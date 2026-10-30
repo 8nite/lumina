@@ -1700,7 +1700,7 @@ func (m Model) View() string {
 			sb.WriteString(style.Render(mark+opt.Text) + desc + "\n")
 		}
 	}
-	sb.WriteString(renderInputLine(m.Input, m.Cursor) + "\n")
+	sb.WriteString(renderInputLine(m.Input, m.Cursor, m.Width) + "\n")
 	if m.Status != "" {
 		sb.WriteString(dimStyle.Render(m.Status) + "\n")
 	}
@@ -1710,7 +1710,10 @@ func (m Model) View() string {
 
 // renderInputLine draws "> input" with a stable cursor cell. Rune-aware so
 // CJK/emoji never split, and pure string ops so typing never re-renders history.
-func renderInputLine(input string, cursor int) string {
+// The line is always exactly one visual row: overlong input is windowed
+// around the cursor (with … markers) so it can never wrap and push the
+// status/help lines out of place.
+func renderInputLine(input string, cursor, width int) string {
 	r := []rune(input)
 	if cursor < 0 {
 		cursor = 0
@@ -1718,7 +1721,41 @@ func renderInputLine(input string, cursor int) string {
 	if cursor > len(r) {
 		cursor = len(r)
 	}
-	return "> " + string(r[:cursor]) + "▊" + string(r[cursor:])
+	if width <= 0 || len(r)+3 <= width {
+		return "> " + string(r[:cursor]) + "▊" + string(r[cursor:])
+	}
+	avail := width - 3 // "> " prefix + cursor cell
+	if avail < 10 {
+		avail = 10
+	}
+	// Window [start,end) of avail runes containing the cursor.
+	start := cursor - avail/2
+	if start < 0 {
+		start = 0
+	}
+	if start+avail > len(r) {
+		start = len(r) - avail
+	}
+	end := start + avail
+	// Reserve a cell per truncated side for the … marker.
+	lo, hi := "", ""
+	if start > 0 {
+		start++
+		lo = "…"
+	}
+	if end < len(r) {
+		end--
+		hi = "…"
+	}
+	rel := cursor - start
+	win := r[start:end]
+	if rel < 0 {
+		rel = 0
+	}
+	if rel > len(win) {
+		rel = len(win)
+	}
+	return "> " + lo + string(win[:rel]) + "▊" + string(win[rel:]) + hi
 }
 
 // renderPending draws the live-streamed turn without markdown work:
