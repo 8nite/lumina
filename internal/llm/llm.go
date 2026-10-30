@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Message is one chat turn.
@@ -53,6 +55,18 @@ type Chunk struct {
 // Usage tallies tokens when the provider reports them.
 type Usage struct {
 	Input, Output int
+}
+
+// LuminaUserAgent identifies lumina to gateways that block generic
+// HTTP-library user agents (opencode zen requires a real client UA;
+// see https://opencode.ai/v2/docs/console/go/#where-can-i-use-it).
+const LuminaUserAgent = "lumina/0.1.0"
+
+// newSessionID mints one routing session for the opencode zen gateway
+// (x-opencode-session). Stable per conversation enables prompt caching;
+// per-request is sufficient for model listing.
+func newSessionID() string {
+	return uuid.NewString()
 }
 
 // Request is a completion call.
@@ -179,6 +193,9 @@ func postJSON(ctx context.Context, url, token string, body interface{}, extraHea
 	}
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", LuminaUserAgent)
 	}
 	resp, err := newClient().Do(req)
 	if err != nil {

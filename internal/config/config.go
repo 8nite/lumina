@@ -71,6 +71,7 @@ type fileConfig struct {
 	Providers   map[string]ProviderConfig `toml:"providers"`
 	Router      RouterConfig              `toml:"router"`
 	KB          KBConfig                  `toml:"kb"`
+	WebSearch   WebSearchConfig           `toml:"websearch"`
 }
 
 type RouterConfig struct {
@@ -86,6 +87,14 @@ type KBConfig struct {
 	StandingOps         bool `toml:"standing_ops"`
 }
 
+// WebSearchConfig mirrors opencode's `websearch` setting: pick one of
+// exa | firecrawl | parallel | tavily | tinyfish | random, or disable.
+// Empty provider means auto-detect from env keys.
+type WebSearchConfig struct {
+	Provider string `toml:"provider"`
+	Disabled bool   `toml:"disabled"`
+}
+
 type Config struct {
 	Server      ServerConfig              `toml:"server"`
 	Defaults    DefaultsConfig            `toml:"defaults"`
@@ -95,6 +104,7 @@ type Config struct {
 	Providers   map[string]ProviderConfig `toml:"providers"`
 	Router      RouterConfig              `toml:"router"`
 	KB          KBConfig                  `toml:"kb"`
+	WebSearch   WebSearchConfig           `toml:"websearch"`
 
 	path     string
 	mu       sync.RWMutex
@@ -153,6 +163,7 @@ func Load(path string) (*Config, error) {
 	}
 	c.Server, c.Defaults, c.Compat = fc.Server, fc.Defaults, fc.Compat
 	c.Providers, c.Router, c.KB = fc.Providers, fc.Router, fc.KB
+	c.WebSearch = fc.WebSearch
 	c.Permissions = map[string]string{}
 	c.BashRules = map[string]string{}
 	for k, prim := range fc.Permissions {
@@ -216,6 +227,10 @@ func (c *Config) Validate() error {
 	if c.Defaults.Agent == "" {
 		c.Defaults.Agent = "build"
 	}
+	c.WebSearch.Provider = strings.ToLower(strings.TrimSpace(c.WebSearch.Provider))
+	if !validWebSearchProviders[c.WebSearch.Provider] {
+		return fmt.Errorf("config: unknown websearch provider %q (want exa|firecrawl|parallel|tavily|tinyfish|random)", c.WebSearch.Provider)
+	}
 	for name, p := range c.Providers {
 		switch p.Protocol {
 		case "", "openai-compatible", "anthropic-compatible", "ollama", "openai-responses", "responses", "copilot":
@@ -241,6 +256,13 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// Validate the websearch provider name (opencode parity).
+var validWebSearchProviders = map[string]bool{
+	"": true, "random": true, "auto": true,
+	"exa": true, "firecrawl": true, "parallel": true,
+	"tavily": true, "tinyfish": true,
 }
 
 // CheckNoGoogle fails if url targets a blocked Google surface.
@@ -364,6 +386,7 @@ func (c *Config) PollReload() error {
 	c.mu.Lock()
 	c.Server, c.Defaults, c.Compat, c.Permissions, c.BashRules = fresh.Server, fresh.Defaults, fresh.Compat, fresh.Permissions, fresh.BashRules
 	c.Providers, c.Router, c.KB = fresh.Providers, fresh.Router, fresh.KB
+	c.WebSearch = fresh.WebSearch
 	c.mtime = fresh.mtime
 	listeners := append([]func(*Config){}, c.onChange...)
 	c.mu.Unlock()

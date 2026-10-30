@@ -92,10 +92,21 @@ type Server struct {
 	opts     Options
 	mu       sync.Mutex
 	sessions map[string]*Session
+	// running tracks sessions with an in-flight turn (steer/queue gate).
+	running  map[string]bool
 	permReqs map[string]map[string]string
+	// Blocking permission broker (opencode-style permission.asked flow,
+	// reimplemented): Runner.AskPermission publishes permission.asked and
+	// waits here until the TUI answers POST /api/v1/permissions/{reqId}.
+	permMu      sync.Mutex
+	permPending map[string]chan string
+	permMeta    map[string]map[string]string
 	// Exec runs one assistant turn (wired by cmd/serve to the agent
 	// Runner). Nil keeps the route as accept-and-broadcast (tests/embeds).
 	Exec func(ctx context.Context, sessionID string, in agent.TurnInput) (string, error)
+	// turnStats stashes finished-turn summaries (NoteTurnEnd) for the
+	// in-flight prompt goroutine, which merges them into turn.completed.
+	turnStats sync.Map // sessionID → agent.TurnStats
 	// Store persists sessions + turns (restart-safe). Nil keeps the
 	// in-memory map (unit tests, embeds).
 	Store *agent.Store
@@ -113,6 +124,12 @@ type Server struct {
 	OnAuthRefresh func(provider, githubToken string)
 	// Redo checkpoints per session for /unrevert.
 	Redo map[string]string
+	// Inbox hooks (wired to the agent Runner in cmd/serve): steer/queue
+	// while a turn is running. Nil preserves the legacy behavior of
+	// running every prompt immediately (tests/embeds).
+	SteerPrompt func(sessionID, text string)
+	QueuePrompt func(sessionID string, in agent.TurnInput) int
+	TakeQueued  func(sessionID string) (agent.TurnInput, bool)
 	// ListProviderModels lists live models for any provider implementing
 	// llm.ModelLister (wired by cmd/serve from config + router).
 	ListProviderModels func(ctx context.Context, provider string) ([]llm.ModelMeta, error)
@@ -127,7 +144,10 @@ func New(o Options) *Server {
 		broker:      NewBroker(),
 		opts:        o,
 		sessions:    map[string]*Session{},
+		running:     map[string]bool{},
 		permReqs:    map[string]map[string]string{},
+		permPending: map[string]chan string{},
+		permMeta:    map[string]map[string]string{},
 		RouterState: map[string]string{},
 		Redo:        map[string]string{},
 	}
@@ -143,6 +163,23 @@ func (s *Server) MountSPA(h http.Handler) {
 
 // Broker exposes the event broker for in-process subscribers.
 func (s *Server) Broker() *Broker { return s.broker }
+
+// NoteTurnEnd stashes one finished turn's summary (opencode v2 turn
+// summary: model, duration, tokens) for the in-flight prompt goroutine,
+// which merges it into the turn.completed event.
+func (s *Server) NoteTurnEnd(sessionID string, st agent.TurnStats) {
+	s.turnStats.Store(sessionID, st)
+}
+
+// turnEndStats takes and clears the stashed summary for a session.
+func (s *Server) turnEndStats(sessionID string) (agent.TurnStats, bool) {
+	v, ok := s.turnStats.LoadAndDelete(sessionID)
+	if !ok {
+		return agent.TurnStats{}, false
+	}
+	st, ok := v.(agent.TurnStats)
+	return st, ok
+}
 
 // GetSession returns one session by id (memory first, store fallback).
 func (s *Server) GetSession(id string) (*Session, bool) {
@@ -239,7 +276,7 @@ func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 		"info":    map[string]string{"title": "Lumina Daemon API", "version": "0.1.0"},
 		"servers": []map[string]string{{"url": "http://127.0.0.1:7432"}},
 		"paths": map[string]interface{}{
-			"/api/v1/events":                 map[string]string{"get": "SSE multiplexed stream"},
+			"/api/v1/events":                 map[string]string{"get": "SSE: turn.started/progress/delta/tool/completed/failed, permission.asked/resolved, session.*, config.updated"},
 			"/api/v1/sessions":               map[string]string{"get": "list (?directory=, ?latest=1)", "post": "create"},
 			"/api/v1/sessions/{id}":          map[string]string{"get": "fetch", "patch": "update agent/permission/model/title"},
 			"/api/v1/sessions/{id}/fork":     map[string]string{"post": "fork at turn"},
@@ -254,9 +291,9 @@ func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 			"/api/v1/pty":                    map[string]string{"get": "interactive shell websocket"},
 			"/api/v1/providers":              map[string]string{"get": "list providers"},
 			"/api/v1/router":                 map[string]string{"get": "router state", "put": "switch fast/executor/improver"},
-			"/api/v1/models":                map[string]string{"get": "live provider models (?provider=)"},
-			"/api/v1/auth/device/start":     map[string]string{"post": "begin device web-auth"},
-			"/api/v1/auth/device/poll":      map[string]string{"post": "complete device web-auth"},
+			"/api/v1/models":                 map[string]string{"get": "live provider models (?provider=)"},
+			"/api/v1/auth/device/start":      map[string]string{"post": "begin device web-auth"},
+			"/api/v1/auth/device/poll":       map[string]string{"post": "complete device web-auth"},
 			"/api/v1/kb/query":               map[string]string{"post": "graphify query"},
 			"/api/v1/harness":                map[string]string{"get": "inspect 8 components (?directory=)"},
 			"/api/v1/harness/evolve":         map[string]string{"post": "propose-probe-compose run"},
@@ -478,7 +515,12 @@ func (s *Server) handleSessionSub(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Text   string `json:"text"`
 			Effort string `json:"effort"`
-			Images []struct {
+			// Delivery selects inbox behavior while a turn is running
+			// (opencode steer/queue parity): steer (default) joins the
+			// active turn at the next round boundary; queue chains after
+			// it completes. Ignored when the session is idle.
+			Delivery string `json:"delivery"`
+			Images   []struct {
 				Name      string `json:"name"`
 				MediaType string `json:"media_type"`
 				Data      string `json:"data"`
@@ -497,19 +539,51 @@ func (s *Server) handleSessionSub(w http.ResponseWriter, r *http.Request) {
 			}
 			images = append(images, llm.ImageAttachment{Name: im.Name, MediaType: im.MediaType, Data: im.Data})
 		}
+		in := agent.TurnInput{Text: req.Text, Images: images, Effort: req.Effort}
+		delivery := req.Delivery
+		if delivery == "" {
+			delivery = "steer"
+		}
+		// While a turn is in flight, steer or queue instead of starting
+		// a second concurrent loop on the same session. The gate only
+		// applies when a runner is wired (Exec != nil); embeds without
+		// one keep the legacy run-immediately behavior.
+		s.mu.Lock()
+		busy := s.Exec != nil && s.running[id]
+		if s.Exec != nil && !busy {
+			s.running[id] = true
+		}
+		s.mu.Unlock()
+		if busy {
+			switch {
+			case delivery == "queue" && s.QueuePrompt != nil:
+				pos := s.QueuePrompt(id, in)
+				s.broker.Publish(Event{Type: "turn.progress", SessionID: id, Data: map[string]string{"stage": "queued #" + fmt.Sprintf("%d", pos)}})
+				writeJSON(w, 202, map[string]interface{}{"status": "queued", "session_id": id, "position": pos})
+			case s.SteerPrompt != nil:
+				s.SteerPrompt(id, req.Text)
+				preview := req.Text
+				if len([]rune(preview)) > 80 {
+					preview = string([]rune(preview)[:80]) + "…"
+				}
+				s.broker.Publish(Event{Type: "turn.progress", SessionID: id, Data: map[string]string{"stage": "steered: " + preview}})
+				writeJSON(w, 202, map[string]string{"status": "steered", "session_id": id})
+			default:
+				// Legacy path (no runner wired): run immediately, as before.
+				go s.runTurn(id, in)
+				writeJSON(w, 202, map[string]string{"status": "accepted", "session_id": id})
+			}
+			return
+		}
+		// Idle path: the flag was already set above; runTurns clears it.
 		sess.UpdatedAt = nowStr()
 		s.broker.Publish(Event{Type: "turn.started", SessionID: id, Data: map[string]string{"text": req.Text}})
 		if s.Exec != nil {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-				defer cancel()
-				out, err := s.Exec(ctx, id, agent.TurnInput{Text: req.Text, Images: images, Effort: req.Effort})
-				if err != nil {
-					s.broker.Publish(Event{Type: "turn.failed", SessionID: id, Data: map[string]string{"error": err.Error()}})
-					return
-				}
-				s.broker.Publish(Event{Type: "turn.completed", SessionID: id, Data: map[string]string{"text": out}})
-			}()
+			go s.runTurns(id, in)
+		} else {
+			s.mu.Lock()
+			delete(s.running, id)
+			s.mu.Unlock()
 		}
 		writeJSON(w, 202, map[string]string{"status": "accepted", "session_id": id})
 	case "revert", "unrevert":
@@ -529,6 +603,51 @@ func (s *Server) handleSessionSub(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	default:
 		writeJSON(w, 404, map[string]string{"error": "unknown action"})
+	}
+}
+
+// runTurn executes one turn and publishes its terminal event.
+func (s *Server) runTurn(id string, in agent.TurnInput) {
+	if s.Exec == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	out, err := s.Exec(ctx, id, in)
+	if err != nil {
+		s.broker.Publish(Event{Type: "turn.failed", SessionID: id, Data: map[string]string{"error": err.Error()}})
+		return
+	}
+	data := map[string]interface{}{"text": out}
+	if st, ok := s.turnEndStats(id); ok {
+		data["model"] = st.Model
+		data["duration_ms"] = st.DurationMs
+		data["input_tokens"] = st.InputTokens
+		data["output_tokens"] = st.OutputTokens
+	}
+	s.broker.Publish(Event{Type: "turn.completed", SessionID: id, Data: data})
+}
+
+// runTurns executes a turn, then chains queued turns until the inbox
+// drains, holding the session's running flag throughout so prompts that
+// arrive mid-chain keep steering or queueing instead of racing the loop.
+func (s *Server) runTurns(id string, in agent.TurnInput) {
+	defer func() {
+		s.mu.Lock()
+		delete(s.running, id)
+		s.mu.Unlock()
+	}()
+	for {
+		s.runTurn(id, in)
+		if s.TakeQueued == nil {
+			return
+		}
+		next, ok := s.TakeQueued(id)
+		if !ok {
+			return
+		}
+		s.broker.Publish(Event{Type: "turn.started", SessionID: id, Data: map[string]string{"text": next.Text}})
+		in = next
 	}
 }
 
@@ -578,8 +697,48 @@ func (s *Server) handlePermissions(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.permReqs[reqID] = map[string]string{"decision": req.Decision}
 	s.mu.Unlock()
+	// Unblock a waiting turn (opencode-style allow_once/session/deny).
+	s.permMu.Lock()
+	ch := s.permPending[reqID]
+	delete(s.permPending, reqID)
+	delete(s.permMeta, reqID)
+	s.permMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- req.Decision:
+		default:
+		}
+	}
 	s.broker.Publish(Event{Type: "permission.resolved", Data: map[string]string{"request_id": reqID, "decision": req.Decision}})
 	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// RequestPermission publishes permission.asked and blocks until the UI
+// answers or ctx ends. Lifecycle mirrors sst/opencode's permission flow
+// (MIT): ask → allow_once / allow_session / deny. Reimplemented here.
+func (s *Server) RequestPermission(ctx context.Context, sessionID, tool, target string) (string, error) {
+	reqID := uuid.NewString()[:8]
+	ch := make(chan string, 1)
+	s.permMu.Lock()
+	s.permPending[reqID] = ch
+	s.permMeta[reqID] = map[string]string{"session_id": sessionID, "tool": tool, "target": target}
+	s.permMu.Unlock()
+	s.broker.Publish(Event{Type: "permission.asked", SessionID: sessionID, Data: map[string]string{
+		"request_id": reqID, "tool": tool, "target": target,
+	}})
+	select {
+	case d := <-ch:
+		if d == "" {
+			return "deny", nil
+		}
+		return d, nil
+	case <-ctx.Done():
+		s.permMu.Lock()
+		delete(s.permPending, reqID)
+		delete(s.permMeta, reqID)
+		s.permMu.Unlock()
+		return "", ctx.Err()
+	}
 }
 
 // handleFiles returns a bounded workspace file tree (?directory=).

@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
-
-	"github.com/google/uuid"
 )
 
 // Responses speaks the OpenAI Responses API (/v1/responses SSE):
@@ -83,8 +81,10 @@ func (p *Responses) Chat(ctx context.Context, req Request) (<-chan Chunk, error)
 		}
 		body["tools"] = tools
 	}
+	sid := newSessionID()
 	resp, err := postJSON(ctx, url, p.APIKey, body, map[string]string{
-		"x-lumina-session": uuid.NewString(),
+		"x-lumina-session":   sid,
+		"x-opencode-session": sid,
 	})
 	if err != nil {
 		return nil, err

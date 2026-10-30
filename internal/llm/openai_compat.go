@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -36,6 +37,16 @@ func listOpenAIModels(ctx context.Context, url, key string, headers map[string]s
 			continue
 		}
 		req.Header.Set(k, v)
+	}
+	// Gateways (opencode zen) reject generic library UAs and require a
+	// routing session even for GET /models.
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", LuminaUserAgent)
+	}
+	if req.Header.Get("x-opencode-session") == "" {
+		sid := newSessionID()
+		req.Header.Set("x-opencode-session", sid)
+		req.Header.Set("x-lumina-session", sid)
 	}
 	resp, err := newClient().Do(req)
 	if err != nil {
@@ -101,7 +112,22 @@ func (p *OpenAICompat) Chat(ctx context.Context, req Request) (<-chan Chunk, err
 		}
 		body["tools"] = tools
 	}
-	resp, err := postJSON(ctx, url, p.APIKey, body, p.Headers)
+	// Session routing headers: lumina's own plus the opencode zen gateway's
+	// (x-opencode-session), required when BaseURL points at opencode.ai/zen.
+	headers := map[string]string{}
+	for k, v := range p.Headers {
+		headers[k] = v
+	}
+	sid := ""
+	for _, k := range []string{"x-opencode-session", "x-lumina-session"} {
+		if _, ok := headers[k]; !ok {
+			if sid == "" {
+				sid = newSessionID()
+			}
+			headers[k] = sid
+		}
+	}
+	resp, err := postJSON(ctx, url, p.APIKey, body, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +142,30 @@ func (p *OpenAICompat) Chat(ctx context.Context, req Request) (<-chan Chunk, err
 				return false
 			}
 		}
+		// Tool calls stream as fragments: the first chunk for an index
+		// carries id+name, later chunks carry argument substrings only.
+		// Accumulate by index and flush complete calls on finish.
+		type pendingCall struct {
+			id, name string
+			args     strings.Builder
+		}
+		pending := map[int]*pendingCall{}
+		flush := func() []ToolCallRequest {
+			var idxs []int
+			for i := range pending {
+				idxs = append(idxs, i)
+			}
+			sort.Ints(idxs)
+			var out []ToolCallRequest
+			for _, i := range idxs {
+				pc := pending[i]
+				var args map[string]interface{}
+				_ = json.Unmarshal([]byte(pc.args.String()), &args)
+				out = append(out, ToolCallRequest{ID: pc.id, Name: pc.name, Args: args})
+				delete(pending, i)
+			}
+			return out
+		}
 		_ = readSSE(ctx, resp, func(data string) bool {
 			var ev struct {
 				Choices []struct {
@@ -123,6 +173,7 @@ func (p *OpenAICompat) Chat(ctx context.Context, req Request) (<-chan Chunk, err
 						Content          *string `json:"content"`
 						ReasoningContent *string `json:"reasoning_content"`
 						ToolCalls        []struct {
+							Index    int    `json:"index"`
 							ID       string `json:"id"`
 							Function struct {
 								Name      string `json:"name"`
@@ -145,20 +196,36 @@ func (p *OpenAICompat) Chat(ctx context.Context, req Request) (<-chan Chunk, err
 				c.Thinking = *d.ReasoningContent
 			}
 			for _, tc := range d.ToolCalls {
-				var args map[string]interface{}
-				_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
-				c.ToolCalls = append(c.ToolCalls, ToolCallRequest{ID: tc.ID, Name: tc.Function.Name, Args: args})
+				pc, ok := pending[tc.Index]
+				if !ok {
+					pc = &pendingCall{}
+					pending[tc.Index] = pc
+				}
+				if tc.ID != "" {
+					pc.id = tc.ID
+				}
+				if tc.Function.Name != "" {
+					pc.name = tc.Function.Name
+				}
+				pc.args.WriteString(tc.Function.Arguments)
 			}
 			if ev.Choices[0].FinishReason != nil {
+				c.ToolCalls = flush()
 				c.Done = true
 				emit(c)
 				return false
 			}
-			if c.Delta != "" || c.Thinking != "" || len(c.ToolCalls) > 0 {
+			if c.Delta != "" || c.Thinking != "" {
 				return emit(c)
 			}
 			return true
 		})
+		for _, tc := range flush() {
+			select {
+			case out <- Chunk{ToolCalls: []ToolCallRequest{tc}}:
+			default:
+			}
+		}
 		select {
 		case out <- Chunk{Done: true}:
 		default:

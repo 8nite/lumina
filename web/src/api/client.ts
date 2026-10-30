@@ -90,9 +90,9 @@ export const api = {
   patchSession: (id: string, patch: Partial<Session>) =>
     req<Session>('PATCH', `/api/v1/sessions/${id}`, patch),
   fork: (id: string) => req<Session>('POST', `/api/v1/sessions/${id}/fork`, {}),
-  prompt: (id: string, text: string, images?: PromptAttachment[], effort?: string) =>
-    req<{ status: string }>('POST', `/api/v1/sessions/${id}/prompt`, {
-      text, images: images || [], effort: effort || '',
+  prompt: (id: string, text: string, images?: PromptAttachment[], effort?: string, delivery?: string) =>
+    req<{ status: string; position?: number }>('POST', `/api/v1/sessions/${id}/prompt`, {
+      text, images: images || [], effort: effort || '', delivery: delivery || '',
     }),
   revert: (id: string) => req<{ status: string }>('POST', `/api/v1/sessions/${id}/revert`, {}),
   unrevert: (id: string) => req<{ status: string }>('POST', `/api/v1/sessions/${id}/unrevert`, {}),

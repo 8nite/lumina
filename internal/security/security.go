@@ -174,10 +174,11 @@ func IsDestructiveBash(cmd string) bool {
 	return false
 }
 
-// readTools are always allowed in every mode.
+// readTools are always allowed in every mode (discovery + web research).
 func isReadTool(tool string) bool {
 	switch strings.ToLower(tool) {
-	case "read", "read_file", "glob", "grep", "kb_query", "lsp", "skill":
+	case "read", "read_file", "glob", "grep", "kb_query", "lsp", "skill",
+		"webfetch", "websearch", "task_output":
 		return true
 	}
 	return false
@@ -221,9 +222,12 @@ func Authorize(agent AgentMode, perm PermissionMode, tool, target, workspaceDir 
 func authorizePlan(tool, target, workspaceDir string) Decision {
 	t := strings.ToLower(strings.TrimSpace(tool))
 	switch t {
-	case "read", "read_file", "glob", "grep", "lsp", "kb_query", "skill", "ask_question":
+	case "read", "read_file", "glob", "grep", "lsp", "kb_query", "skill", "ask_question",
+		"webfetch", "websearch", "task_output":
+		// opencode `explore` parity: plan research may read the web and
+		// poll background tasks, but never mutates via delegation.
 		return Allow
-	case "bash":
+	case "bash", "shell":
 		if IsReadOnlyBash(target) && !IsDestructiveBash(target) {
 			return Allow
 		}
@@ -232,6 +236,10 @@ func authorizePlan(tool, target, workspaceDir string) Decision {
 		if IsPlanWritable(workspaceDir, target) {
 			return Allow
 		}
+		return Deny
+	case "subagent":
+		// Delegation could bypass the read-only fence (a build child
+		// edits while the parent stays in plan), so plan denies it.
 		return Deny
 	default:
 		return Deny
@@ -259,7 +267,7 @@ func authorizeBuild(pm PermissionMode, tool, target string, bashRules map[string
 			return Ask
 		}
 	}
-	if t == "bash" {
+	if t == "bash" || t == "shell" {
 		if IsDestructiveBash(target) {
 			if pm == PermBypass {
 				return Allow

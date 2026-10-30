@@ -153,9 +153,14 @@ type PromptInput struct {
 	Text   string             `json:"text"`
 	Images []PromptAttachment `json:"images,omitempty"`
 	Effort string             `json:"effort,omitempty"`
+	// Delivery selects inbox behavior while a turn is running
+	// (opencode steer/queue parity): steer (default) joins the active
+	// turn; queue chains after it completes.
+	Delivery string `json:"delivery,omitempty"`
 }
 
-// Prompt submits a turn; progress arrives over Subscribe.
+// Prompt submits a turn; progress arrives over Subscribe. Delivery
+// selects steer (default) or queue when a turn is already running.
 func (c *Client) Prompt(ctx context.Context, id string, in PromptInput) error {
 	resp, err := c.req(ctx, http.MethodPost, "/api/v1/sessions/"+id+"/prompt", in)
 	if err != nil {
@@ -243,11 +248,11 @@ func (c *Client) SetRouterModel(ctx context.Context, role, model string) error {
 
 // DeviceAuth carries device web-auth codes (never a token).
 type DeviceAuth struct {
-	DeviceCode      string `json:"device_code"`
-	UserCode        string `json:"user_code"`
-	URI             string `json:"verification_uri"`
-	ExpiresIn       int    `json:"expires_in"`
-	Interval        int    `json:"interval"`
+	DeviceCode string `json:"device_code"`
+	UserCode   string `json:"user_code"`
+	URI        string `json:"verification_uri"`
+	ExpiresIn  int    `json:"expires_in"`
+	Interval   int    `json:"interval"`
 }
 
 // DeviceStart begins provider web-auth.

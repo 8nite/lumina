@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/8nite/lumina/internal/rules"
@@ -174,6 +175,7 @@ func builtinSlashCommands() []CompleteItem {
 		{"/mode", "view or set approval mode (ask|auto-edit|auto-approve|bypass)"},
 		{"/connect", "connect a provider via device web-auth (usage: /connect [provider] [github-url])"},
 		{"/compact", "summarize context to free the window"},
+		{"/thinking", "show or hide model reasoning while working (show|hide)"},
 		{"/undo", "restore the last shadow-git checkpoint"},
 		{"/redo", "re-apply the undone checkpoint"},
 		{"/resume", "pick a session to attach"},
@@ -192,8 +194,13 @@ type Model struct {
 	Agent string // "plan" | "build" (+ custom primary names)
 	Perm  string // ask | auto-edit | auto-approve | bypass
 
-	Lines []string // rendered timeline (markdown source)
-	Input string
+	Lines []string // timeline (markdown source)
+	// Rendered mirrors Lines but holds the ANSI-rendered form, produced
+	// once per appended line (not once per View call). View only joins
+	// the visible tail, which is what stops the flicker on fast SSE.
+	Rendered []string
+	Input    string
+	Cursor   int // rune index into Input (not byte index)
 
 	Modal    *PermModal
 	Sessions []*sdk.Session // /resume picker entries
@@ -202,23 +209,92 @@ type Model struct {
 	Picking      bool
 	PickingModel bool
 	PickIdx      int
- 	// /connect wizard: provider picker, GitHub URL prompt, device polling.
+	// /connect wizard: provider picker, GitHub URL prompt, device polling.
 	ConnectOptions  []string
 	PickingConnect  bool
 	ConnectProvider string
 	AwaitingURL     bool
 	// Inline autocomplete popup for / commands, @files and [[notes]].
-	SlashCommands []CompleteItem // builtins (+ workspace customs once loaded)
-	CustomLoaded  bool           // custom commands/files/notes already loaded
-	CompleteFiles []string       // workspace-relative file paths
-	CompleteNotes []string       // memory note names (no .md)
-	Completing    bool
+	SlashCommands   []CompleteItem // builtins (+ workspace customs once loaded)
+	CustomLoaded    bool           // custom commands/files/notes already loaded
+	CompleteFiles   []string       // workspace-relative file paths
+	CompleteNotes   []string       // memory note names (no .md)
+	Completing      bool
 	CompleteOptions []CompleteItem
 	CompleteIdx     int
 
-	Status   string
-	Width    int
-	quitting bool
+	Status string
+	Width  int
+	Height int
+	// Pending holds live-streamed assistant text (turn.delta), rendered
+	// plain until turn.completed replaces it with the final markdown.
+	Pending         string
+	PendingThinking string
+	// ShowThinking mirrors opencode v2 `session.thinking` (default hide):
+	// reasoning streams but only renders when enabled (/thinking).
+	ShowThinking bool
+	// Working tracks an in-flight turn (send/turn.started → completed/failed).
+	// Enter steers it, Ctrl+X then Enter queues for later (opencode parity).
+	Working    bool
+	QueueArmed bool
+	quitting   bool
+}
+
+// mdCache holds a single shared glamour renderer. Recreated only when the
+// terminal width changes, so steady-state View calls do zero markdown work.
+var (
+	mdMu     sync.Mutex
+	mdRender *glamour.TermRenderer
+	mdWrap   int
+)
+
+func mdRenderer(width int) *glamour.TermRenderer {
+	wrap := width
+	if wrap <= 0 {
+		wrap = 80
+	}
+	if wrap > 120 {
+		wrap = 120
+	}
+	mdMu.Lock()
+	defer mdMu.Unlock()
+	if mdRender == nil || mdWrap != wrap {
+		r, err := glamour.NewTermRenderer(glamour.WithStandardStyle("dark"), glamour.WithWordWrap(wrap))
+		if err != nil {
+			return nil
+		}
+		mdRender = r
+		mdWrap = wrap
+	}
+	return mdRender
+}
+
+// renderCached renders one markdown block once. View must never call this
+// per frame; lines are rendered on append and on width change only.
+func renderCached(src string, width int) string {
+	r := mdRenderer(width)
+	if r == nil {
+		return src
+	}
+	out, err := r.Render(src)
+	if err != nil {
+		return src
+	}
+	return strings.TrimRight(out, "\n")
+}
+
+// appendLine stores source + its rendered form together.
+func (m *Model) appendLine(src string) {
+	m.Lines = append(m.Lines, src)
+	m.Rendered = append(m.Rendered, renderCached(src, m.Width))
+}
+
+// rerenderAll rebuilds the rendered cache after a width change.
+func (m *Model) rerenderAll() {
+	m.Rendered = m.Rendered[:0]
+	for _, ln := range m.Lines {
+		m.Rendered = append(m.Rendered, renderCached(ln, m.Width))
+	}
 }
 
 // New creates a model bound to a session.
@@ -232,9 +308,12 @@ func New(c *sdk.Client, sess *sdk.Session) Model {
 			perm = sess.PermissionMode
 		}
 	}
-	return Model{Client: c, Session: sess, Agent: agent, Perm: perm,
+	m := Model{Client: c, Session: sess, Agent: agent, Perm: perm,
 		SlashCommands: builtinSlashCommands(),
-		Lines: []string{"# lumina", "Session `" + sessID(sess) + "` — Tab: plan↔build, Shift+Tab: approval mode."}}
+		Width:         80}
+	m.appendLine("# lumina")
+	m.appendLine("Session `" + sessID(sess) + "` — Tab: plan↔build, Shift+Tab: approval mode.")
+	return m
 }
 
 func sessID(s *sdk.Session) string {
@@ -287,7 +366,16 @@ func (m *Model) CyclePerm() {
 }
 
 func (m *Model) pushSystem(s string) {
-	m.Lines = append(m.Lines, "_"+s+"_")
+	m.appendLine("_" + s + "_")
+}
+
+// sendDelivery picks steer vs queue (opencode parity): Enter steers the
+// active turn, Ctrl+X then Enter queues for later.
+func (m *Model) sendDelivery() string {
+	if m.Working && m.QueueArmed {
+		return "queue"
+	}
+	return "steer"
 }
 
 // ApplyCommand executes /slash commands locally; returns a tea.Cmd for any
@@ -418,6 +506,24 @@ func (m *Model) ApplyCommand(cmd string) tea.Cmd {
 		}
 	case "/compact":
 		m.compact()
+	case "/thinking":
+		want := ""
+		if len(fields) > 1 {
+			want = strings.ToLower(fields[1])
+		}
+		switch want {
+		case "show":
+			m.ShowThinking = true
+		case "hide":
+			m.ShowThinking = false
+		default:
+			m.ShowThinking = !m.ShowThinking
+		}
+		state := "hide"
+		if m.ShowThinking {
+			state = "show"
+		}
+		m.pushSystem("thinking → " + state)
 	case "/undo":
 		m.pushSystem("undo requested")
 		if m.Client != nil && m.Session != nil {
@@ -508,6 +614,7 @@ func (m *Model) beginConnect(provider, ghurl string) tea.Cmd {
 		}
 	}
 }
+
 // applyModel connects a session to a model id and persists it.
 func (m *Model) applyModel(id string) tea.Cmd {
 	m.pushSystem("model → " + id)
@@ -537,8 +644,8 @@ func (m *Model) compact() {
 		m.pushSystem("compact: nothing to do")
 		return
 	}
-	kept := append([]string{"_[compacted earlier turns; rules, diffs, memory pointers preserved]_"}, m.Lines[len(m.Lines)-30:]...)
-	m.Lines = kept
+	m.Lines = append([]string{"_[compacted earlier turns; rules, diffs, memory pointers preserved]_"}, m.Lines[len(m.Lines)-30:]...)
+	m.rerenderAll()
 	m.pushSystem("compacted")
 }
 
@@ -639,23 +746,64 @@ func (m *Model) acceptCompletion() {
 	case strings.Contains(in, "[[") && strings.HasPrefix(item.Text, "[["):
 		m.Input = in[:strings.LastIndex(in, "[[")] + item.Text
 	}
+	m.Cursor = len([]rune(m.Input))
 	m.Completing = false
 	m.CompleteOptions = nil
 	m.CompleteIdx = 0
+}
+
+// insertRunes inserts s at the cursor (rune-aware).
+func (m *Model) insertRunes(s string) {
+	if s == "" {
+		return
+	}
+	r := []rune(m.Input)
+	c := m.Cursor
+	if c < 0 {
+		c = 0
+	}
+	if c > len(r) {
+		c = len(r)
+	}
+	nr := make([]rune, 0, len(r)+len([]rune(s)))
+	nr = append(nr, r[:c]...)
+	nr = append(nr, []rune(s)...)
+	nr = append(nr, r[c:]...)
+	m.Input = string(nr)
+	m.Cursor = c + len([]rune(s))
+}
+
+// deleteBeforeCursor removes one rune left of the cursor.
+func (m *Model) deleteBeforeCursor() {
+	r := []rune(m.Input)
+	if m.Cursor <= 0 || len(r) == 0 {
+		return
+	}
+	if m.Cursor > len(r) {
+		m.Cursor = len(r)
+	}
+	nr := append(r[:m.Cursor-1], r[m.Cursor:]...)
+	m.Input = string(nr)
+	m.Cursor--
 }
 
 // Update is the headless-testable state machine.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		changed := msg.Width != m.Width
 		m.Width = msg.Width
+		m.Height = msg.Height
+		if changed {
+			m.rerenderAll()
+		}
 		return m, nil
 	case tea.KeyMsg:
 		return m.updateKey(msg)
 	case EventMsg:
 		return m.updateEvent(msg.Event)
 	case TurnDoneMsg:
-		m.Lines = append(m.Lines, msg.Text)
+		m.appendLine(msg.Text)
 		m.Status = ""
 		return m, nil
 	case ModelsMsg:
@@ -692,9 +840,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.PickIdx = 0
 		return m, nil
 	case DeviceStartedMsg:
-		m.Lines = append(m.Lines,
-			"Open "+msg.URI+" and enter code: "+msg.UserCode,
-			"Waiting for approval…")
+		m.appendLine("Open " + msg.URI + " and enter code: " + msg.UserCode)
+		m.appendLine("Waiting for approval…")
 		c := m.Client
 		return m, func() tea.Msg {
 			if c == nil {
@@ -728,6 +875,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case ErrMsg:
+		if m.Status == "working…" {
+			m.appendLine("**error:** " + msg.Err.Error())
+		}
 		m.Status = "error: " + msg.Err.Error()
 		return m, nil
 	}
@@ -881,12 +1031,18 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.CompleteOptions = nil
 		m.CyclePerm()
 		return m, m.pushPermCmd()
+	case "ctrl+x":
+		// Arm queue mode: the next Enter queues instead of steering.
+		m.QueueArmed = true
+		m.Status = "ctrl+x — enter queues the prompt, esc cancels"
+		return m, nil
 	case "enter":
 		m.Completing = false
 		m.CompleteOptions = nil
 		m.CompleteIdx = 0
 		text := strings.TrimSpace(m.Input)
 		m.Input = ""
+		m.Cursor = 0
 		// /connect wizard consumes the next line as the GitHub URL
 		// (empty = default host). This must run before the empty check.
 		if m.AwaitingURL && !strings.HasPrefix(text, "/") {
@@ -906,34 +1062,53 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if strings.HasPrefix(text, "/") {
 			return m, m.ApplyCommand(text)
 		}
-		m.Lines = append(m.Lines, "**you:** "+text)
-		m.Status = "working…"
+		m.appendLine("**you:** " + text)
+		delivery := m.sendDelivery()
+		m.QueueArmed = false
+		m.Working = true
+		if delivery == "queue" {
+			m.Status = "queued…"
+		} else {
+			m.Status = "working…"
+		}
 		if m.Client != nil && m.Session != nil {
 			id, t := m.Session.ID, text
 			c := m.Client
 			return m, func() tea.Msg {
-				if err := c.Prompt(bg(), id, sdk.PromptInput{Text: t}); err != nil {
+				if err := c.Prompt(bg(), id, sdk.PromptInput{Text: t, Delivery: delivery}); err != nil {
 					return ErrMsg{err}
 				}
 				return nil
 			}
 		}
-		m.Lines = append(m.Lines, "_(no daemon attached — prompt recorded locally)_")
+		m.appendLine("_(no daemon attached — prompt recorded locally)_")
 		return m, nil
 	case "backspace":
-		if len(m.Input) > 0 {
-			m.Input = m.Input[:len(m.Input)-1]
+		m.deleteBeforeCursor()
+	case "left":
+		if m.Cursor > 0 {
+			m.Cursor--
 		}
+		return m, nil
+	case "right":
+		if m.Cursor < len([]rune(m.Input)) {
+			m.Cursor++
+		}
+		return m, nil
+	case "ctrl+u":
+		m.Input = ""
+		m.Cursor = 0
 	case "esc":
 		if m.Picking {
 			m.Picking = false
 		}
+		m.QueueArmed = false
 		m.Completing = false
 		m.CompleteOptions = nil
 		m.CompleteIdx = 0
 	default:
 		if msg.Type == tea.KeyRunes {
-			m.Input += msg.String()
+			m.insertRunes(msg.String())
 		}
 	}
 	return m, m.computeCompletions()
@@ -972,22 +1147,105 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 	// session never touch this timeline (TP-09.4).
 	if e.SessionID != "" && m.Session != nil && e.SessionID != m.Session.ID {
 		switch e.Type {
-		case "turn.completed", "turn.failed", "turn.started",
+		case "turn.completed", "turn.failed", "turn.started", "turn.progress",
+			"turn.delta", "turn.tool",
 			"permission.asked", "permission":
 			return m, nil
 		}
 	}
 	switch e.Type {
-	case "turn.completed":
+	case "turn.started":
+		// opencode-style pending state (reimplemented): show what the
+		// daemon accepted so long runs never look frozen.
+		var d map[string]string
+		preview := "working…"
+		if err := jsonUnmarshal(e.Data, &d); err == nil {
+			if t := d["text"]; t != "" {
+				preview = "working… " + truncate(t, 60)
+			} else if s := d["stage"]; s != "" {
+				preview = s
+			}
+		}
+		m.Status = preview
+		m.Working = true
+	case "turn.progress":
 		var d map[string]string
 		if err := jsonUnmarshal(e.Data, &d); err == nil {
-			m.Lines = append(m.Lines, d["text"])
+			if s := d["stage"]; s != "" {
+				m.Status = s
+			}
 		}
+	case "turn.delta":
+		var d map[string]string
+		if err := jsonUnmarshal(e.Data, &d); err == nil {
+			// Cap the live buffer; the final text arrives via turn.completed.
+			if len([]rune(m.Pending+m.PendingThinking)) < 4000 {
+				m.Pending += d["delta"]
+				m.PendingThinking += d["thinking"]
+			}
+			m.Status = "working…"
+		}
+	case "turn.tool":
+		var d map[string]interface{}
+		if err := jsonUnmarshal(e.Data, &d); err == nil {
+			tool, _ := d["tool"].(string)
+			target, _ := d["target"].(string)
+			if tool != "" {
+				m.Status = "tool: " + tool
+				if phase, _ := d["phase"].(string); phase == "done" {
+					preview, _ := d["preview"].(string)
+					if isErr, _ := d["error"].(bool); isErr {
+						m.appendLine("· `" + tool + "` " + target + " → error: " + truncate(preview, 200))
+					} else if preview != "" {
+						m.appendLine("· `" + tool + "` " + target + " → " + truncate(preview, 200))
+					} else {
+						m.appendLine("· `" + tool + "` " + target + " → done")
+					}
+				} else {
+					m.appendLine("· `" + tool + "` " + target)
+				}
+			}
+		}
+	case "turn.completed":
+		// opencode v2 turn summary: agent, model, duration (+tok/s when
+		// the provider reported usage) as the assistant footer.
+		var d map[string]interface{}
+		if err := jsonUnmarshal(e.Data, &d); err == nil {
+			if t, _ := d["text"].(string); t != "" {
+				m.appendLine(t)
+			}
+			if f := turnFooter(m.Agent, d); f != "" {
+				m.appendLine(f)
+			}
+		}
+		m.Pending = ""
+		m.PendingThinking = ""
 		m.Status = ""
+		m.Working = false
+		m.QueueArmed = false
 	case "turn.failed":
-		m.Status = "turn failed"
+		var d map[string]string
+		msg := "turn failed"
+		if err := jsonUnmarshal(e.Data, &d); err == nil {
+			if v := d["error"]; v != "" {
+				msg = v
+			} else if v := d["text"]; v != "" {
+				msg = v
+			}
+		}
+		m.appendLine("**error:** " + msg)
+		m.Pending = ""
+		m.PendingThinking = ""
+		m.Status = "error: " + truncate(msg, 120)
+		m.Working = false
+		m.QueueArmed = false
 	case "session.updated":
 		m.Status = "session updated"
+	case "permission.resolved":
+		var d map[string]string
+		if err := jsonUnmarshal(e.Data, &d); err == nil {
+			m.Status = "permission: " + d["decision"]
+		}
 	case "permission.asked", "permission":
 		var d map[string]string
 		modal := &PermModal{Tool: "bash", Target: string(e.Data)}
@@ -1012,14 +1270,54 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 }
 
 // View renders header pills, timeline, input, and modal.
+// It never does markdown work: lines were rendered on append. It only
+// shows the tail that fits the current Height, so resize/scroll is stable
+// and does not flicker.
 func (m Model) View() string {
 	var sb strings.Builder
 	agentPill := agentStyle.Render(" " + strings.ToUpper(m.Agent) + " ")
 	permPill := permStyle(m.Perm).Render(" " + strings.ToUpper(m.Perm) + " ")
 	fmt.Fprintf(&sb, "%s %s  %s\n", agentPill, permPill, dimStyle.Render(sessID(m.Session)))
 	sb.WriteString(strings.Repeat("─", maxInt(20, m.Width)) + "\n")
-	for _, line := range m.Lines {
-		sb.WriteString(renderMD(line) + "\n")
+	lines := m.Rendered
+	if m.Height > 0 {
+		// Reserve: header(2) + input(1) + status(0-1) + help(1) +
+		// modal/pickers/completion (variable). Keep at least 5 rows for history.
+		reserved := 6
+		if m.Modal != nil {
+			reserved += 3
+		}
+		if m.Picking {
+			reserved += len(m.Sessions) + 1
+		}
+		if m.PickingConnect {
+			reserved += len(m.ConnectOptions) + 1
+		}
+		if m.PickingModel {
+			reserved += len(m.ModelOptions) + 1
+		}
+		if m.Completing {
+			reserved += len(m.CompleteOptions) + 1
+		}
+		if m.Status != "" {
+			reserved++
+		}
+		budget := m.Height - reserved
+		if budget < 5 {
+			budget = 5
+		}
+		if len(lines) > budget {
+			lines = lines[len(lines)-budget:]
+		}
+	} else if len(lines) > 100 {
+		// Headless / tests: cap so a long session cannot blow up View.
+		lines = lines[len(lines)-100:]
+	}
+	for _, line := range lines {
+		sb.WriteString(line + "\n")
+	}
+	if m.Pending != "" || m.PendingThinking != "" {
+		sb.WriteString(m.renderPending() + "\n")
 	}
 	if m.Modal != nil {
 		sb.WriteString(modalStyle.Render(m.renderModal()) + "\n")
@@ -1070,12 +1368,92 @@ func (m Model) View() string {
 			sb.WriteString(style.Render(mark+opt.Text) + desc + "\n")
 		}
 	}
-	sb.WriteString("> " + m.Input + "▊\n")
+	sb.WriteString(renderInputLine(m.Input, m.Cursor) + "\n")
 	if m.Status != "" {
 		sb.WriteString(dimStyle.Render(m.Status) + "\n")
 	}
-	sb.WriteString(dimStyle.Render("tab plan↔build · shift+tab approval · /resume /undo /compact") + "\n")
+	sb.WriteString(dimStyle.Render("tab plan↔build · shift+tab approval · enter steers · ctrl+x queues · /resume /undo /compact") + "\n")
 	return sb.String()
+}
+
+// renderInputLine draws "> input" with a stable cursor cell. Rune-aware so
+// CJK/emoji never split, and pure string ops so typing never re-renders history.
+func renderInputLine(input string, cursor int) string {
+	r := []rune(input)
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(r) {
+		cursor = len(r)
+	}
+	return "> " + string(r[:cursor]) + "▊" + string(r[cursor:])
+}
+
+// renderPending draws the live-streamed turn without markdown work:
+// thinking dimmed, text plain. The final turn.completed render replaces it.
+func (m Model) renderPending() string {
+	var sb strings.Builder
+	if m.ShowThinking && m.PendingThinking != "" {
+		sb.WriteString(dimStyle.Render("… "+tailRunes(m.PendingThinking, 800)) + "\n")
+	}
+	sb.WriteString(tailRunes(m.Pending, 1500) + "▊")
+	return sb.String()
+}
+
+// turnFooter renders the opencode v2 turn summary (agent · model ·
+// duration · tok/s). Empty when the event carries no summary, so old
+// daemons and tests render nothing extra.
+func turnFooter(agent string, d map[string]interface{}) string {
+	model, _ := d["model"].(string)
+	ms, _ := d["duration_ms"].(float64)
+	if model == "" && ms <= 0 {
+		return ""
+	}
+	var parts []string
+	if agent != "" {
+		parts = append(parts, agent)
+	}
+	if model != "" {
+		parts = append(parts, model)
+	}
+	if ms > 0 {
+		parts = append(parts, formatDuration(int64(ms)))
+	}
+	var out int
+	switch v := d["output_tokens"].(type) {
+	case float64:
+		out = int(v)
+	case int:
+		out = v
+	case int64:
+		out = int(v)
+	}
+	if out > 0 && ms > 0 {
+		parts = append(parts, fmt.Sprintf("%.0f tok/s", float64(out)/(ms/1000)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "_" + strings.Join(parts, " · ") + "_"
+}
+
+// formatDuration renders milliseconds like opencode durations.
+func formatDuration(ms int64) string {
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	if ms < 60000 {
+		return fmt.Sprintf("%.1fs", float64(ms)/1000)
+	}
+	return fmt.Sprintf("%dm%02ds", ms/60000, (ms%60000)/1000)
+}
+
+func tailRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return "…" + string(r[len(r)-n:])
 }
 
 func (m Model) renderModal() string {
@@ -1108,14 +1486,6 @@ func permStyle(p string) lipgloss.Style {
 	default:
 		return lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("160")).Foreground(lipgloss.Color("230"))
 	}
-}
-
-func renderMD(src string) string {
-	out, err := glamour.Render(src, "dark")
-	if err != nil {
-		return src
-	}
-	return strings.TrimRight(out, "\n")
 }
 
 func maxInt(a, b int) int {

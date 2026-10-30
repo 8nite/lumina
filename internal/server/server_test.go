@@ -365,6 +365,148 @@ func TestPromptWithImagesAndEffort(t *testing.T) {
 	}
 }
 
+func TestTurnCompletedCarriesSummary(t *testing.T) {
+	s := New(Options{})
+	s.Exec = func(_ context.Context, id string, _ agent.TurnInput) (string, error) {
+		s.NoteTurnEnd(id, agent.TurnStats{Model: "prov/m", DurationMs: 2500, InputTokens: 40, OutputTokens: 100})
+		return "seen", nil
+	}
+	ch, unsub := s.Broker().Subscribe(16)
+	defer unsub()
+	h := s.Handler()
+	cr := httptest.NewRecorder()
+	creq := httptest.NewRequest("POST", "/api/v1/sessions", strings.NewReader(`{"workspace_dir":"/tmp/ws","agent":"build"}`))
+	h.ServeHTTP(cr, creq)
+	var created struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(cr.Body.Bytes(), &created)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/sessions/"+created.ID+"/prompt", strings.NewReader(`{"text":"hi"}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != 202 {
+		t.Fatalf("prompt status=%d", rec.Code)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case e := <-ch:
+			if e.Type != "turn.completed" || e.SessionID != created.ID {
+				continue
+			}
+			var d map[string]interface{}
+			raw, err := json.Marshal(e.Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(raw, &d); err != nil {
+				t.Fatal(err)
+			}
+			if d["text"] != "seen" || d["model"] != "prov/m" {
+				t.Fatalf("data=%v", d)
+			}
+			if d["duration_ms"] != float64(2500) || d["output_tokens"] != float64(100) {
+				t.Fatalf("stats missing: %v", d)
+			}
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("no turn.completed with summary")
+}
+
+func TestPromptQueueChainsTurns(t *testing.T) {
+	st, err := agent.Open(t.TempDir() + "/s.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	runner := agent.NewRunner(st, nil, nil)
+	s := New(Options{})
+	s.Store = st
+	releaseFirst := make(chan struct{})
+	s.Exec = func(ctx context.Context, id string, in agent.TurnInput) (string, error) {
+		if in.Text == "first" {
+			// Hold the first turn open until the test queues behind it.
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(5 * time.Second):
+				return "", fmt.Errorf("first turn not released")
+			case <-releaseFirst:
+			}
+		}
+		return "done:" + in.Text, nil
+	}
+	s.SteerPrompt = runner.Steer
+	s.QueuePrompt = runner.Queue
+	s.TakeQueued = runner.TakeQueued
+	ch, unsub := s.Broker().Subscribe(64)
+	defer unsub()
+	h := s.Handler()
+	mkSession := func() string {
+		cr := httptest.NewRecorder()
+		creq := httptest.NewRequest("POST", "/api/v1/sessions", strings.NewReader(`{"workspace_dir":"/tmp/ws","agent":"build"}`))
+		h.ServeHTTP(cr, creq)
+		if cr.Code != 201 {
+			t.Fatalf("create status=%d", cr.Code)
+		}
+		var created struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(cr.Body.Bytes(), &created)
+		return created.ID
+	}
+	prompt := func(id, body string) map[string]interface{} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/api/v1/sessions/"+id+"/prompt", strings.NewReader(body))
+		h.ServeHTTP(rec, req)
+		if rec.Code != 202 {
+			t.Fatalf("prompt status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var out map[string]interface{}
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return out
+	}
+	id := mkSession()
+	if got := prompt(id, `{"text":"first"}`)["status"]; got != "accepted" {
+		t.Fatalf("first=%v", got)
+	}
+	// While the first turn runs, queue one and steer another.
+	if got := prompt(id, `{"text":"second","delivery":"queue"}`); got["status"] != "queued" || got["position"] != float64(1) {
+		t.Fatalf("queue=%v", got)
+	}
+	if got := prompt(id, `{"text":"third"}`)["status"]; got != "steered" {
+		t.Fatalf("steer=%v", got)
+	}
+	close(releaseFirst)
+	// Both turns complete in order; the steered text lands in the transcript.
+	var completed []string
+	deadline := time.Now().Add(10 * time.Second)
+	for len(completed) < 2 && time.Now().Before(deadline) {
+		select {
+		case e := <-ch:
+			if e.Type == "turn.completed" && e.SessionID == id {
+				var d struct {
+					Text string `json:"text"`
+				}
+				raw, _ := json.Marshal(e.Data)
+				_ = json.Unmarshal(raw, &d)
+				completed = append(completed, d.Text)
+			}
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if len(completed) != 2 || completed[0] != "done:first" || completed[1] != "done:second" {
+		t.Fatalf("completed=%v", completed)
+	}
+	// Steered text stays in the runner inbox for the live loop to consume
+	// (agent-level test proves consumption); the queued turn chained above.
+	if _, ok := runner.TakeQueued(id); ok {
+		t.Fatal("queue should be drained")
+	}
+}
+
 func TestDevicePollRefreshesRouter(t *testing.T) {
 	// After a successful device auth the daemon must hand the fresh token
 	// to the live router (OnAuthRefresh) so /model works with no restart.

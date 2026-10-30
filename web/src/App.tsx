@@ -11,7 +11,7 @@ import {
 } from './api/client';
 import { TopBar } from './components/TopBar';
 import { HomeView } from './components/HomeView';
-import { SessionView, type Turn } from './components/SessionView';
+import { SessionView, type Turn, type LiveStep, type TurnSummary } from './components/SessionView';
 import { ReviewPane } from './components/ReviewPane';
 import { ServersModal } from './components/ServersModal';
 import { TerminalPane } from './components/TerminalPane';
@@ -37,6 +37,11 @@ export default function App() {
   const [homePerm, setHomePerm] = useState('ask');
   const [homeModel, setHomeModel] = useState('');
   const [working, setWorking] = useState(false);
+  const [liveText, setLiveText] = useState('');
+  const [liveThinking, setLiveThinking] = useState('');
+  const [liveSteps, setLiveSteps] = useState<LiveStep[]>([]);
+  const [stage, setStage] = useState('');
+  const [summary, setSummary] = useState<TurnSummary | null>(null);
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
   const [effort, setEffort] = useState('');
 
@@ -83,13 +88,72 @@ export default function App() {
     refresh();
     refreshModels();
     return subscribe((e: DaemonEvent) => {
-      if (e.type === 'turn.started') setWorking(true);
-      if (e.type === 'turn.completed' && e.session_id === session?.id) {
-        const d = e.data as { text?: string };
-        setTurns((t) => [...t, { role: 'assistant', text: d?.text ?? '' }]);
+      const forSession = !e.session_id || !session?.id || e.session_id === session.id;
+      if (e.type === 'turn.started' && forSession) {
+        setWorking(true);
+        setLiveText('');
+        setLiveThinking('');
+        setLiveSteps([]);
+        setStage('');
+        setSummary(null);
+      }
+      if ((e.type === 'turn.delta') && forSession) {
+        const d = (e.data || {}) as { delta?: string; thinking?: string };
+        if (d.delta) setLiveText((t) => (t + d.delta!).slice(-8000));
+        if (d.thinking) setLiveThinking((t) => (t + d.thinking!).slice(-4000));
+      }
+      if (e.type === 'turn.progress' && forSession) {
+        const d = (e.data || {}) as { stage?: string };
+        if (d.stage) setStage(d.stage);
+      }
+      if (e.type === 'turn.tool' && forSession) {
+        const d = (e.data || {}) as Partial<LiveStep> & { phase?: 'start' | 'done' };
+        if (d.tool) {
+          setLiveSteps((steps) => {
+            const next = [...steps];
+            if (d.phase === 'done') {
+              const i = [...next].reverse().findIndex((s) => s.tool === d.tool && s.phase === 'start');
+              const step: LiveStep = {
+                tool: d.tool!, target: d.target || '',
+                phase: 'done', preview: d.preview, error: d.error, duration_ms: d.duration_ms,
+              };
+              if (i >= 0) next[next.length - 1 - i] = step;
+              else next.push(step);
+            } else {
+              next.push({ tool: d.tool!, target: d.target || '', phase: 'start' });
+            }
+            return next.slice(-30);
+          });
+        }
+      }
+      if (e.type === 'turn.completed' && e.session_id && e.session_id === session?.id) {
+        const sid = e.session_id;
+        const d = (e.data || {}) as { text?: string; model?: string; duration_ms?: number; output_tokens?: number };
+        setSummary({ model: d.model, duration_ms: d.duration_ms, output_tokens: d.output_tokens });
+        api.export(sid).then((ex) => {
+          setTurns(
+            (ex.transcript || [])
+              .filter((t) => t.role === 'user' || t.role === 'assistant' || t.role === 'tool' || t.role === 'tool_error')
+              .map((t) => ({ role: t.role, text: t.text })),
+          );
+        }).catch(() => {
+          const d = e.data as { text?: string };
+          setTurns((t) => [...t, { role: 'assistant', text: d?.text ?? '' }]);
+        });
+        setLiveText('');
+        setLiveThinking('');
+        setLiveSteps([]);
+        setStage('');
         setWorking(false);
       }
-      if (e.type === 'turn.failed') setWorking(false);
+      if (e.type === 'turn.failed' && forSession) {
+        setLiveText('');
+        setLiveThinking('');
+        setLiveSteps([]);
+        setStage('');
+        setSummary(null);
+        setWorking(false);
+      }
       if (e.type === 'session.created' || e.type === 'session.updated' || e.type === 'auth.connected') refresh();
     });
   }, [refresh, refreshModels, session?.id, base]);
@@ -180,7 +244,7 @@ export default function App() {
         const ex = await api.export(s.id);
         setTurns(
           (ex.transcript || [])
-            .filter((t) => t.role === 'user' || t.role === 'assistant')
+            .filter((t) => t.role === 'user' || t.role === 'assistant' || t.role === 'tool' || t.role === 'tool_error')
             .map((t) => ({ role: t.role, text: t.text })),
         );
       } catch {
@@ -189,7 +253,7 @@ export default function App() {
     }
   };
 
-  const send = async () => {
+  const send = async (delivery: 'steer' | 'queue' = 'steer') => {
     const text = input.trim();
     if (!text && attachments.length === 0) return;
     setInput('');
@@ -206,7 +270,8 @@ export default function App() {
     setTurns((t) => [...t, { role: 'user', text: shown }]);
     setWorking(true);
     try {
-      await api.prompt(s.id, text, atts, effort || undefined);
+      const r = await api.prompt(s.id, text, atts, effort || undefined, delivery);
+      if (r.status === 'queued') setStage(`queued #${r.position ?? ''}`.trim());
     } catch (err) {
       setWorking(false);
       alert(String(err));
@@ -258,7 +323,7 @@ export default function App() {
               modified={branch.modified}
               input={input}
               onInput={setInput}
-              onSend={() => void send()}
+              onSend={(d) => void send(d)}
               agent={agent}
               onAgent={setHomeAgent}
               model={model}
@@ -280,7 +345,7 @@ export default function App() {
               onUndo={(i) => session && api.revert(session.id).then(() => setTurns((t) => t.slice(0, i)))}
               input={input}
               onInput={setInput}
-              onSend={() => void send()}
+              onSend={(d) => void send(d)}
               agent={agent}
               onAgent={(a) => api.patchSession(session.id, { agent: a }).then(setSession)}
               model={model}
@@ -295,6 +360,11 @@ export default function App() {
               onAttach={(f) => void onAttach(f)}
               onRemoveAttachment={(i) => setAttachments((a) => a.filter((_, j) => j !== i))}
               working={working}
+              liveText={liveText}
+              liveThinking={liveThinking}
+              liveSteps={liveSteps}
+              stage={stage}
+              summary={summary}
             />
           )}
         </main>

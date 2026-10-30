@@ -132,6 +132,8 @@ func loadStack() (*config.Config, *llm.Router, *tools.Registry) {
 	}
 	reg := tools.NewRegistry()
 	wireToolBackends(reg)
+	reg.WebSearchProvider = cfg.WebSearch.Provider
+	reg.WebSearchDisabled = cfg.WebSearch.Disabled
 	return cfg, router, reg
 }
 
@@ -161,6 +163,31 @@ func runServe(args []string) error {
 	}
 	srv.Store = st
 	runner := agent.NewRunner(st, router, reg)
+	// opencode-style live feedback (reimplemented): stage updates become
+	// turn.progress SSE; approval pauses publish permission.asked and wait
+	// for the TUI answer instead of failing the tool call.
+	runner.OnProgress = func(sessionID, stage string) {
+		srv.Broker().Publish(server.Event{Type: "turn.progress", SessionID: sessionID, Data: map[string]string{"stage": stage}})
+	}
+	runner.OnDelta = func(sessionID, delta, thinking string) {
+		srv.Broker().Publish(server.Event{Type: "turn.delta", SessionID: sessionID, Data: map[string]string{"delta": delta, "thinking": thinking}})
+	}
+	runner.OnToolStart = func(sessionID, tool, target string) {
+		srv.Broker().Publish(server.Event{Type: "turn.tool", SessionID: sessionID, Data: map[string]interface{}{"phase": "start", "tool": tool, "target": target}})
+	}
+	runner.OnToolDone = func(sessionID, tool, target, preview string, isErr bool, durationMs int64) {
+		srv.Broker().Publish(server.Event{Type: "turn.tool", SessionID: sessionID, Data: map[string]interface{}{"phase": "done", "tool": tool, "target": target, "preview": preview, "error": isErr, "duration_ms": durationMs}})
+	}
+	// Turn summaries (opencode v2: agent, model, duration, tok/s) ride the
+	// turn.completed event; the prompt handler picks them up below.
+	runner.OnTurnEnd = srv.NoteTurnEnd
+	// Inbox: steer/queue while a turn runs (opencode parity).
+	srv.SteerPrompt = runner.Steer
+	srv.QueuePrompt = runner.Queue
+	srv.TakeQueued = runner.TakeQueued
+	runner.AskPermission = func(ctx context.Context, sessionID, tool, target string) (string, error) {
+		return srv.RequestPermission(ctx, sessionID, tool, target)
+	}
 	var provNames []string
 	for name := range cfg.Providers {
 		provNames = append(provNames, name)
@@ -417,6 +444,33 @@ func runHeadless(args []string) error {
 		}
 	}
 	runner := agent.NewRunner(st, router, reg)
+	// Progression is on by default: stages, tool calls, and the turn
+	// summary stream to stderr while the turn runs, so a working agent is
+	// never silent. Stdout keeps only the final answer (machine-readable
+	// for --format json).
+	runner.OnProgress = func(_, stage string) {
+		if strings.HasPrefix(stage, "tool: ") {
+			return // covered by OnToolStart below
+		}
+		fmt.Fprintf(os.Stderr, "› %s\n", stage)
+	}
+	runner.OnToolStart = func(_, tool, target string) {
+		fmt.Fprintf(os.Stderr, "▸ %s %s\n", tool, target)
+	}
+	runner.OnToolDone = func(_, tool, _, preview string, isErr bool, durationMs int64) {
+		if isErr {
+			fmt.Fprintf(os.Stderr, "  ✗ %s (%s): %s\n", tool, agent.FormatDuration(durationMs), preview)
+		} else if preview != "" {
+			fmt.Fprintf(os.Stderr, "  → %s\n", preview)
+		} else {
+			fmt.Fprintf(os.Stderr, "  ✓ %s (%s)\n", tool, agent.FormatDuration(durationMs))
+		}
+	}
+	runner.OnTurnEnd = func(_ string, st agent.TurnStats) {
+		if s := st.Summary(); s != "" {
+			fmt.Fprintf(os.Stderr, "› done %s\n", s)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	images, err := loadAttachments(attach)
@@ -782,7 +836,8 @@ func runEvolve(args []string) error {
 
 // ---------- models & auth (provider connect) ----------
 
-// runModels lists live models for a provider (copilot gateway /models).
+// runModels lists live models for any provider implementing ModelLister
+// (copilot gateway, opencode zen, openai-compatible /models, ...).
 func runModels(args []string) error {
 	provider := ""
 	for i := 0; i < len(args); i++ {
@@ -794,19 +849,21 @@ func runModels(args []string) error {
 	if provider == "" {
 		return fmt.Errorf("lumina models: missing --provider")
 	}
-	cfg, _, _ := loadStack()
-	p, ok := cfg.Providers[provider]
+	_, router, _ := loadStack()
+	if router == nil {
+		return fmt.Errorf("lumina models: no router configured")
+	}
+	p, ok := router.Provider(provider)
 	if !ok {
 		return fmt.Errorf("unknown provider %q", provider)
 	}
-	key, _ := config.ResolveSecret(p)
-	cp := &llm.Copilot{
-		BaseURL: p.BaseURL, TokenURL: p.TokenURL,
-		GitHubToken: key, ProviderName: provider,
+	lister, ok := p.(llm.ModelLister)
+	if !ok {
+		return fmt.Errorf("provider %q does not list models", provider)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	models, err := cp.ListModels(ctx)
+	models, err := lister.ListModels(ctx)
 	if err != nil {
 		return fmt.Errorf("lumina models: %v (connect with `lumina auth device --provider %s`)", err, provider)
 	}

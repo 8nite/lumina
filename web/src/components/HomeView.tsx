@@ -10,7 +10,7 @@ export function HomeView(props: {
   modified: string;
   input: string;
   onInput: (v: string) => void;
-  onSend: () => void;
+  onSend: (delivery?: 'steer' | 'queue') => void;
   agent: string;
   onAgent: (a: string) => void;
   model: string;

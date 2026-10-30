@@ -8,13 +8,43 @@ export interface Turn {
   text: string;
 }
 
+export interface LiveStep {
+  tool: string;
+  target: string;
+  phase: 'start' | 'done';
+  preview?: string;
+  error?: boolean;
+  duration_ms?: number;
+}
+
+export interface TurnSummary {
+  agent?: string;
+  model?: string;
+  duration_ms?: number;
+  output_tokens?: number;
+}
+
+export function formatSummary(s: TurnSummary | null): string {
+  if (!s) return '';
+  const parts: string[] = [];
+  if (s.model) parts.push(s.model);
+  if (s.duration_ms && s.duration_ms > 0) {
+    const ms = s.duration_ms;
+    parts.push(ms < 1000 ? `${ms}ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.floor(ms / 60000)}m${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}s`);
+  }
+  if (s.output_tokens && s.output_tokens > 0 && s.duration_ms && s.duration_ms > 0) {
+    parts.push(`${Math.round(s.output_tokens / (s.duration_ms / 1000))} tok/s`);
+  }
+  return parts.join(' · ');
+}
+
 // Active-session timeline: prompt cards, collapsible steps, responses.
 export function SessionView(props: {
   turns: Turn[];
   onUndo: (i: number) => void;
   input: string;
   onInput: (v: string) => void;
-  onSend: () => void;
+  onSend: (delivery?: 'steer' | 'queue') => void;
   agent: string;
   onAgent: (a: string) => void;
   model: string;
@@ -29,8 +59,20 @@ export function SessionView(props: {
   attachments: PromptAttachment[];
   onAttach: (f: FileList | null) => void;
   onRemoveAttachment: (i: number) => void;
+  // Live run state: streamed text/thinking, tool steps, status stage,
+  // and the just-finished turn summary (opencode v2 turn summary).
+  liveText: string;
+  liveThinking: string;
+  liveSteps: LiveStep[];
+  stage: string;
+  summary: TurnSummary | null;
 }) {
   const [showSteps, setShowSteps] = useState(true);
+  const summaryText = formatSummary(props.summary);
+  let lastAssistant = -1;
+  props.turns.forEach((t, i) => {
+    if (t.role === 'assistant') lastAssistant = i;
+  });
   const toolTurns = (i: number) => {
     // Tool pills belonging to the assistant turn ending at/before i.
     const out: { idx: number; t: Turn }[] = [];
@@ -90,7 +132,7 @@ export function SessionView(props: {
                     ))}
                   </div>
                 )}
-                <div className="mb-1 text-xs text-zinc-500">Response</div>
+                <div className="mb-1 text-xs text-zinc-500">Response{i === lastAssistant && summaryText ? ` · ${summaryText}` : ''}</div>
                 <div className="whitespace-pre-wrap text-sm leading-relaxed text-zinc-100">
                   <LinkifiedText text={t.text} />
                 </div>
@@ -103,6 +145,46 @@ export function SessionView(props: {
               </div>
             );
           })}
+          {props.working && (
+            <div className="rounded-lg border border-white/10 bg-white/[0.02] px-4 py-3">
+              <div className="mb-1 text-xs text-zinc-500">
+                {props.stage || 'working…'}
+              </div>
+              {props.liveSteps.length > 0 && (
+                <div className="mb-2 flex flex-wrap gap-1.5">
+                  {props.liveSteps.map((s, i) => (
+                    <span
+                      key={i}
+                      title={(s.target + (s.preview ? '\n' + s.preview : '')).slice(0, 300)}
+                      className={`rounded border px-2 py-0.5 font-mono text-[11px] ${
+                        s.error
+                          ? 'border-red-500/30 text-red-300'
+                          : s.phase === 'done'
+                            ? 'border-white/10 text-zinc-400'
+                            : 'border-amber-500/30 text-amber-300'
+                      }`}
+                    >
+                      {s.tool} {s.target.slice(0, 60)}
+                      {s.phase === 'done' && s.duration_ms != null ? ` · ${s.duration_ms}ms` : ''}
+                      {s.phase === 'start' ? ' …' : ''}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {props.liveThinking && (
+                <details className="mb-2 text-xs text-zinc-500">
+                  <summary className="cursor-pointer hover:text-zinc-300">thinking</summary>
+                  <div className="mt-1 whitespace-pre-wrap">{props.liveThinking.slice(-2000)}</div>
+                </details>
+              )}
+              {props.liveText && (
+                <div className="whitespace-pre-wrap text-sm leading-relaxed text-zinc-100">
+                  {props.liveText.slice(-4000)}
+                  <span className="animate-pulse">▊</span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
       <div className="mx-auto w-full max-w-2xl px-4 pb-6">

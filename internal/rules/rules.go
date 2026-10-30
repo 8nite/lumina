@@ -122,7 +122,7 @@ func Load(o Options) *Bundle {
 			filepath.Join(o.WorkspaceDir, ".lumina", "skills"),
 			filepath.Join(o.WorkspaceDir, ".lumina", "harness", "skills"),
 		})...)
-		b.Agents = discoverAgents(o.WorkspaceDir)
+		b.Agents = append(discoverAgents(o.WorkspaceDir), BuiltinAgents()...)
 		b.Commands = discoverCommands(o.WorkspaceDir)
 	}
 
@@ -254,6 +254,30 @@ func discoverSkillsFromRoots(roots []string) []SkillMeta {
 		}
 	}
 	return out
+}
+
+// BuiltinAgents mirrors opencode's shipped subagents (reimplemented):
+// general handles multi-step work with broad tools but cannot delegate;
+// explore is read-only research over code and the web.
+func BuiltinAgents() []AgentDef {
+	return []AgentDef{
+		{
+			Name:        "general",
+			Description: "Handles research and multi-step work with broad tool access, but cannot launch subagents.",
+			Mode:        "subagent",
+			Body: "You are a general-purpose subagent. Research the workspace, run safe diagnostics, " +
+				"and complete multi-step tasks. Prefer kb_query and grep before broad edits. " +
+				"Summarize what you did with file references.",
+		},
+		{
+			Name:        "explore",
+			Description: "Searches and reads code or web sources without editing files.",
+			Mode:        "subagent",
+			Body: "You are an explore subagent. Search and read code (read, glob, grep, lsp), " +
+				"memory (kb_query, skill), and the web (webfetch, websearch). " +
+				"Do not edit files. Report findings with file and line references.",
+		},
+	}
 }
 
 func discoverAgents(workspace string) []AgentDef {

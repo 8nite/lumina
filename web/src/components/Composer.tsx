@@ -5,11 +5,12 @@ const agents = ['plan', 'build'];
 const perms = ['ask', 'auto-edit', 'auto-approve', 'bypass'];
 
 // Centered composer card: attachments, textarea, agent / model / effort /
-// permission controls.
+// permission controls. Enter steers the active turn; Ctrl+X then Enter
+// queues for later (opencode parity); Esc cancels an armed queue.
 export function Composer(props: {
   value: string;
   onChange: (v: string) => void;
-  onSend: () => void;
+  onSend: (delivery?: 'steer' | 'queue') => void;
   agent: string;
   onAgent: (a: string) => void;
   model: string;
@@ -28,6 +29,7 @@ export function Composer(props: {
 }) {
   const [open, setOpen] = useState<null | 'agent' | 'model' | 'perm' | 'effort'>(null);
   const [custom, setCustom] = useState('');
+  const [queueArmed, setQueueArmed] = useState(false);
   const boxRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -58,9 +60,20 @@ export function Composer(props: {
         value={props.value}
         onChange={(e) => props.onChange(e.target.value)}
         onKeyDown={(e) => {
+          if (e.key === 'x' && e.ctrlKey) {
+            e.preventDefault();
+            setQueueArmed(true);
+            return;
+          }
+          if (e.key === 'Escape') {
+            setQueueArmed(false);
+            return;
+          }
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
-            props.onSend();
+            const q = queueArmed;
+            setQueueArmed(false);
+            props.onSend(q ? 'queue' : 'steer');
           }
         }}
         placeholder={props.placeholder ?? 'Ask anything... "Help me debug this issue"'}
@@ -156,9 +169,9 @@ export function Composer(props: {
         <button onClick={() => fileRef.current?.click()} className="mr-1 rounded px-1.5 py-0.5 text-zinc-400 hover:bg-white/5 hover:text-zinc-200" title="Attach images">
           🖼
         </button>
-        <span className="mr-1 text-xs text-zinc-600">{props.working ? 'working…' : ''}</span>
+        <span className="mr-1 text-xs text-zinc-600">{queueArmed ? 'will queue…' : props.working ? 'working… (enter steers)' : ''}</span>
         <button
-          onClick={props.onSend}
+          onClick={() => { const q = queueArmed; setQueueArmed(false); props.onSend(q ? 'queue' : 'steer'); }}
           className="flex h-7 w-7 items-center justify-center rounded-md bg-white/10 text-zinc-200 hover:bg-white/20"
           title="Send"
         >
