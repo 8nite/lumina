@@ -2,6 +2,7 @@ package agent
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"fmt"
 	"regexp"
 	"sort"
@@ -12,20 +13,23 @@ import (
 //
 // Detection reuses the secret shapes from SanitizeExport (store.go), but
 // instead of redacting, each distinct value is minted a stable per-session
-// reference like [LUMINA-SECRET-A3F9C2]. Outbound text (history, tool
-// feedback, steered input, subagent tasks) is substituted before it enters
-// an llm.Message, so the provider never sees the value. Inbound text
+// reference like {placeholder_k3x}. Outbound text (history, tool feedback,
+// steered input, subagent tasks) is substituted before it enters an
+// llm.Message, so the provider never sees the value. Inbound text
 // (assistant replies, tool args) is resolved locally, so the user, the
 // transcript, and tool execution all see the real value.
 //
-// Mappings persist in the vault table with values sealed by the turnkey
-// (crypt.go): the DB stays encrypted at rest AND the provider stays blind.
-// Refs are inert by construction — they match no secret pattern (no re-vault
-// loop) and no credential path (security hard-deny unaffected).
+// Mappings persist in the vault table as-is (no encryption: the DB is the
+// user's own file and every read path already shows values). Refs are inert
+// by construction — they match no secret pattern (no re-vault loop) and no
+// credential path (security hard-deny unaffected).
 
-// vaultRefRe matches minted references. Keep the alphabet clear of every
-// secret pattern above: no "=", no "sk-", no bearer shape.
-var vaultRefRe = regexp.MustCompile(`\[LUMINA-SECRET-[0-9A-F]{6}\]`)
+// vaultRefRe matches minted references: {placeholder_ + 3 ASCII chars}.
+var vaultRefRe = regexp.MustCompile(`\{placeholder_[a-z0-9]{3}\}`)
+
+// placeholderAlphabet is the JSON/brace/regex-safe ASCII subset refs draw
+// from (36^3 ≈ 46k per session, with retry on collision).
+const placeholderAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
 
 // vaultPattern pairs a detector with its label/value group layout
 // (0 = absent: the whole match is the secret).
@@ -43,45 +47,78 @@ var vaultPatterns = []vaultPattern{
 	{regexp.MustCompile(`(?i)(bearer\s+)([A-Za-z0-9\-._~+/]+-=*)`), 1, 2},
 }
 
-// migrateVault creates the ref→sealed-value mapping table.
+// migrateVault creates the ref→value mapping table. The pre-release layout
+// used a `sealed` column; existing dev DBs get a `value` column added and
+// keep working (old sealed rows read as unknown refs and pass through;
+// new writes fill both columns so the old NOT NULL constraint holds).
 func (s *Store) migrateVault() error {
-	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS vault(
- session_id TEXT NOT NULL, ref TEXT NOT NULL, sealed TEXT NOT NULL, created_at TEXT,
- UNIQUE(session_id, ref))`)
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS vault(
+ session_id TEXT NOT NULL, ref TEXT NOT NULL, value TEXT NOT NULL DEFAULT '', created_at TEXT,
+ UNIQUE(session_id, ref))`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_vault_session ON vault(session_id)`); err != nil {
+		return err
+	}
+	rows, err := s.db.Query(`PRAGMA table_info(vault)`)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_vault_session ON vault(session_id)`)
+	defer rows.Close()
+	hasValue := false
+	hasSealed := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "value" {
+			hasValue = true
+		}
+		if name == "sealed" {
+			hasSealed = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !hasValue {
+		_, err = s.db.Exec(`ALTER TABLE vault ADD COLUMN value TEXT NOT NULL DEFAULT ''`)
+	}
+	s.vaultLegacy = hasSealed
 	return err
 }
 
 // vaultRefFor returns the stable ref for value in this session, minting and
 // persisting one on first sight.
 func (s *Store) vaultRefFor(sessionID, value string) (string, error) {
-	rows, err := s.db.Query(`SELECT ref,sealed FROM vault WHERE session_id=?`, sessionID)
+	rows, err := s.db.Query(`SELECT ref,value FROM vault WHERE session_id=?`, sessionID)
 	if err != nil {
 		return "", err
 	}
-	type entry struct{ ref, sealed string }
+	type entry struct{ ref, value string }
 	var entries []entry
 	for rows.Next() {
 		var e entry
-		if err := rows.Scan(&e.ref, &e.sealed); err != nil {
+		var v sql.NullString
+		if err := rows.Scan(&e.ref, &v); err != nil {
 			rows.Close()
 			return "", err
 		}
-		entries = append(entries, e)
+		if v.Valid {
+			e.value = v.String
+			entries = append(entries, e)
+		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return "", err
 	}
 	for _, e := range entries {
-		plain, err := openGCM(s.key, e.sealed)
-		if err != nil {
-			return "", fmt.Errorf("vault %s: %w", e.ref, err)
-		}
-		if plain == value {
+		if e.value == value {
 			return e.ref, nil
 		}
 	}
@@ -90,21 +127,25 @@ func (s *Store) vaultRefFor(sessionID, value string) (string, error) {
 		if _, err := rand.Read(b[:]); err != nil {
 			return "", err
 		}
-		ref := fmt.Sprintf("[LUMINA-SECRET-%02X%02X%02X]", b[0], b[1], b[2])
-		sealed, err := sealGCM(s.key, []byte(value))
-		if err != nil {
-			return "", err
+		ref := fmt.Sprintf("{placeholder_%c%c%c}",
+			placeholderAlphabet[int(b[0])%len(placeholderAlphabet)],
+			placeholderAlphabet[int(b[1])%len(placeholderAlphabet)],
+			placeholderAlphabet[int(b[2])%len(placeholderAlphabet)])
+		if s.vaultLegacy {
+			_, err = s.exec(`INSERT INTO vault(session_id,ref,sealed,value,created_at) VALUES(?,?,?,?,?)`,
+				sessionID, ref, value, value, nowStr())
+		} else {
+			_, err = s.exec(`INSERT INTO vault(session_id,ref,value,created_at) VALUES(?,?,?,?)`,
+				sessionID, ref, value, nowStr())
 		}
-		_, err = s.exec(`INSERT INTO vault(session_id,ref,sealed,created_at) VALUES(?,?,?,?)`,
-			sessionID, ref, sealed, nowStr())
 		if err == nil {
 			return ref, nil
 		}
-		if !isBusy(err) && !strings.Contains(strings.ToLower(err.Error()), "unique") {
-			return "", err
-		}
 		if isBusy(err) {
 			return "", err // exec already retried BUSY; don't spin refs
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return "", err
 		}
 		// UNIQUE collision on ref: mint another.
 	}
@@ -114,16 +155,12 @@ func (s *Store) vaultRefFor(sessionID, value string) (string, error) {
 // vaultValue resolves one ref to its value; unknown refs pass through so a
 // foreign or stale token degrades to inert text, never an error.
 func (s *Store) vaultValue(sessionID, ref string) (string, bool, error) {
-	var sealed string
-	err := s.db.QueryRow(`SELECT sealed FROM vault WHERE session_id=? AND ref=?`, sessionID, ref).Scan(&sealed)
-	if err != nil {
+	var v sql.NullString
+	err := s.db.QueryRow(`SELECT value FROM vault WHERE session_id=? AND ref=?`, sessionID, ref).Scan(&v)
+	if err != nil || !v.Valid || v.String == "" {
 		return "", false, nil
 	}
-	plain, err := openGCM(s.key, sealed)
-	if err != nil {
-		return "", false, err
-	}
-	return plain, true, nil
+	return v.String, true, nil
 }
 
 // substituteSecrets swaps secret-shaped spans for stable refs. Labels
@@ -157,21 +194,20 @@ func (s *Store) substituteSecrets(sessionID, text string) (string, error) {
 		}
 		return spans[i].end > spans[j].end // longest wins ties
 	})
-	// Drop overlaps (e.g. api_key=sk-… matches two patterns).
+	// Drop overlaps (e.g. api_key=sk-… matches two patterns). Spans whose
+	// value is already a ref are left verbatim: re-vaulting the ref would
+	// nest a new ref on every round, forever.
 	kept := spans[:0]
 	end := -1
 	for _, sp := range spans {
 		if sp.start < end {
 			continue
 		}
+		end = sp.end
 		if vaultRefRe.MatchString(sp.value) {
-			// Already opaque (e.g. api_key=[LUMINA-SECRET-…] on a later
-			// round): re-vaulting the ref would nest forever. Skip.
-			end = sp.end
 			continue
 		}
 		kept = append(kept, sp)
-		end = sp.end
 	}
 	var sb strings.Builder
 	pos := 0
@@ -192,7 +228,7 @@ func (s *Store) substituteSecrets(sessionID, text string) (string, error) {
 // resolveRefs swaps refs back to values for user display, storage, and
 // tool execution. Unknown refs pass through untouched.
 func (s *Store) resolveRefs(sessionID, text string) (string, error) {
-	if !strings.Contains(text, "[LUMINA-SECRET-") {
+	if !strings.Contains(text, "{placeholder_") {
 		return text, nil // ponytail: skip the regex on the common path
 	}
 	var out strings.Builder

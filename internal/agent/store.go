@@ -39,12 +39,12 @@ type Session struct {
 }
 
 // Store persists sessions + turn trees in pure-Go SQLite (WAL).
-// Turn texts are encrypted at rest (see crypt.go); the key lives in a 0600
-// file beside the DB.
 type Store struct {
 	db   *sql.DB
 	path string
-	key  []byte
+	// vaultLegacy marks the pre-release vault layout (sealed column kept
+	// filled so its NOT NULL constraint holds on old dev DBs).
+	vaultLegacy bool
 }
 
 // Open creates ~/. dirs as needed and migrates schema.
@@ -79,12 +79,6 @@ func Open(path string) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		return nil, err
 	}
-	key, err := loadOrCreateKey(path)
-	if err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	s.key = key
 	if err := s.migrateVault(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -261,19 +255,14 @@ func (s *Store) ForkSession(id, turnID string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Copy ancestor turns up to turnID (or all when empty). ListTurns
-	// returns plaintext; re-seal on insert so forks are encrypted too.
+	// Copy ancestor turns up to turnID (or all when empty).
 	turns, err := s.ListTurns(id)
 	if err != nil {
 		return nil, err
 	}
 	for _, t := range turns {
-		sealed, err := sealTurn(s.key, t.Text)
-		if err != nil {
-			return nil, err
-		}
 		_, err = s.exec(`INSERT INTO turns(id,session_id,parent_id,role,text,created_at) VALUES(?,?,?,?,?,?)`,
-			uuid.NewString()[:8], fork.ID, t.ParentID, t.Role, sealed, t.CreatedAt)
+			uuid.NewString()[:8], fork.ID, t.ParentID, t.Role, t.Text, t.CreatedAt)
 		if err != nil {
 			return nil, err
 		}
@@ -284,15 +273,11 @@ func (s *Store) ForkSession(id, turnID string) (*Session, error) {
 	return fork, nil
 }
 
-// AddTurn appends a turn node (text sealed at rest; see crypt.go).
+// AddTurn appends a turn node.
 func (s *Store) AddTurn(sessionID, parentID, role, text string) (*Turn, error) {
 	t := &Turn{ID: uuid.NewString()[:8], SessionID: sessionID, ParentID: parentID, Role: role, Text: text, CreatedAt: nowStr()}
-	sealed, err := sealTurn(s.key, t.Text)
-	if err != nil {
-		return nil, err
-	}
-	_, err = s.exec(`INSERT INTO turns(id,session_id,parent_id,role,text,created_at) VALUES(?,?,?,?,?,?)`,
-		t.ID, t.SessionID, t.ParentID, t.Role, sealed, t.CreatedAt)
+	_, err := s.exec(`INSERT INTO turns(id,session_id,parent_id,role,text,created_at) VALUES(?,?,?,?,?,?)`,
+		t.ID, t.SessionID, t.ParentID, t.Role, t.Text, t.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +285,7 @@ func (s *Store) AddTurn(sessionID, parentID, role, text string) (*Turn, error) {
 	return t, nil
 }
 
-// ListTurns returns a session's turns in insertion order (unsealed).
+// ListTurns returns a session's turns in insertion order.
 func (s *Store) ListTurns(sessionID string) ([]*Turn, error) {
 	rows, err := s.db.Query(`SELECT id,session_id,parent_id,role,text,created_at FROM turns WHERE session_id=? ORDER BY created_at`, sessionID)
 	if err != nil {
@@ -313,11 +298,6 @@ func (s *Store) ListTurns(sessionID string) ([]*Turn, error) {
 		if err := rows.Scan(&t.ID, &t.SessionID, &t.ParentID, &t.Role, &t.Text, &t.CreatedAt); err != nil {
 			return nil, err
 		}
-		plain, err := openTurn(s.key, t.Text)
-		if err != nil {
-			return nil, fmt.Errorf("turn %s: %w", t.ID, err)
-		}
-		t.Text = plain
 		out = append(out, &t)
 	}
 	return out, rows.Err()
