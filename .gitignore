@@ -1,0 +1,38 @@
+# Local Lumina operational state & probe sandboxes
+.lumina/lumina.db*
+.lumina/probe-*/
+.lumina/tmp/
+
+# Graphify transient extraction scratch files & cache (keep graph.json, GRAPH_REPORT.md, manifest.json, reflections/)
+**/graphify-out/.graphify_*
+**/graphify-out/.needs_update
+**/graphify-out/.vocab.txt
+**/graphify-out/cache/
+
+# Build outputs
+/bin/
+/dist/
+/lumina
+web/dist/
+web/node_modules/
+node_modules/
+*.tsbuildinfo
+
+# Secrets & environment files (never commit)
+.env
+.env.*
+*.pem
+*.key
+*secret*
+*credential*
+auth.json
+lumina.json
+# Local Lumina provider configs (may name endpoints/key vault refs)
+config.toml
+lumina.db*
+*.db-wal
+*.db-shm
+
+# OS / Editor
+.DS_Store
+*.swp

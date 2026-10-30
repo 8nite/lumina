@@ -1,0 +1,26 @@
+{
+  "MEMORY.md": {
+    "mtime": 1793323448.811,
+    "seen": 1793323482.5391762,
+    "ast_hash": "1dfbdef9ffe1a85dcdac14c71f4825f2",
+    "semantic_hash": "1dfbdef9ffe1a85dcdac14c71f4825f2"
+  },
+  "project.md": {
+    "mtime": 1793323467.4902844,
+    "seen": 1793323482.5391762,
+    "ast_hash": "d2d27adc22c3f79a5dfc6bdbc8f732b7",
+    "semantic_hash": "d2d27adc22c3f79a5dfc6bdbc8f732b7"
+  },
+  "lumina-build.md": {
+    "mtime": 1793318505.973173,
+    "seen": 1793318531.533234,
+    "ast_hash": "c02b74cb0c1130b0395476f5f3f62cb8",
+    "semantic_hash": "c02b74cb0c1130b0395476f5f3f62cb8"
+  },
+  "lumina-live.md": {
+    "mtime": 1793323385.7810447,
+    "seen": 1793323482.5391762,
+    "ast_hash": "aef4ced44397002ea6643650e2be08b0",
+    "semantic_hash": "aef4ced44397002ea6643650e2be08b0"
+  }
+}

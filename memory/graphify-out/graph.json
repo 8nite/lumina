@@ -1,0 +1,549 @@
+{
+  "directed": false,
+  "multigraph": false,
+  "graph": {
+    "hyperedges": [
+      {
+        "id": "he_lumina_core_pillars",
+        "label": "Lumina Local-First Architecture Pillars",
+        "nodes": [
+          "project_lumina_daemon",
+          "project_graphify_kb",
+          "project_harness2_engine",
+          "project_no_google_secret_guard"
+        ],
+        "relation": "form",
+        "confidence": "EXTRACTED",
+        "confidence_score": 1.0,
+        "source_file": "project.md"
+      },
+      {
+        "id": "he_lumina_parity",
+        "label": "Lumina Runtime Parity Surface",
+        "nodes": [
+          "project_rules_hierarchy",
+          "project_lumina_plugins",
+          "project_plan_build_modes",
+          "project_permission_modes",
+          "project_session_lifecycle"
+        ],
+        "relation": "form",
+        "confidence": "EXTRACTED",
+        "confidence_score": 1.0,
+        "source_file": "project.md"
+      }
+    ],
+    "schema_version": 1,
+    "graphify_version": "0.9.82"
+  },
+  "nodes": [
+    {
+      "id": "lumina_build_verification_gate",
+      "label": "Go plus Web Verification Gate",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 0,
+      "community_name": "M0-M6 Build and Delivery",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "go plus web verification gate",
+      "rationale": "go test ./... (14 pkgs) plus pnpm test/build plus live daemon e2e must stay green.",
+      "source_file": "lumina-build.md",
+      "source_location": "lumina-build.md:7",
+      "source_url": null
+    },
+    {
+      "id": "project_harness2_engine",
+      "label": "Harness2 Propose-Probe-Compose Engine",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 0,
+      "community_name": "M0-M6 Build and Delivery",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "harness2 propose-probe-compose engine",
+      "rationale": "Optimizes 8 mutable harness components on refs/lumina/harness in git worktree sandboxes and promotes lessons into a graphify library.",
+      "source_file": "project.md",
+      "source_location": "project.md:17",
+      "source_url": null
+    },
+    {
+      "id": "project_lumina_plugins",
+      "label": "Lumina-Compatible JS/TS Plugin Host",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 0,
+      "community_name": "M0-M6 Build and Delivery",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "lumina-compatible js/ts plugin host",
+      "rationale": "On-demand Node v22 worker supporting factory and v2 setup(ctx) plugins across chat.message, tool.execute.before/after, shell.env, permission.ask, and event hooks.",
+      "source_file": "project.md",
+      "source_location": "project.md:12",
+      "source_url": null
+    },
+    {
+      "id": "project_session_lifecycle",
+      "label": "Session Continue, Fork & Shadow-Git Undo",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 0,
+      "community_name": "M0-M6 Build and Delivery",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "session continue, fork & shadow-git undo",
+      "rationale": "Supports -c/--continue per workspace, -s <id>, /fork, lumina run, sanitized export, shadow-Git /undo+/redo, per-session TMPDIR, and model-persist.",
+      "source_file": "project.md",
+      "source_location": "project.md:15",
+      "source_url": null
+    },
+    {
+      "id": "lumina_build_implementation",
+      "label": "Lumina plan.md Implementation (M0-M6)",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 0,
+      "community_name": "M0-M6 Build and Delivery",
+      "contributor": null,
+      "file_type": "document",
+      "norm_label": "lumina plan.md implementation (m0-m6)",
+      "rationale": "Full M0-M6 plan delivery: daemon, fence/broker, router, sessions, plugins, kb, Harness2, TUI, SPA, MCP.",
+      "source_file": "lumina-build.md",
+      "source_location": "lumina-build.md:5",
+      "source_url": null
+    },
+    {
+      "id": "project_lumina_daemon",
+      "label": "Lumina Pure-Go Daemon",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 1,
+      "community_name": "Plan/Build and Permission Modes",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "lumina pure-go daemon",
+      "rationale": "Single CGO_ENABLED=0 Go 1.22+ binary powering Web SPA, Bubble Tea TUI, and lumina run over OpenAPI/SSE/WS.",
+      "source_file": "project.md",
+      "source_location": "project.md:9",
+      "source_url": null
+    },
+    {
+      "id": "project_permission_modes",
+      "label": "4-Mode Permission & Bypass Broker (Shift+Tab)",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 1,
+      "community_name": "Plan/Build and Permission Modes",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "4-mode permission & bypass broker (shift+tab)",
+      "rationale": "Supports ask, auto-edit, auto-approve (-y), and bypass (--bypass) plus glob rules while preserving immutable secret/no-Google hard denies.",
+      "source_file": "project.md",
+      "source_location": "project.md:14",
+      "source_url": null
+    },
+    {
+      "id": "project_plan_build_modes",
+      "label": "Plan & Build Primary Agent Modes (Tab)",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 1,
+      "community_name": "Plan/Build and Permission Modes",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "plan & build primary agent modes (tab)",
+      "rationale": "Separates structural capability (Tab: plan read-only code fence + scoped plan.md writes vs build full execution) from approval mode (Shift+Tab), with 1-click Plan->Build handoff.",
+      "source_file": "project.md",
+      "source_location": "project.md:13",
+      "source_url": null
+    },
+    {
+      "id": "project_rules_hierarchy",
+      "label": "AGENTS.md & Markdown Extensions Loader",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 1,
+      "community_name": "Plan/Build and Permission Modes",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "agents.md & markdown extensions loader",
+      "rationale": "Merges global and repo AGENTS.md, instructions/*.md, lazy skills/SKILL.md, agents/*.md, and commands/*.md.",
+      "source_file": "project.md",
+      "source_location": "project.md:11",
+      "source_url": null
+    },
+    {
+      "id": "memory_lumina_index",
+      "label": "Lumina Memory Index",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 2,
+      "community_name": "Memory Index and Live Wiring",
+      "contributor": null,
+      "file_type": "document",
+      "norm_label": "lumina memory index",
+      "source_file": "MEMORY.md",
+      "source_location": "MEMORY.md:6",
+      "source_url": null
+    },
+    {
+      "id": "lumina_live_wiring",
+      "label": "lumina Live Wiring",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 2,
+      "community_name": "Memory Index and Live Wiring",
+      "contributor": null,
+      "file_type": "document",
+      "norm_label": "lumina live wiring",
+      "rationale": "Responses-transport adapter plus 8-round tool loop, live-verified for reply, file edits, bash.",
+      "source_file": "lumina-live.md",
+      "source_location": "lumina-live.md:5",
+      "source_url": null
+    },
+    {
+      "id": "lumina_live_transport",
+      "label": "Responses-Only Transport plus Session Header",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 2,
+      "community_name": "Memory Index and Live Wiring",
+      "contributor": null,
+      "file_type": "rationale",
+      "norm_label": "responses-only transport plus session header",
+      "rationale": "chat/completions fails for muse models; x-lumina-session header required else MissingSessionID 400.",
+      "source_file": "lumina-live.md",
+      "source_location": "lumina-live.md:6",
+      "source_url": null
+    },
+    {
+      "id": "project_graphify_kb",
+      "label": "Markdown + Graphify RAG Engine",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 3,
+      "community_name": "Graphify KB and Guardrails",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "markdown + graphify rag engine",
+      "rationale": "Plain Markdown with YAML frontmatter and wikilinks indexed by graphify across memory, workspace AST, and Harness2 library.",
+      "source_file": "project.md",
+      "source_location": "project.md:16",
+      "source_url": null
+    },
+    {
+      "id": "project_standing_ops_sweeper",
+      "label": "Singleflight Standing-Ops KB Sweeper",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 3,
+      "community_name": "Graphify KB and Guardrails",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "singleflight standing-ops kb sweeper",
+      "rationale": "In-daemon idle/close distiller replacing race-prone shell hooks and enforcing canonical manifest stamping.",
+      "source_file": "project.md",
+      "source_location": "project.md:16",
+      "source_url": null
+    },
+    {
+      "id": "project_no_google_secret_guard",
+      "label": "No-Google & Secret Indirection Guardrails",
+      "author": null,
+      "captured_at": "2026-10-29",
+      "community": 3,
+      "community_name": "Graphify KB and Guardrails",
+      "contributor": null,
+      "file_type": "rationale",
+      "norm_label": "no-google & secret indirection guardrails",
+      "rationale": "Hard-blocks Google APIs/SDKs/fonts/backends and enforces api_key_env/api_key_cmd with non-bypassable credential-file hard-deny.",
+      "source_file": "project.md",
+      "source_location": "project.md:18",
+      "source_url": null
+    }
+  ],
+  "links": [
+    {
+      "source": "project_standing_ops_sweeper",
+      "target": "project_graphify_kb",
+      "relation": "calls",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:16",
+      "weight": 1.0
+    },
+    {
+      "source": "lumina_build_verification_gate",
+      "target": "lumina_build_implementation",
+      "relation": "conceptually_related_to",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "lumina-build.md",
+      "source_location": "lumina-build.md:7",
+      "weight": 1.0
+    },
+    {
+      "source": "project_plan_build_modes",
+      "target": "project_permission_modes",
+      "relation": "conceptually_related_to",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:13",
+      "weight": 1.0
+    },
+    {
+      "source": "project_lumina_daemon",
+      "target": "project_rules_hierarchy",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:11",
+      "weight": 1.0
+    },
+    {
+      "source": "project_lumina_daemon",
+      "target": "project_lumina_plugins",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:12",
+      "weight": 1.0
+    },
+    {
+      "source": "project_lumina_daemon",
+      "target": "project_plan_build_modes",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:13",
+      "weight": 1.0
+    },
+    {
+      "source": "project_lumina_daemon",
+      "target": "project_permission_modes",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:14",
+      "weight": 1.0
+    },
+    {
+      "source": "project_lumina_daemon",
+      "target": "project_session_lifecycle",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:15",
+      "weight": 1.0
+    },
+    {
+      "source": "project_lumina_daemon",
+      "target": "project_graphify_kb",
+      "relation": "implements",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:16",
+      "weight": 1.0
+    },
+    {
+      "source": "lumina_live_transport",
+      "target": "lumina_live_wiring",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "lumina-live.md",
+      "source_location": "lumina-live.md:6",
+      "weight": 1.0
+    },
+    {
+      "source": "project_no_google_secret_guard",
+      "target": "project_graphify_kb",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:18",
+      "weight": 1.0
+    },
+    {
+      "source": "project_no_google_secret_guard",
+      "target": "project_permission_modes",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:18",
+      "weight": 1.0
+    },
+    {
+      "source": "lumina_build_implementation",
+      "target": "project_graphify_kb",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "lumina-build.md",
+      "source_location": "lumina-build.md:6",
+      "weight": 1.0
+    },
+    {
+      "source": "lumina_build_implementation",
+      "target": "project_harness2_engine",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "lumina-build.md",
+      "source_location": "lumina-build.md:6",
+      "weight": 1.0
+    },
+    {
+      "source": "lumina_build_implementation",
+      "target": "project_lumina_plugins",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "lumina-build.md",
+      "source_location": "lumina-build.md:6",
+      "weight": 1.0
+    },
+    {
+      "source": "lumina_build_implementation",
+      "target": "project_session_lifecycle",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "lumina-build.md",
+      "source_location": "lumina-build.md:6",
+      "weight": 1.0
+    },
+    {
+      "source": "lumina_build_implementation",
+      "target": "project_lumina_daemon",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "lumina-build.md",
+      "source_location": "lumina-build.md:8",
+      "weight": 1.0
+    },
+    {
+      "source": "memory_lumina_index",
+      "target": "lumina_live_wiring",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "MEMORY.md",
+      "source_location": "MEMORY.md:10",
+      "weight": 1.0
+    },
+    {
+      "source": "memory_lumina_index",
+      "target": "project_lumina_daemon",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "MEMORY.md",
+      "source_location": "MEMORY.md:8",
+      "weight": 1.0
+    },
+    {
+      "source": "memory_lumina_index",
+      "target": "lumina_build_implementation",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "MEMORY.md",
+      "source_location": "MEMORY.md:9",
+      "weight": 1.0
+    },
+    {
+      "source": "lumina_live_wiring",
+      "target": "lumina_build_implementation",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "lumina-live.md",
+      "source_location": "lumina-live.md:11",
+      "weight": 1.0
+    },
+    {
+      "source": "project_harness2_engine",
+      "target": "project_lumina_plugins",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:17",
+      "weight": 1.0
+    },
+    {
+      "source": "project_plan_build_modes",
+      "target": "project_rules_hierarchy",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:13",
+      "weight": 1.0
+    },
+    {
+      "source": "project_harness2_engine",
+      "target": "project_graphify_kb",
+      "relation": "shares_data_with",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md",
+      "source_location": "project.md:17",
+      "weight": 1.0
+    },
+    {
+      "source": "lumina_live_wiring",
+      "target": "project_lumina_daemon",
+      "relation": "references",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "lumina-live.md",
+      "source_location": "lumina-live.md:9",
+      "weight": 1.0
+    }
+  ],
+  "hyperedges": [
+    {
+      "id": "he_lumina_core_pillars",
+      "label": "Lumina Local-First Architecture Pillars",
+      "nodes": [
+        "project_lumina_daemon",
+        "project_graphify_kb",
+        "project_harness2_engine",
+        "project_no_google_secret_guard"
+      ],
+      "relation": "form",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md"
+    },
+    {
+      "id": "he_lumina_parity",
+      "label": "Lumina Runtime Parity Surface",
+      "nodes": [
+        "project_rules_hierarchy",
+        "project_lumina_plugins",
+        "project_plan_build_modes",
+        "project_permission_modes",
+        "project_session_lifecycle"
+      ],
+      "relation": "form",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "project.md"
+    }
+  ],
+  "built_at_commit": "e7e07ae6d27311557f74b28a4da42ce168206b73"
+}
