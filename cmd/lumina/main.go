@@ -42,7 +42,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return runTUI(defaultFlags())
+		return runTUI(configBaseFlags())
 	}
 	switch args[0] {
 	case "serve":
@@ -311,8 +311,34 @@ type tuiFlags struct {
 
 func defaultFlags() tuiFlags { return tuiFlags{agent: "build", perm: "ask"} }
 
-func parseTUIArgs(args []string) tuiFlags {
+// configPath honors LUMINA_CONFIG like loadStack.
+func configPath() string {
+	if v := os.Getenv("LUMINA_CONFIG"); v != "" {
+		return v
+	}
+	return config.DefaultPath()
+}
+
+// configBaseFlags returns TUI defaults from [defaults] in config.toml
+// (LUMINA_CONFIG or ~/.config/lumina/config.toml), falling back to
+// build/ask. CLI flags parsed afterwards still win over the file.
+func configBaseFlags() tuiFlags {
 	f := defaultFlags()
+	cfg, err := config.Load(configPath())
+	if err != nil || cfg == nil {
+		return f
+	}
+	if a := strings.TrimSpace(cfg.Defaults.Agent); a != "" {
+		f.agent = a
+	}
+	if p := strings.TrimSpace(cfg.Defaults.PermissionMode); p != "" {
+		f.perm = string(security.Normalize(security.PermissionMode(p)))
+	}
+	return f
+}
+
+func parseTUIArgs(args []string) tuiFlags {
+	f := configBaseFlags()
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--agent":
@@ -341,15 +367,18 @@ func parseTUIArgs(args []string) tuiFlags {
 }
 
 func runHeadless(args []string) error {
+	// Config [defaults] seed agent/permission; explicit CLI flags parsed
+	// below still win over the file.
+	bf := configBaseFlags()
 	// Pre-scan flags in any position (`run -c "prompt"` and `run "prompt" -c
 	// both work); everything else is the prompt. Go's flag package would
 	// stop at the first positional arg, swallowing trailing flags.
 	var (
-		agentMode  = "build"
+		agentMode  = bf.agent
 		plan, cont bool
 		sid, model string
 		format     = "text"
-		perm       = "ask"
+		perm       = bf.perm
 		effort     = ""
 		attach     []string
 		positional []string
@@ -579,7 +608,7 @@ func runAttach(args []string) error {
 		return fmt.Errorf("lumina attach: missing url")
 	}
 	os.Setenv("LUMINA_URL", args[0])
-	return runTUI(defaultFlags())
+	return runTUI(configBaseFlags())
 }
 
 // ---------- session ----------

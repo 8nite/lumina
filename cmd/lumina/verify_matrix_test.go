@@ -448,3 +448,24 @@ func TestCopilotMatrix(t *testing.T) {
 	verdict(t, "TP-11.3", merr == nil && len(ms) == 1 && ms[0].ID == "copilot/gpt-4o" && patched == 1 && routerPut == 1,
 		fmt.Sprintf("models=%v patched=%d routerPut=%d", ms, patched, routerPut))
 }
+
+func TestConfigDefaultsSeedFlags(t *testing.T) {
+	// [defaults] permission_mode/agent in config.toml must seed TUI and
+	// headless runs; explicit CLI flags still win over the file.
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte("[defaults]\nagent = \"plan\"\npermission_mode = \"bypass\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LUMINA_CONFIG", cfgPath)
+	if f := configBaseFlags(); f.agent != "plan" || f.perm != "bypass" {
+		t.Fatalf("config defaults not applied: %+v", f)
+	}
+	if g := parseTUIArgs([]string{"--auto-edit"}); g.perm != "auto-edit" || g.agent != "plan" {
+		t.Fatalf("CLI flag must win over config: %+v", g)
+	}
+	t.Setenv("LUMINA_CONFIG", filepath.Join(dir, "missing.toml"))
+	if h := configBaseFlags(); h.agent != "build" || h.perm != "ask" {
+		t.Fatalf("missing config must fall back to build/ask: %+v", h)
+	}
+}
