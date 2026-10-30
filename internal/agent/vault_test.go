@@ -162,8 +162,29 @@ func TestVaultTokenIdPasswordSegments(t *testing.T) {
 
 // TestVaultSurvivesReopen proves mappings persist: a restart still remaps
 // placeholders minted before it.
-func TestVaultSurvivesReopen(t *testing.T) {
-	dir := t.TempDir()
+// TestVaultGuidanceInert guards the layer-0 example: {placeholder_ABC}
+// must never match the ref pattern (uppercase is unmintable), so neither
+// the model nor the mocks can mistake the documentation for a live token.
+func TestVaultGuidanceInert(t *testing.T) {
+	if vaultRefRe.MatchString("{placeholder_ABC}") {
+		t.Fatal("guidance example matches the ref pattern")
+	}
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sess, _ := st.CreateSession(t.TempDir(), "build", "ask", "", "")
+	sub, err := st.substituteSecrets(sess.ID, vaultGuidance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub != vaultGuidance {
+		t.Fatalf("guidance rewritten: %q", sub)
+	}
+}
+
+func TestVaultSurvivesReopen(t *testing.T) {	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "s.db")
 	st, err := Open(dbPath)
 	if err != nil {

@@ -317,7 +317,7 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 			"- agent: " + sess.Agent + " (plan=read-only except plan.md/.lumina/plans; build=full)\n" +
 			"- permission_mode: " + sess.PermissionMode + "\n\n" +
 			envBlock(sess.WorkspaceDir) + "\n\n" +
-			toolGuidanceBase + "\n" + renderToolGuidance(specs) + "\n",
+			toolGuidanceBase + "\n" + renderToolGuidance(specs) + "\n" + vaultGuidance + "\n",
 	}}
 	for _, t := range turns {
 		if t.Role == "user" || t.Role == "assistant" {
@@ -1017,7 +1017,7 @@ func (r *Runner) runChildLoop(ctx context.Context, sc tools.SecCtx, model, syste
 		return "", err
 	}
 	msgs := []llm.Message{
-		{Role: "system", Content: system + "\n\n- workspace_dir: " + sc.WorkspaceDir},
+		{Role: "system", Content: system + "\n\n- workspace_dir: " + sc.WorkspaceDir + "\n\n" + vaultGuidance},
 		{Role: "user", Content: vaultedTask},
 	}
 	stream := r.deltaFunc(sc.SessionID)

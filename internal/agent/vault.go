@@ -28,6 +28,13 @@ import (
 // vaultRefRe matches minted references: {placeholder_ + 3 ASCII chars}.
 var vaultRefRe = regexp.MustCompile(`\{placeholder_[a-z0-9]{3}\}`)
 
+// vaultGuidance is the layer-0 note telling the model how placeholders work:
+// values arrive as {placeholder_xxx} and the local harness remaps each one
+// to its real value before any tool or skill runs.
+const vaultGuidance = `# Placeholders
+- Sensitive values reach you as {placeholder_ABC} tokens (lowercase letters and digits). Pass them through verbatim in replies and tool arguments: the local harness remaps each token to its real value before any tool or skill runs.
+- Never guess, expand, or fabricate the value behind a token.`
+
 // placeholderAlphabet is the JSON/brace/regex-safe ASCII subset refs draw
 // from (36^3 ≈ 46k per session, with retry on collision).
 const placeholderAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
