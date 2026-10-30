@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -39,12 +40,15 @@ type Session struct {
 }
 
 // Store persists sessions + turn trees in pure-Go SQLite (WAL).
+// The secret vault (vault.go) is memory-only: per-session ref→value maps
+// that die with the process.
 type Store struct {
 	db   *sql.DB
 	path string
-	// vaultLegacy marks the pre-release vault layout (sealed column kept
-	// filled so its NOT NULL constraint holds on old dev DBs).
-	vaultLegacy bool
+
+	vaultMu      sync.Mutex
+	vault        map[string]map[string]string // sessionID -> ref -> value
+	vaultByValue map[string]map[string]string // sessionID -> value -> ref
 }
 
 // Open creates ~/. dirs as needed and migrates schema.
@@ -77,10 +81,6 @@ func Open(path string) (*Store, error) {
 	}
 	s := &Store{db: db, path: path}
 	if err := s.migrate(); err != nil {
-		return nil, err
-	}
-	if err := s.migrateVault(); err != nil {
-		_ = db.Close()
 		return nil, err
 	}
 	return s, nil

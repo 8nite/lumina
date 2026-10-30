@@ -24,7 +24,7 @@ const (
 	testSecretText  = "my api_key=" + testSecretValue
 )
 
-var testRefRe = regexp.MustCompile(`\{placeholder_[a-z0-9]{3}\}`)
+var testRefRe = regexp.MustCompile(`\{placeholder_[a-z]{3}\}`)
 
 func TestVaultSubstituteResolve(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
@@ -184,7 +184,11 @@ func TestVaultGuidanceInert(t *testing.T) {
 	}
 }
 
-func TestVaultSurvivesReopen(t *testing.T) {	dir := t.TempDir()
+// TestVaultSessionScoped proves mappings live for the session only: a new
+// Store (daemon restart) no longer resolves old refs — they pass through as
+// inert text, while the transcript's real values simply mint fresh refs.
+func TestVaultSessionScoped(t *testing.T) {
+	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "s.db")
 	st, err := Open(dbPath)
 	if err != nil {
@@ -194,6 +198,14 @@ func TestVaultSurvivesReopen(t *testing.T) {	dir := t.TempDir()
 	sub, err := st.substituteSecrets(sess.ID, testSecretText)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !testRefRe.MatchString(sub) {
+		t.Fatalf("no placeholder: %q", sub)
+	}
+	for _, c := range testRefRe.FindString(sub)[len("{placeholder_") : len("{placeholder_")+3] {
+		if c < 'a' || c > 'z' {
+			t.Fatalf("ref not letters-only: %q", sub)
+		}
 	}
 	st.Close()
 
@@ -202,54 +214,27 @@ func TestVaultSurvivesReopen(t *testing.T) {	dir := t.TempDir()
 		t.Fatal(err)
 	}
 	defer st2.Close()
-	plain, err := st2.resolveRefs(sess.ID, sub)
+	got, err := st2.resolveRefs(sess.ID, sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != sub {
+		t.Fatalf("stale ref resolved after restart: %q", got)
+	}
+	// Same session text re-vaults cleanly with a fresh ref.
+	sub2, err := st2.substituteSecrets(sess.ID, testSecretText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !testRefRe.MatchString(sub2) {
+		t.Fatalf("no fresh placeholder: %q", sub2)
+	}
+	plain, err := st2.resolveRefs(sess.ID, sub2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if plain != testSecretText {
-		t.Fatalf("post-reopen resolve: %q", plain)
-	}
-}
-
-// TestVaultLegacyTable proves dev DBs created by the pre-release sealed-column
-// layout still open and vault from scratch.
-func TestVaultLegacyTable(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "s.db")
-	legacy, err := Open(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Simulate the old layout: drop the new table, recreate with `sealed`.
-	if _, err := legacy.db.Exec(`DROP TABLE vault`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := legacy.db.Exec(`CREATE TABLE vault(
- session_id TEXT NOT NULL, ref TEXT NOT NULL, sealed TEXT NOT NULL, created_at TEXT,
- UNIQUE(session_id, ref))`); err != nil {
-		t.Fatal(err)
-	}
-	legacy.Close()
-
-	st, err := Open(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	sess, _ := st.CreateSession(dir, "build", "ask", "", "")
-	sub, err := st.substituteSecrets(sess.ID, testSecretText)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !testRefRe.MatchString(sub) {
-		t.Fatalf("no placeholder on legacy table: %q", sub)
-	}
-	plain, err := st.resolveRefs(sess.ID, sub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plain != testSecretText {
-		t.Fatalf("round-trip on legacy table: %q", plain)
+		t.Fatalf("round-trip: %q", plain)
 	}
 }
 

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"fmt"
 	"regexp"
 	"sort"
@@ -14,30 +13,33 @@ import (
 // Detection covers labeled secrets (api_key=, password:, token:, user_id=,
 // bearer) plus bare shapes (sk-…, AKIA…, PIN/OTP/ID numbers like 123456,
 // segmented codes like 1234-12345), each minted a stable per-session
-// reference like {placeholder_k3x}. Outbound text (history, tool feedback,
-// steered input, subagent tasks) is substituted before it enters an
-// llm.Message, so the provider never sees the value. Inbound text
+// reference like {placeholder_abc} — lowercase letters only, so a ref can
+// never be mistaken for (part of) a numeric code. Outbound text (history,
+// tool feedback, steered input, subagent tasks) is substituted before it
+// enters an llm.Message, so the provider never sees the value. Inbound text
 // (assistant replies, tool args) is resolved locally, so the user, the
 // transcript, and tool execution all see the real value.
 //
-// Mappings persist in the vault table as-is (no encryption: the DB is the
-// user's own file and every read path already shows values). Refs are inert
-// by construction — they match no secret pattern (no re-vault loop) and no
-// credential path (security hard-deny unaffected).
+// The vault lives only in memory, keyed by session: mappings die with the
+// process and never touch disk. Transcripts keep real values, so after a
+// restart substitution simply mints fresh refs — nothing to migrate, nothing
+// to clean up. Refs are inert by construction — they match no secret pattern
+// (no re-vault loop) and no credential path (security hard-deny unaffected).
 
-// vaultRefRe matches minted references: {placeholder_ + 3 ASCII chars}.
-var vaultRefRe = regexp.MustCompile(`\{placeholder_[a-z0-9]{3}\}`)
+// vaultRefRe matches minted references: {placeholder_ + 3 lowercase letters}.
+var vaultRefRe = regexp.MustCompile(`\{placeholder_[a-z]{3}\}`)
 
 // vaultGuidance is the layer-0 note telling the model how placeholders work:
-// values arrive as {placeholder_xxx} and the local harness remaps each one
+// values arrive as {placeholder_abc} and the local harness remaps each one
 // to its real value before any tool or skill runs.
 const vaultGuidance = `# Placeholders
-- Sensitive values reach you as {placeholder_ABC} tokens (lowercase letters and digits). Pass them through verbatim in replies and tool arguments: the local harness remaps each token to its real value before any tool or skill runs.
+- Sensitive values reach you as {placeholder_ABC} tokens (lowercase letters only). Pass them through verbatim in replies and tool arguments: the local harness remaps each token to its real value before any tool or skill runs.
 - Never guess, expand, or fabricate the value behind a token.`
 
-// placeholderAlphabet is the JSON/brace/regex-safe ASCII subset refs draw
-// from (36^3 ≈ 46k per session, with retry on collision).
-const placeholderAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+// placeholderAlphabet is the ref alphabet: lowercase ASCII only, so refs
+// stay visually distinct from the numeric codes they stand in for
+// (26^3 ≈ 17k per session, with retry on collision).
+const placeholderAlphabet = "abcdefghijklmnopqrstuvwxyz"
 
 // vaultPattern pairs a detector with its label/value group layout
 // (0 = absent: the whole match is the secret).
@@ -100,80 +102,21 @@ func isDateLike(s string) bool {
 	return isoDateLike.MatchString(s) || usDateLike.MatchString(s)
 }
 
-// migrateVault creates the ref→value mapping table. The pre-release layout
-// used a `sealed` column; existing dev DBs get a `value` column added and
-// keep working (old sealed rows read as unknown refs and pass through;
-// new writes fill both columns so the old NOT NULL constraint holds).
-func (s *Store) migrateVault() error {
-	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS vault(
- session_id TEXT NOT NULL, ref TEXT NOT NULL, value TEXT NOT NULL DEFAULT '', created_at TEXT,
- UNIQUE(session_id, ref))`); err != nil {
-		return err
-	}
-	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_vault_session ON vault(session_id)`); err != nil {
-		return err
-	}
-	rows, err := s.db.Query(`PRAGMA table_info(vault)`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	hasValue := false
-	hasSealed := false
-	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notnull, pk int
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
-			return err
-		}
-		if name == "value" {
-			hasValue = true
-		}
-		if name == "sealed" {
-			hasSealed = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if !hasValue {
-		_, err = s.db.Exec(`ALTER TABLE vault ADD COLUMN value TEXT NOT NULL DEFAULT ''`)
-	}
-	s.vaultLegacy = hasSealed
-	return err
-}
-
-// vaultRefFor returns the stable ref for value in this session, minting and
-// persisting one on first sight.
+// vaultRefFor returns the stable ref for value in this session, minting one
+// on first sight. Memory-only: mappings die with the process.
 func (s *Store) vaultRefFor(sessionID, value string) (string, error) {
-	rows, err := s.db.Query(`SELECT ref,value FROM vault WHERE session_id=?`, sessionID)
-	if err != nil {
-		return "", err
+	s.vaultMu.Lock()
+	defer s.vaultMu.Unlock()
+	if s.vault == nil {
+		s.vault = map[string]map[string]string{}
+		s.vaultByValue = map[string]map[string]string{}
 	}
-	type entry struct{ ref, value string }
-	var entries []entry
-	for rows.Next() {
-		var e entry
-		var v sql.NullString
-		if err := rows.Scan(&e.ref, &v); err != nil {
-			rows.Close()
-			return "", err
-		}
-		if v.Valid {
-			e.value = v.String
-			entries = append(entries, e)
-		}
+	if s.vault[sessionID] == nil {
+		s.vault[sessionID] = map[string]string{}
+		s.vaultByValue[sessionID] = map[string]string{}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
-	for _, e := range entries {
-		if e.value == value {
-			return e.ref, nil
-		}
+	if ref, ok := s.vaultByValue[sessionID][value]; ok {
+		return ref, nil
 	}
 	for attempt := 0; attempt < 5; attempt++ {
 		var b [3]byte
@@ -184,23 +127,12 @@ func (s *Store) vaultRefFor(sessionID, value string) (string, error) {
 			placeholderAlphabet[int(b[0])%len(placeholderAlphabet)],
 			placeholderAlphabet[int(b[1])%len(placeholderAlphabet)],
 			placeholderAlphabet[int(b[2])%len(placeholderAlphabet)])
-		if s.vaultLegacy {
-			_, err = s.exec(`INSERT INTO vault(session_id,ref,sealed,value,created_at) VALUES(?,?,?,?,?)`,
-				sessionID, ref, value, value, nowStr())
-		} else {
-			_, err = s.exec(`INSERT INTO vault(session_id,ref,value,created_at) VALUES(?,?,?,?)`,
-				sessionID, ref, value, nowStr())
+		if _, taken := s.vault[sessionID][ref]; taken {
+			continue // collision: mint another
 		}
-		if err == nil {
-			return ref, nil
-		}
-		if isBusy(err) {
-			return "", err // exec already retried BUSY; don't spin refs
-		}
-		if !strings.Contains(strings.ToLower(err.Error()), "unique") {
-			return "", err
-		}
-		// UNIQUE collision on ref: mint another.
+		s.vault[sessionID][ref] = value
+		s.vaultByValue[sessionID][value] = ref
+		return ref, nil
 	}
 	return "", fmt.Errorf("vault: ref collision retries exhausted")
 }
@@ -208,12 +140,10 @@ func (s *Store) vaultRefFor(sessionID, value string) (string, error) {
 // vaultValue resolves one ref to its value; unknown refs pass through so a
 // foreign or stale token degrades to inert text, never an error.
 func (s *Store) vaultValue(sessionID, ref string) (string, bool, error) {
-	var v sql.NullString
-	err := s.db.QueryRow(`SELECT value FROM vault WHERE session_id=? AND ref=?`, sessionID, ref).Scan(&v)
-	if err != nil || !v.Valid || v.String == "" {
-		return "", false, nil
-	}
-	return v.String, true, nil
+	s.vaultMu.Lock()
+	defer s.vaultMu.Unlock()
+	v, ok := s.vault[sessionID][ref]
+	return v, ok, nil
 }
 
 // SubstituteForLLM is the exported debug entry to the vault boundary
