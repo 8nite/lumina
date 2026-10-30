@@ -321,7 +321,12 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 	}}
 	for _, t := range turns {
 		if t.Role == "user" || t.Role == "assistant" {
-			msgs = append(msgs, llm.Message{Role: t.Role, Content: t.Text})
+			// Vault boundary: the provider sees refs, never values.
+			sub, err := r.store.substituteSecrets(sessionID, t.Text)
+			if err != nil {
+				return "", err
+			}
+			msgs = append(msgs, llm.Message{Role: t.Role, Content: sub})
 		}
 	}
 	// Provider-aware compaction: keep the newest turns under 80% of the
@@ -406,8 +411,19 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 			r.progress(sessionID, "steered ✓")
 			userMsg += "\n\nSteered input (answer this too):\n" + s
 		}
+		// Vault boundary: tool outputs and steered text may carry values.
+		userMsg, err = r.store.substituteSecrets(sessionID, userMsg)
+		if err != nil {
+			finishTurn()
+			return "", err
+		}
+		text2sub, err := r.store.substituteSecrets(sessionID, text2)
+		if err != nil {
+			finishTurn()
+			return "", err
+		}
 		msgs = append(msgs,
-			llm.Message{Role: "assistant", Content: text2},
+			llm.Message{Role: "assistant", Content: text2sub},
 			llm.Message{Role: "user", Content: userMsg},
 		)
 		// Re-compact every round: tool feedback can balloon past the window
@@ -431,10 +447,15 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 	// round cap still ends with a substantive reply gathering all results.
 	if len(calls) > 0 {
 		r.progress(sessionID, "summarizing…")
+		text2sub, serr := r.store.substituteSecrets(sessionID, text2)
+		if serr != nil {
+			finishTurn()
+			return "", serr
+		}
 		summary, _, _, serr := completeStream(ctx, mustProvider(r, sess), llm.Request{
 			Model: sess.Model,
 			Messages: append(msgs,
-				llm.Message{Role: "assistant", Content: text2},
+				llm.Message{Role: "assistant", Content: text2sub},
 				llm.Message{Role: "user", Content: "Tool budget reached. Summarize in text: what was accomplished, what each tool found, and what is still running. Do not call tools."},
 			),
 		}, stream)
@@ -446,6 +467,13 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 	// turn so it is answered next instead of sitting in the transcript.
 	if rest := r.takeSteered(sessionID); rest != "" {
 		r.Queue(sessionID, TurnInput{Text: rest})
+	}
+	// User transparency: the stored transcript and returned text carry
+	// values; refs only ever faced the provider.
+	text2, err = r.store.resolveRefs(sessionID, text2)
+	if err != nil {
+		finishTurn()
+		return "", err
 	}
 	assistantTurn, err := r.store.AddTurn(sessionID, "", "assistant", text2)
 	if err != nil {
@@ -538,6 +566,18 @@ func (r *Runner) setGranted(sessionID, tool, target string) {
 // single-shot bypass envelope; the plan structural fence still holds inside
 // Authorize because the agent mode is unchanged.
 func (r *Runner) callWithApproval(ctx context.Context, sessionID string, sc tools.SecCtx, name string, args map[string]interface{}) (tools.Result, error) {
+	// Resolve direction: the model only ever saw refs, so its args carry
+	// them. Resolve before the broker prompt (user sees values) and before
+	// execution (tools get values). Fail closed on vault errors.
+	if r.store != nil {
+		rv, err := r.store.resolveArgRefs(sessionID, args)
+		if err != nil {
+			return tools.Result{}, err
+		}
+		if m, ok := rv.(map[string]interface{}); ok {
+			args = m
+		}
+	}
 	target := approvalTarget(name, args)
 	d := security.Authorize(sc.Agent, sc.Permission, name, target, sc.WorkspaceDir, nil, false)
 	if d == security.Allow {
@@ -972,9 +1012,13 @@ func (r *Runner) runChildLoop(ctx context.Context, sc tools.SecCtx, model, syste
 		return "", fmt.Errorf("subagent: no provider for model %q", model)
 	}
 	p := &modelBound{Provider: prov, model: mid}
+	vaultedTask, err := r.store.substituteSecrets(sc.SessionID, task)
+	if err != nil {
+		return "", err
+	}
 	msgs := []llm.Message{
 		{Role: "system", Content: system + "\n\n- workspace_dir: " + sc.WorkspaceDir},
-		{Role: "user", Content: task},
+		{Role: "user", Content: vaultedTask},
 	}
 	stream := r.deltaFunc(sc.SessionID)
 	text, calls, _, err := completeStream(ctx, p, llm.Request{Model: mid, Messages: msgs, Tools: specs}, stream)
@@ -989,7 +1033,17 @@ func (r *Runner) runChildLoop(ctx context.Context, sc tools.SecCtx, model, syste
 				break
 			}
 			r.progress(sc.SessionID, "tool: "+c.Name)
-			res, terr := r.execTool(ctx, sc.SessionID, sc, c.Name, c.Args, approvalTarget(c.Name, c.Args))
+			resolvedArgs := c.Args
+			if r.store != nil {
+				rv, rerr := r.store.resolveArgRefs(sc.SessionID, c.Args)
+				if rerr != nil {
+					return "", rerr
+				}
+				if m, ok := rv.(map[string]interface{}); ok {
+					resolvedArgs = m
+				}
+			}
+			res, terr := r.execTool(ctx, sc.SessionID, sc, c.Name, resolvedArgs, approvalTarget(c.Name, resolvedArgs))
 			if terr != nil {
 				fmt.Fprintf(&feedback, "Tool %s error:\n%v\n\n", c.Name, terr)
 				continue
@@ -999,16 +1053,25 @@ func (r *Runner) runChildLoop(ctx context.Context, sc tools.SecCtx, model, syste
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
+		amsg, serr := r.store.substituteSecrets(sc.SessionID, text)
+		if serr != nil {
+			return "", serr
+		}
+		umsg, serr := r.store.substituteSecrets(sc.SessionID, "Tool results:\n"+feedback.String()+"Continue the task; call more tools if needed, else give the final answer.")
+		if serr != nil {
+			return "", serr
+		}
 		msgs = append(msgs,
-			llm.Message{Role: "assistant", Content: text},
-			llm.Message{Role: "user", Content: "Tool results:\n" + feedback.String() + "Continue the task; call more tools if needed, else give the final answer."},
+			llm.Message{Role: "assistant", Content: amsg},
+			llm.Message{Role: "user", Content: umsg},
 		)
 		text, calls, _, err = completeStream(ctx, p, llm.Request{Model: mid, Messages: msgs, Tools: specs}, stream)
 		if err != nil {
 			return "", err
 		}
 	}
-	return text, nil
+	// User transparency: resolve refs before the text leaves the child.
+	return r.store.resolveRefs(sc.SessionID, text)
 }
 
 // Compact summarizes stale tool-output turns, keeping rules, diffs, and
