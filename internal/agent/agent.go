@@ -644,6 +644,23 @@ func approvalTarget(name string, args map[string]interface{}) string {
 	return name
 }
 
+// wireDebug logs the exact outbound LLM request when LUMINA_DEBUG_WIRE=1.
+// Contents are already vault-substituted at every call site, so the log
+// holds placeholders, never values — it answers "what did the model see?"
+var wireDebug = os.Getenv("LUMINA_DEBUG_WIRE") == "1"
+
+func logWire(req llm.Request) {
+	if !wireDebug {
+		return
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "=== lumina wire → model %s (%d messages) ===\n", req.Model, len(req.Messages))
+	for i, m := range req.Messages {
+		fmt.Fprintf(&sb, "--- msg %d [%s] ---\n%s\n", i, m.Role, m.Content)
+	}
+	fmt.Fprint(os.Stderr, sb.String())
+}
+
 // EstimateContextTokens approximates prompt tokens as ~4 chars/token over
 // roles + contents + thinking, plus a per-tool schema allowance.
 // ponytail: deliberately dependency-free; providers that report real
@@ -725,6 +742,7 @@ func FormatDuration(ms int64) string {
 // to onChunk (nil = collect silently, like llm.Complete). It also returns
 // the last usage report (nil when the provider sends none).
 func completeStream(ctx context.Context, p llm.Provider, req llm.Request, onChunk func(delta, thinking string)) (string, []llm.ToolCallRequest, *llm.Usage, error) {
+	logWire(req)
 	ch, err := p.Chat(ctx, req)
 	if err != nil {
 		return "", nil, nil, err

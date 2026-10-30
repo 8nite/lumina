@@ -216,6 +216,12 @@ func (s *Store) vaultValue(sessionID, ref string) (string, bool, error) {
 	return v.String, true, nil
 }
 
+// SubstituteForLLM is the exported debug entry to the vault boundary
+// (used by `lumina vault check`): what the model would receive for text.
+func (s *Store) SubstituteForLLM(sessionID, text string) (string, error) {
+	return s.substituteSecrets(sessionID, text)
+}
+
 // substituteSecrets swaps secret-shaped spans for stable refs. Labels
 // (api_key=, bearer) are kept: only values are opaque.
 func (s *Store) substituteSecrets(sessionID, text string) (string, error) {

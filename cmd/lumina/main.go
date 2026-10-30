@@ -69,6 +69,8 @@ func run(args []string) error {
 		return runPair(args[1:])
 	case "openapi":
 		return runOpenAPI(args[1:])
+	case "vault":
+		return runVault(args[1:])
 	case "-h", "--help", "help":
 		usage()
 		return nil
@@ -98,7 +100,8 @@ Usage:
   lumina evolve [session-id]
   lumina models [--provider copilot]   # list live provider models
   lumina auth device --provider copilot # GitHub web-auth, stores token
-  lumina pair [--lan]               # print LAN/Tailscale attach URL + token`)
+  lumina pair [--lan]               # print LAN/Tailscale attach URL + token
+  lumina vault check "<text>"     # show what the LLM would receive (placeholders), user side keeps values`)
 }
 
 // ---------- shared setup ----------
@@ -609,6 +612,42 @@ func runAttach(args []string) error {
 	}
 	os.Setenv("LUMINA_URL", args[0])
 	return runTUI(configBaseFlags())
+}
+
+// ---------- vault ----------
+
+// runVaultCheck shows what the LLM would receive for a piece of text:
+// secret-shaped spans replaced with {placeholder_xxx} refs, everything else
+// byte-identical. Runs against a throwaway in-memory vault, so probing never
+// pollutes the real session store. Exit 0 always; the verdict is the diff.
+func runVault(args []string) error {
+	if len(args) == 0 || args[0] != "check" {
+		return fmt.Errorf("usage: lumina vault check \"<text>\"")
+	}
+	if len(args) < 2 {
+		return fmt.Errorf("lumina vault check: missing text")
+	}
+	st, err := agent.Open(":memory:")
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	sess, err := st.CreateSession("", "build", "ask", "", "vault-check")
+	if err != nil {
+		return err
+	}
+	in := strings.Join(args[1:], " ")
+	out, err := st.SubstituteForLLM(sess.ID, in)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("user side: %s\nllm sees:  %s\n", in, out)
+	if out == in {
+		fmt.Println("verdict:   UNCHANGED — no detector matched (see vaultPatterns)")
+	} else {
+		fmt.Println("verdict:   VAULTED — values hidden from the model, remapped locally on return")
+	}
+	return nil
 }
 
 // ---------- session ----------
