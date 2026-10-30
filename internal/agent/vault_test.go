@@ -90,6 +90,76 @@ func TestVaultSubstituteResolve(t *testing.T) {
 	}
 }
 
+func TestVaultTokenIdPasswordSegments(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sess, _ := st.CreateSession(t.TempDir(), "build", "ask", "", "")
+
+	vaulted := []struct{ in, label string }{
+		{"login password=123456", "password="},
+		{"passwd: hunter2", "passwd: "},
+		{"token: abcdef", "token: "},
+		{"access_token=xyz789", "access_token="},
+		{"user_id=42", "user_id="},
+		{"call 123456 now", "call "},
+		{"code 1234-12345 ok", "code "},
+		{"card 1234 5678 9012", "card "},
+	}
+	for _, c := range vaulted {
+		sub, err := st.substituteSecrets(sess.ID, c.in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !testRefRe.MatchString(sub) {
+			t.Fatalf("%q: no placeholder: %q", c.in, sub)
+		}
+		if !strings.Contains(sub, c.label) {
+			t.Fatalf("%q: label lost: %q", c.in, sub)
+		}
+		plain, err := st.resolveRefs(sess.ID, sub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plain != c.in {
+			t.Fatalf("round-trip %q: got %q", c.in, plain)
+		}
+		if again, _ := st.substituteSecrets(sess.ID, sub); again != sub {
+			t.Fatalf("not idempotent %q: %q", c.in, again)
+		}
+	}
+	// One ref per segmented code, spacing preserved.
+	sub, _ := st.substituteSecrets(sess.ID, "call 1234-12345 now")
+	if n := strings.Count(sub, "{placeholder_"); n != 1 {
+		t.Fatalf("segmented code split into %d refs: %q", n, sub)
+	}
+	if !strings.HasPrefix(sub, "call ") || !strings.HasSuffix(sub, " now") {
+		t.Fatalf("spacing mangled: %q", sub)
+	}
+	sub, _ = st.substituteSecrets(sess.ID, "call 123456 now")
+	if !strings.HasPrefix(sub, "call ") || !strings.HasSuffix(sub, " now") {
+		t.Fatalf("boundary space dropped: %q", sub)
+	}
+
+	// Benign lookalikes stay byte-identical.
+	plain := []string{
+		"loop.txt", "valid=true", "bypass=x", "version 1.3.10",
+		"the id is 7", "abc1234", "port 80", "2026-10-30",
+		"12-34", "score 100-98", "1234x", "v2_1234beta",
+	}
+	for _, in := range plain {
+		got, err := st.substituteSecrets(sess.ID, in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != in {
+			t.Fatalf("false positive %q: %q", in, got)
+		}
+	}
+}
+
 // TestVaultSurvivesReopen proves mappings persist: a restart still remaps
 // placeholders minted before it.
 func TestVaultSurvivesReopen(t *testing.T) {
