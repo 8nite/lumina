@@ -94,6 +94,7 @@ Verification matrix for `8nite/lumina` against `plan.md` (§1–§14) and `AGENT
 | `TP-04.4` | Multi-round agentic tool loop & tool JSON schemas | Mock LLM emits `write` → `read` → final answer via `Runner.RunPrompt`; inspect `toolSpecs()` | Tool results fed back; `Schema` defined for tool parameters; `kb_query` & `skill` wired in `loadStack()` | `PASS` |
 | `TP-04.5` | Shadow-Git `/undo` & `/redo` (`Snapshot` / `Revert`) | Mutate tracked + untracked files, `Snapshot`, mutate again, `Revert`, check user `git status --cached` | Working tree restored; user `.git/index` untouched; zero `.index.lock` leaks | `PASS` |
 | `TP-04.6` | Local MCP stdio & SSE client | `mcp.Dial` against mock stdio server & mock SSE server + Google URL check | `initialize`, `tools/list`, `tools/call` succeed; Google SSE URL blocked | `PASS` |
+| `TP-04.7` | Context estimate & turn summary | `EstimateContextTokens` on 1- and 3-message histories; `TurnStats.Summary` with/without ctx | Exact small-history value; monotonic growth; footer shows `ctx ~12.0k/200.0k`; omitted when unknown | `PASS` |
 
 ---
 
@@ -141,6 +142,8 @@ Verification matrix for `8nite/lumina` against `plan.md` (§1–§14) and `AGENT
 | `TP-08.3` | Daemon functional endpoints audit | Test `/api/v1/files`, `/api/v1/git/diff`, `/api/v1/providers`, `/api/v1/kb/query`, `/api/v1/sessions/{id}/export?sanitize=1`, `/api/v1/sessions/{id}/revert`, `/api/v1/router`, `/api/v1/harness/evolve` | Return real workspace/store/KB/git data (not hardcoded empty stubs) | `PASS` |
 | `TP-08.4` | SSE `/api/v1/events` real-time broadcast | Subscribe via `sdk.Client.Subscribe`, trigger `session.created`, `session.updated`, `turn.started`, `turn.completed` | Subscriber receives all events in order | `PASS` |
 | `TP-08.5` | PTY WebSocket (`/api/v1/pty`) | RFC6455 upgrade handshake + send masked text frame `echo pty-ok` | `101 Switching Protocols` with valid `Sec-WebSocket-Accept`; receives unmasked text frame containing `pty-ok` | `PASS` |
+| `TP-08.7` | Concurrent prompts single-flight | Slow `Exec` blocked on a channel; fire overlapping prompts while turn 1 runs | 2nd returns `steered`, 3rd (`queue`) returns `queued`; max in-flight `Exec` = 1; exactly 1 `turn.completed` | `PASS` |
+| `TP-08.8` | `turn.context` gauge + completed ctx fields | `Exec` reports `NoteTurnEnd` with `ContextTokens`/`MaxTokens` | `turn.context` SSE carries `context_tokens`/`max_tokens`; `turn.completed` merges both fields | `PASS` |
 | `TP-08.6` | CLI subcommands end-to-end | `lumina --version`, `--help`, `openapi`, `run`, `run -c`, `run -s`, `run --plan`, `run --format json`, `session list/show/fork/export --sanitize`, `plugin list/doctor`, `kb status/query/reflect/update`, `evolve`, `pair` | Exit `0` with expected outputs against isolated `LUMINA_DB` & temp git workspace | `PASS` |
 
 ---
@@ -153,6 +156,7 @@ Verification matrix for `8nite/lumina` against `plan.md` (§1–§14) and `AGENT
 | `TP-09.2` | Slash commands (`/plan`, `/build`, `/mode`, `/compact`, `/undo`, `/redo`, `/resume`, `/fork`) | Execute each slash command in `Model` | Updates state AND syncs mode/undo/redo/fork to daemon when client attached | `PASS` |
 | `TP-09.3` | `@file` & `[[memory]]` completions | `CompleteInput` on `@src/ma` and `[[mem` | Returns `@src/main.go` and `[[memory-notes]]` | `PASS` |
 | `TP-09.4` | Inline permission modal & session-scoped SSE filtering | Receive `permission.asked`, select `Allow Session` + `Enter`; receive `turn.completed` for another `session_id` | Sends `AnswerPermission` to daemon; ignores SSE `turn.completed` from other sessions | `PASS` |
+| `TP-09.5` | Space input, context pill & tool target | Type `hi` + space + `there`; receive `turn.context`; `turn.tool` with target; `turn.completed` with ctx | Input is `hi there`; header shows `ctx ~12.3k/200.0k`; status shows `tool: <name> <target>`; footer carries `ctx` summary | `PASS` |
 
 ---
 
@@ -163,6 +167,7 @@ Verification matrix for `8nite/lumina` against `plan.md` (§1–§14) and `AGENT
 | `TP-10.1` | Embedded SPA serving & HTTP CSP headers | `GET /` on live `lumina serve` (isolated port) | `200 OK`, serves built React bundle; strict `Content-Security-Policy` present; zero external font/CDN tags | `PASS` |
 | `TP-10.2` | Zero external / Google network requests | Open `http://127.0.0.1:<port>/` in headless browser (`agent-browser`), inspect all network requests, console errors, page errors | Zero non-`127.0.0.1` requests; zero JS runtime errors | `PASS` |
 | `TP-10.3` | Live UI interaction flow | Click `New` session → toggle `PLAN` / `BUILD` (`ModeBar` & `Tab`) → cycle `ASK`/`AUTO-EDIT`/`AUTO-APPROVE`/`BYPASS` → submit prompt → verify SSE reply renders in `ChatTimeline` → test `sessions`/`files`/`memory`/`harness` tabs & `diff`/`term`/`graph` drawers | All UI controls respond without errors and state persists via daemon API | `PASS` |
+| `TP-10.4` | Context pill, approval modal & SSE reconnect | `turn.context` while working; `permission.asked` with no CLI; kill/retry SSE stream | TopBar shows `ctx ~x/y`; modal answers `allow_once/session/deny` and turn completes; client backoffs-reconnects, `working` clears on terminal event | `PASS` |
 
 ### `TP-11` — GitHub Copilot Provider, `/model` Connect & Device Web Auth
 

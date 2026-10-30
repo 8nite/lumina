@@ -7,11 +7,59 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Ollama speaks local /api/chat NDJSON streaming.
 type Ollama struct {
 	BaseURL string
+
+	mu       sync.Mutex
+	ctxCache map[string]int // model name → context_length from /api/show
+}
+
+// ContextWindow reads the model's context_length from /api/show
+// (e.g. `llama.context_length`), cached per model name.
+func (p *Ollama) ContextWindow(ctx context.Context, model string) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if w, ok := p.ctxCache[model]; ok {
+		return w, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	resp, err := postJSON(cctx, strings.TrimSuffix(p.BaseURL, "/")+"/api/show", "", map[string]interface{}{"name": model}, nil)
+	if err != nil {
+		return 0, err
+	}
+	var doc struct {
+		ModelInfo map[string]interface{} `json:"model_info"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		resp.Body.Close()
+		return 0, err
+	}
+	resp.Body.Close()
+	w := 0
+	for k, v := range doc.ModelInfo {
+		if k == "context_length" || strings.HasSuffix(k, ".context_length") {
+			switch n := v.(type) {
+			case float64:
+				if n > 0 {
+					w = int(n)
+				}
+			}
+		}
+		if w > 0 {
+			break
+		}
+	}
+	if p.ctxCache == nil {
+		p.ctxCache = map[string]int{}
+	}
+	p.ctxCache[model] = w
+	return w, nil
 }
 
 func (p *Ollama) Name() string { return "ollama" }

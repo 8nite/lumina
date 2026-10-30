@@ -98,6 +98,57 @@ func TestViewRenders(t *testing.T) {
 	}
 }
 
+func TestSpaceInsertsRune(t *testing.T) {
+	// Bare space arrives as KeySpace (not KeyRunes); it must type a space.
+	m := testModel()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hi")})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("there")})
+	m = next.(Model)
+	if m.Input != "hi there" {
+		t.Fatalf("space input broken, got %q", m.Input)
+	}
+}
+
+func ctxEvent(typ, sid string, data map[string]interface{}) EventMsg {
+	raw, _ := json.Marshal(data)
+	return EventMsg{Event: sdk.Event{Type: typ, SessionID: sid, Data: raw}}
+}
+
+func TestContextGaugeAndFooter(t *testing.T) {
+	m := testModel()
+	next, _ := m.Update(ctxEvent("turn.context", "s1", map[string]interface{}{
+		"context_tokens": 12345, "max_tokens": 200000,
+	}))
+	m = next.(Model)
+	if m.CtxUsed != 12345 || m.CtxMax != 200000 {
+		t.Fatalf("ctx gauge not stored: %+v", m)
+	}
+	m.Width = 100
+	if v := m.View(); !strings.Contains(v, "ctx ~12.3k/200.0k") {
+		t.Fatalf("header missing ctx pill:\n%s", v)
+	}
+	next, _ = m.Update(ctxEvent("turn.completed", "s1", map[string]interface{}{
+		"text": "done", "model": "prov/m", "duration_ms": float64(2000),
+		"output_tokens": float64(100), "context_tokens": float64(13000), "max_tokens": float64(200000),
+	}))
+	m = next.(Model)
+	if m.Working {
+		t.Fatal("completed must clear Working")
+	}
+	found := false
+	for _, ln := range m.Lines {
+		if strings.Contains(ln, "ctx ~13.0k/200.0k") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("footer missing ctx summary: %v", m.Lines)
+	}
+}
+
 func TestModelPickerConnect(t *testing.T) {
 	var patched, routerPut int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -521,5 +572,97 @@ func TestModelPickerListsAllProviders(t *testing.T) {
 	msg2, ok := m.ApplyCommand("/model 4")().(ModelsMsg)
 	if !ok || len(msg2.Models) != 2 {
 		t.Fatalf("filtered: %#v", msg2)
+	}
+}
+
+func testQModal() *QuestionModal {
+	return &QuestionModal{
+		RequestID: "q1",
+		Questions: []QuestionItem{
+			{Question: "pick one", Header: "Pick", Options: []QuestionOption{{Label: "a", Description: "first"}, {Label: "b"}}, Multiple: false},
+			{Question: "pick any", Options: []QuestionOption{{Label: "x"}, {Label: "y"}}, Multiple: true},
+		},
+	}
+}
+
+func TestQuestionModalAnswerAndAdvance(t *testing.T) {
+	m := testModel()
+	m.QModal = testQModal()
+	// Type "2" + enter answers first question with option b.
+	m = sendKey(m, key("2", tea.KeyRunes))
+	m = sendKey(m, key("", tea.KeyEnter))
+	if m.QModal == nil || m.QModal.Idx != 1 {
+		t.Fatalf("should advance to question 2: %+v", m.QModal)
+	}
+	// Type "1,2" + enter answers multi question with both labels.
+	m = sendKey(m, key("1", tea.KeyRunes))
+	m = sendKey(m, key(",", tea.KeyRunes))
+	m = sendKey(m, key("2", tea.KeyRunes))
+	m = sendKey(m, key("", tea.KeyEnter))
+	if m.QModal != nil {
+		t.Fatal("modal should close after last answer")
+	}
+	if !strings.Contains(m.Status, "answered") {
+		t.Fatalf("status=%q", m.Status)
+	}
+}
+
+func TestQuestionModalCursorPick(t *testing.T) {
+	m := testModel()
+	m.QModal = &QuestionModal{RequestID: "q1", Questions: []QuestionItem{{Question: "q", Options: []QuestionOption{{Label: "a"}, {Label: "b"}}}}}
+	m = sendKey(m, key("", tea.KeyDown))
+	m = sendKey(m, key("", tea.KeyEnter))
+	if m.QModal != nil {
+		t.Fatal("single-question modal should close")
+	}
+}
+
+func TestQuestionModalDismiss(t *testing.T) {
+	m := testModel()
+	m.QModal = testQModal()
+	m = sendKey(m, key("", tea.KeyEsc))
+	if m.QModal != nil {
+		t.Fatal("modal should close on esc")
+	}
+	if !strings.Contains(m.Status, "dismissed") {
+		t.Fatalf("status=%q", m.Status)
+	}
+}
+
+func TestParseQuestionAnswer(t *testing.T) {
+	q := QuestionItem{Question: "q", Options: []QuestionOption{{Label: "a"}, {Label: "b"}}}
+	if got := parseQuestionAnswer(q, "2", 0); len(got) != 1 || got[0] != "b" {
+		t.Fatalf("number pick: %v", got)
+	}
+	mq := QuestionItem{Question: "q", Options: []QuestionOption{{Label: "a"}, {Label: "b"}}, Multiple: true}
+	if got := parseQuestionAnswer(mq, "1,2", 0); len(got) != 2 {
+		t.Fatalf("multi pick: %v", got)
+	}
+	if got := parseQuestionAnswer(q, "custom thing", 0); len(got) != 1 || got[0] != "custom thing" {
+		t.Fatalf("free text: %v", got)
+	}
+	if got := parseQuestionAnswer(q, "", 1); len(got) != 1 || got[0] != "b" {
+		t.Fatalf("cursor pick: %v", got)
+	}
+}
+
+func TestQuestionAskedEvent(t *testing.T) {
+	m := testModel()
+	next, _ := m.Update(ctxEvent("question.asked", "s1", map[string]interface{}{
+		"request_id": "q9",
+		"questions": []interface{}{map[string]interface{}{
+			"question": "pick?", "header": "H",
+			"options": []interface{}{map[string]interface{}{"label": "a", "description": "d"}},
+		}},
+	}))
+	m = next.(Model)
+	if m.QModal == nil || m.QModal.RequestID != "q9" || len(m.QModal.Questions) != 1 {
+		t.Fatalf("qmodal not set: %+v", m.QModal)
+	}
+	if m.QModal.Questions[0].Options[0].Label != "a" {
+		t.Fatalf("options not decoded: %+v", m.QModal.Questions[0])
+	}
+	if v := m.View(); !strings.Contains(v, "pick?") {
+		t.Fatalf("view missing question: %q", v[len(v)-200:])
 	}
 }

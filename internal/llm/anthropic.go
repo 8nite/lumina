@@ -4,15 +4,49 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Anthropic speaks native /v1/messages SSE with thinking blocks + prompt cache.
 type Anthropic struct {
 	BaseURL string
 	APIKey  string
+
+	mu         sync.Mutex
+	ctxCache   map[string]int // model id → advertised window (0 = none)
+	ctxFetched bool           // /models was already pulled once
 }
 
 func (p *Anthropic) Name() string { return "anthropic-compatible" }
+
+// ContextWindow returns the gateway-advertised window for a bare model id
+// (OpenRouter-style `context_length`; plain Anthropic has none → 0). The
+// /v1/models document is fetched once and cached per provider.
+func (p *Anthropic) ContextWindow(ctx context.Context, model string) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if w, ok := p.ctxCache[model]; ok {
+		return w, nil
+	}
+	if p.ctxFetched {
+		return 0, nil
+	}
+	p.ctxFetched = true
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	models, err := listOpenAIModels(cctx, strings.TrimSuffix(p.BaseURL, "/")+"/v1/models", p.APIKey, nil)
+	if err != nil {
+		return 0, err
+	}
+	if p.ctxCache == nil {
+		p.ctxCache = map[string]int{}
+	}
+	for _, m := range models {
+		p.ctxCache[m.ID] = m.ContextWindow
+	}
+	return p.ctxCache[model], nil
+}
 
 // ListModels returns the account's live models (GET /v1/models, same
 // envelope as OpenAI).

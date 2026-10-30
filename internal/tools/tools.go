@@ -1,9 +1,8 @@
 // Package tools implements the agent tool envelope: read, edit, write,
 // bash, grep, glob, skill, lsp, mcp, kb_query, memory_write, webfetch,
-// websearch, subagent, task_output — every call gated by
-// internal/security Authorize(). Web + subagent semantics follow
-// https://opencode.ai/v2/docs/tools, /websearch, and /agents (reimplemented,
-// no opencode sources copied).
+// websearch, question, todowrite, subagent, task_output — every call gated by
+// internal/security Authorize(). Web + subagent semantics are
+// reimplemented for Lumina's toolset.
 package tools
 
 import (
@@ -12,13 +11,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,12 +37,46 @@ type SecCtx struct {
 	WorkspaceDir      string
 	BashRules         map[string]string
 	AllowToolingWrite bool
-	// SubagentDepth counts delegation nesting (opencode caps at 1: a
-	// subagent may not launch its own subagents).
+	// SubagentDepth counts delegation nesting. The cap is the registry's
+	// maxDepth (default 1): a subagent may not launch its own subagents.
 	SubagentDepth int
 	// SessionID routes background-done notifications to the owning session.
 	SessionID string
 }
+
+// SubagentRequest is one scoped child delegation.
+type SubagentRequest struct {
+	Agent       string
+	Description string
+	Prompt      string
+	// Model optionally overrides the child model (provider/model).
+	Model string
+}
+
+// Todo is one tracked task for the todowrite tool.
+type Todo struct {
+	Content string `json:"content"`
+	Status  string `json:"status"` // pending | in_progress | completed | cancelled
+}
+
+// QuestionOption is one offered answer to a user question.
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+// Question is one model question for the user (opencode Question.Prompt
+// parity: question/header/options/multiple).
+type Question struct {
+	Question string           `json:"question"`
+	Header   string           `json:"header"`
+	Options  []QuestionOption `json:"options"`
+	Multiple bool             `json:"multiple"`
+}
+
+// ErrQuestionUnwired reports a question call with no UI attached (headless
+// runs, tests). doQuestion maps it to proceed-with-best-guess guidance.
+var ErrQuestionUnwired = fmt.Errorf("question UI not wired")
 
 // Task is one background unit (bash background:true or subagent
 // background:true). Foreground callers get the result inline; background
@@ -82,16 +119,24 @@ type Registry struct {
 	// to avoid an import cycle). Always foreground: doSubagent handles
 	// background:true itself via the task store. Nil means the subagent
 	// tool reports "not wired".
-	Subagent func(ctx context.Context, sc SecCtx, agent, description, prompt string) (string, error)
+	Subagent func(ctx context.Context, sc SecCtx, req SubagentRequest) (string, error)
+	// SubagentMaxDepth caps delegation nesting (0 = default 1). Overridable
+	// via LUMINA_SUBAGENT_DEPTH. Children never receive the subagent tool,
+	// so depth can only grow through this backend.
+	SubagentMaxDepth int
+	// AskQuestion answers a question-tool call with the user's replies, one
+	// string list per question (multiple:true may yield several). Nil means
+	// no question UI is wired: doQuestion reports ErrQuestionUnwired so the
+	// turn proceeds with best guesses instead of hanging a headless run.
+	AskQuestion func(ctx context.Context, sc SecCtx, questions []Question) ([][]string, error)
 	// WebSearchProvider selects the websearch backend ("", "random", "exa",
 	// "firecrawl", "parallel", "tavily", "tinyfish"). Empty = auto-detect
-	// from env keys. Mirrors opencode's `websearch.provider` setting.
+	// from env keys. Mirrors the `[websearch] provider` setting.
 	WebSearchProvider string
-	// WebSearchDisabled removes the websearch tool (opencode `websearch: false`).
+	// WebSearchDisabled removes the websearch tool (`websearch: false`).
 	WebSearchDisabled bool
 	// OnBackgroundDone, when set, fires when a background task finishes
-	// (the daemon maps it to a turn.progress SSE, like opencode's
-	// background session notification).
+	// (the daemon maps it to a turn.progress SSE background notification).
 	OnBackgroundDone func(sessionID, taskID, kind, label string)
 	// Plugin hooks (JS tool.execute.before/after). BeforeCall may
 	// rewrite args or return an error to block with guidance for the model.
@@ -101,24 +146,54 @@ type Registry struct {
 	mu    sync.Mutex
 	tasks map[string]*Task
 	seq   int
+	// todos tracks todowrite state per session.
+	todos map[string][]Todo
+}
+
+// maxDepth returns the configured delegation cap (default 1).
+func (r *Registry) maxDepth() int {
+	if r.SubagentMaxDepth > 0 {
+		return r.SubagentMaxDepth
+	}
+	return 1
+}
+
+// subagentDepthOverride reads LUMINA_SUBAGENT_DEPTH once at startup.
+func subagentDepthOverride() int {
+	v := strings.TrimSpace(os.Getenv("LUMINA_SUBAGENT_DEPTH"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0
+	}
+	return n
 }
 
 // NewRegistry builds the default tool set.
 func NewRegistry() *Registry {
-	r := &Registry{tools: map[string]*Tool{}, tasks: map[string]*Task{}}
-	r.tools["read"] = &Tool{Name: "read", Description: "Read a workspace file (offset/limit).", Execute: r.doRead}
-	r.tools["edit"] = &Tool{Name: "edit", Description: "Replace exact text in a file.", Execute: r.doEdit}
-	r.tools["write"] = &Tool{Name: "write", Description: "Create/overwrite a file.", Execute: r.doWrite}
-	r.tools["bash"] = &Tool{Name: "bash", Description: "Run a shell command in the workspace (background:true runs detached; poll with task_output).", Execute: r.doBash}
-	r.tools["grep"] = &Tool{Name: "grep", Description: "Search file contents.", Execute: r.doGrep}
-	r.tools["glob"] = &Tool{Name: "glob", Description: "Find files by glob.", Execute: r.doGlob}
-	r.tools["skill"] = &Tool{Name: "skill", Description: "Load a SKILL.md body lazily.", Execute: r.doSkill}
+	r := &Registry{tools: map[string]*Tool{}, tasks: map[string]*Task{}, todos: map[string][]Todo{}}
+	if d := subagentDepthOverride(); d > 0 {
+		r.SubagentMaxDepth = d
+	}
+	year := time.Now().Year()
+	r.tools["read"] = &Tool{Name: "read", Description: "Read a file or directory (line: content, offset/limit).", Execute: r.doRead}
+	r.tools["edit"] = &Tool{Name: "edit", Description: "Edit a file by finding and replacing exact text.", Execute: r.doEdit}
+	r.tools["write"] = &Tool{Name: "write", Description: "Write a file, overwriting if one exists; creates parent dirs.", Execute: r.doWrite}
+	r.tools["bash"] = &Tool{Name: "bash", Description: "Execute a shell command (workdir optional; background:true runs detached; poll with task_output).", Execute: r.doBash}
+	r.tools["grep"] = &Tool{Name: "grep", Description: "Search file contents (regex or literal).", Execute: r.doGrep}
+	r.tools["glob"] = &Tool{Name: "glob", Description: "Search file paths by glob.", Execute: r.doGlob}
+	r.tools["skill"] = &Tool{Name: "skill", Description: "Load a skill's instructions by name.", Execute: r.doSkill}
 	r.tools["lsp"] = &Tool{Name: "lsp", Description: "Code intelligence: symbols/refs (grep-backed).", Execute: r.doGrep}
 	r.tools["mcp"] = &Tool{Name: "mcp", Description: "Call a local MCP tool (stdio/SSE).", Execute: r.doMCP}
 	r.tools["kb_query"] = &Tool{Name: "kb_query", Description: "Query Markdown+graphify memory.", Execute: r.doKBQuery}
 	r.tools["memory_write"] = &Tool{Name: "memory_write", Description: "Write atomic memory note.", Execute: r.doMemoryWrite}
-	r.tools["webfetch"] = &Tool{Name: "webfetch", Description: "Fetch one HTTP(S) URL as markdown/text (cap 100KB).", Execute: r.doWebFetch}
-	r.tools["websearch"] = &Tool{Name: "websearch", Description: "Search the web for current info (needs a provider key: TAVILY_API_KEY, EXA_API_KEY, FIRECRAWL_API_KEY, PARALLEL_API_KEY, or TINYFISH_API_KEY).", Execute: r.doWebSearch}
+	r.tools["webfetch"] = &Tool{Name: "webfetch", Description: "Fetch one HTTP(S) URL as markdown/text/HTML (cap 100KB).", Execute: r.doWebFetch}
+	r.tools["websearch"] = &Tool{Name: "websearch", Description: fmt.Sprintf("Search the web for current info (needs a provider key: TAVILY_API_KEY, EXA_API_KEY, FIRECRAWL_API_KEY, PARALLEL_API_KEY, or TINYFISH_API_KEY). The current year is %d.", year), Execute: r.doWebSearch}
+	r.tools["patch"] = &Tool{Name: "patch", Description: "Apply a *** Begin Patch *** multi-file diff (add/update/delete).", Execute: r.doPatch}
+	r.tools["question"] = &Tool{Name: "question", Description: "Ask the user questions during execution.", Execute: r.doQuestion}
+	r.tools["todowrite"] = &Tool{Name: "todowrite", Description: "Track task progress as a todo list.", Execute: r.doTodoWrite}
 	r.tools["subagent"] = &Tool{Name: "subagent", Description: "Launch a scoped subagent child (general/explore/custom). background:true returns a task ID; poll with task_output.", Execute: r.doSubagent}
 	r.tools["task_output"] = &Tool{Name: "task_output", Description: "Poll a background bash/subagent task by ID.", Execute: r.doTaskOutput}
 	return r
@@ -177,7 +252,7 @@ func (r *Registry) Call(ctx context.Context, sc SecCtx, name string, args map[st
 
 func isEditName(n string) bool {
 	switch strings.ToLower(n) {
-	case "edit", "write", "read":
+	case "edit", "write", "read", "patch":
 		return true
 	}
 	return false
@@ -212,6 +287,18 @@ func toolTarget(name string, args map[string]interface{}) string {
 		}
 		if s, _ := args["id"].(string); s != "" {
 			return "task:" + s
+		}
+	case "patch":
+		// Authorize on the first touched file; doPatch re-gates every
+		// file (workspace containment, credential shapes, plan scope).
+		if s, _ := args["patchText"].(string); s != "" {
+			return patchFirstPath(s)
+		}
+		if s, _ := args["patch_text"].(string); s != "" {
+			return patchFirstPath(s)
+		}
+		if s, _ := args["patch"].(string); s != "" {
+			return patchFirstPath(s)
 		}
 	}
 	if s, _ := args["path"].(string); s != "" {
@@ -252,15 +339,48 @@ func (r *Registry) doRead(_ context.Context, sc SecCtx, args map[string]interfac
 	if p == "" {
 		return Result{}, fmt.Errorf("read: missing path")
 	}
+	st, err := os.Stat(p)
+	if err != nil {
+		return Result{}, err
+	}
+	offset, limit := intArg(args, "offset", 1), intArg(args, "limit", 2000)
+	if offset < 1 {
+		offset = 1
+	}
+	if limit < 1 {
+		limit = 2000
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+	// Directory: one entry per line, paginated like text.
+	if st.IsDir() {
+		entries, err := os.ReadDir(p)
+		if err != nil {
+			return Result{}, err
+		}
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		sort.Strings(names)
+		end := offset - 1 + limit
+		if end > len(names) {
+			end = len(names)
+		}
+		if offset-1 > len(names) {
+			return Result{Output: ""}, nil
+		}
+		return Result{Output: strings.Join(names[offset-1:end], "\n"), Truncated: end < len(names)}, nil
+	}
 	b, err := os.ReadFile(p)
 	if err != nil {
 		return Result{}, err
 	}
-	lines := strings.Split(string(b), "\n")
-	offset, limit := intArg(args, "offset", 1), intArg(args, "limit", 200)
-	if offset < 1 {
-		offset = 1
+	if bytes.IndexByte(b, 0) >= 0 {
+		return Result{}, fmt.Errorf("read: binary file not supported (%s)", p)
 	}
+	lines := strings.Split(string(b), "\n")
 	end := offset - 1 + limit
 	if end > len(lines) {
 		end = len(lines)
@@ -268,13 +388,18 @@ func (r *Registry) doRead(_ context.Context, sc SecCtx, args map[string]interfac
 	if offset-1 > len(lines) {
 		return Result{Output: ""}, nil
 	}
-	out := strings.Join(lines[offset-1:end], "\n")
-	return Result{Output: out, Truncated: end < len(lines)}, nil
+	// ponytail: 1-based "line: content" matches opencode read.ts so models
+	// can cite lines and edits stay prefix-free.
+	out := make([]string, 0, end-(offset-1))
+	for i := offset - 1; i < end; i++ {
+		out = append(out, fmt.Sprintf("%d: %s", i+1, lines[i]))
+	}
+	return Result{Output: strings.Join(out, "\n"), Truncated: end < len(lines)}, nil
 }
 
 func (r *Registry) doEdit(_ context.Context, sc SecCtx, args map[string]interface{}) (Result, error) {
 	p := resolvePath(sc, strArg(args, "path", "file"))
-	oldS, newS := strArg(args, "old_string", "old"), strArg(args, "new_string", "new")
+	oldS, newS := strArg(args, "old_string", "oldString", "old"), strArg(args, "new_string", "newString", "new")
 	if p == "" || oldS == "" {
 		return Result{}, fmt.Errorf("edit: missing path/old_string")
 	}
@@ -285,7 +410,16 @@ func (r *Registry) doEdit(_ context.Context, sc SecCtx, args map[string]interfac
 	if !strings.Contains(string(b), oldS) {
 		return Result{}, fmt.Errorf("edit: old_string not found")
 	}
-	updated := strings.Replace(string(b), oldS, newS, 1)
+	// ponytail: opencode parity — replaceAll replaces every occurrence.
+	updated := string(b)
+	if boolArg(args, "replaceAll") || boolArg(args, "replace_all") {
+		updated = strings.ReplaceAll(updated, oldS, newS)
+	} else {
+		if strings.Count(updated, oldS) > 1 {
+			return Result{}, fmt.Errorf("edit: old_string matches %d locations; add context or set replaceAll:true", strings.Count(updated, oldS))
+		}
+		updated = strings.Replace(updated, oldS, newS, 1)
+	}
 	if err := os.WriteFile(p, []byte(updated), 0o644); err != nil {
 		return Result{}, err
 	}
@@ -312,7 +446,22 @@ func (r *Registry) doBash(ctx context.Context, sc SecCtx, args map[string]interf
 	if cmdStr == "" {
 		return Result{}, fmt.Errorf("bash: missing command")
 	}
-	// opencode parity: background:true detaches (no timeout unless one is
+	// workdir runs the command in a subdirectory of the workspace.
+	dir := sc.WorkspaceDir
+	if w := strArg(args, "workdir", "work_dir", "cwd"); w != "" {
+		resolved := w
+		if !filepath.IsAbs(w) {
+			resolved = filepath.Join(sc.WorkspaceDir, w)
+		}
+		if !insideWorkspace(sc.WorkspaceDir, resolved) {
+			return Result{}, fmt.Errorf("bash: workdir escapes workspace")
+		}
+		if st, err := os.Stat(resolved); err != nil || !st.IsDir() {
+			return Result{}, fmt.Errorf("bash: workdir is not a directory: %s", w)
+		}
+		dir = resolved
+	}
+	// background:true detaches (no timeout unless one is
 	// supplied); poll with task_output. Foreground keeps the 2-minute cap.
 	if boolArg(args, "background") {
 		timeout := timeoutArg(args)
@@ -330,9 +479,7 @@ func (r *Registry) doBash(ctx context.Context, sc SecCtx, args map[string]interf
 				defer cancel()
 			}
 			cmd := exec.CommandContext(runCtx, "sh", "-c", cmdStr)
-			if sc.WorkspaceDir != "" {
-				cmd.Dir = sc.WorkspaceDir
-			}
+			cmd.Dir = dir
 			cmd.Env = append(os.Environ(), "TMPDIR="+security.SessionTMPDIR("tool"))
 			out, err := cmd.CombinedOutput()
 			if err != nil && len(out) == 0 {
@@ -352,9 +499,7 @@ func (r *Registry) doBash(ctx context.Context, sc SecCtx, args map[string]interf
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
-	if sc.WorkspaceDir != "" {
-		cmd.Dir = sc.WorkspaceDir
-	}
+	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "TMPDIR="+security.SessionTMPDIR("tool"))
 	out, err := cmd.CombinedOutput()
 	if err != nil && len(out) == 0 {
@@ -372,9 +517,40 @@ func (r *Registry) doGrep(_ context.Context, sc SecCtx, args map[string]interfac
 	if pattern == "" || root == "" {
 		return Result{}, fmt.Errorf("grep: missing pattern/path")
 	}
+	// literal:true matches exact text; otherwise pattern is a regexp.
+	literal := boolArg(args, "literal")
+	caseSensitive := true
+	if _, ok := args["caseSensitive"]; ok {
+		caseSensitive = boolArg(args, "caseSensitive")
+	} else if _, ok := args["case_sensitive"]; ok {
+		caseSensitive = boolArg(args, "case_sensitive")
+	}
+	var re *regexp.Regexp
+	if !literal {
+		expr := pattern
+		if !caseSensitive {
+			expr = "(?i)" + expr
+		}
+		var err error
+		if re, err = regexp.Compile(expr); err != nil {
+			return Result{}, fmt.Errorf("grep: invalid pattern: %v", err)
+		}
+	}
+	include := strArg(args, "include")
+	limit := intArg(args, "limit", 100)
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	needle := pattern
+	if !caseSensitive {
+		needle = strings.ToLower(pattern)
+	}
 	var out []string
 	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || len(out) > 100 {
+		if err != nil || info.IsDir() || len(out) >= limit {
 			return nil
 		}
 		if strings.Contains(p, "/.git/") || strings.Contains(p, "/node_modules/") {
@@ -386,25 +562,47 @@ func (r *Registry) doGrep(_ context.Context, sc SecCtx, args map[string]interfac
 		if info.Size() > 1<<20 {
 			return nil
 		}
+		rel := p
+		if sc.WorkspaceDir != "" {
+			rel, _ = filepath.Rel(sc.WorkspaceDir, p)
+		}
+		if include != "" {
+			// Match against the relative path and the base name so
+			// "*.go" works at any depth.
+			if ok, _ := path.Match(include, rel); !ok {
+				if ok, _ := path.Match(include, filepath.Base(rel)); !ok {
+					return nil
+				}
+			}
+		}
 		b, err := os.ReadFile(p)
 		if err != nil {
 			return nil
 		}
+		if bytes.IndexByte(b, 0) >= 0 {
+			return nil // skip binaries
+		}
 		for i, line := range strings.Split(string(b), "\n") {
-			if strings.Contains(line, pattern) {
-				rel := p
-				if sc.WorkspaceDir != "" {
-					rel, _ = filepath.Rel(sc.WorkspaceDir, p)
+			var hit bool
+			if literal {
+				if caseSensitive {
+					hit = strings.Contains(line, pattern)
+				} else {
+					hit = strings.Contains(strings.ToLower(line), needle)
 				}
+			} else {
+				hit = re.MatchString(line)
+			}
+			if hit {
 				out = append(out, fmt.Sprintf("%s:%d:%s", rel, i+1, line))
-				if len(out) >= 100 {
+				if len(out) >= limit {
 					break
 				}
 			}
 		}
 		return nil
 	})
-	return Result{Output: strings.Join(out, "\n"), Truncated: len(out) >= 100}, nil
+	return Result{Output: strings.Join(out, "\n"), Truncated: len(out) >= limit}, nil
 }
 
 func (r *Registry) doGlob(_ context.Context, sc SecCtx, args map[string]interface{}) (Result, error) {
@@ -413,14 +611,100 @@ func (r *Registry) doGlob(_ context.Context, sc SecCtx, args map[string]interfac
 		return Result{}, fmt.Errorf("glob: missing pattern")
 	}
 	root := sc.WorkspaceDir
-	matches, _ := filepath.Glob(filepath.Join(root, pattern))
-	var rel []string
-	for _, m := range matches {
-		r, _ := filepath.Rel(root, m)
-		rel = append(rel, r)
+	if p := strArg(args, "path"); p != "" {
+		root = resolvePath(sc, p)
+		if !insideWorkspace(sc.WorkspaceDir, root) {
+			return Result{}, fmt.Errorf("glob: path escapes workspace")
+		}
 	}
-	sort.Strings(rel)
-	return Result{Output: strings.Join(rel, "\n")}, nil
+	limit := intArg(args, "limit", 100)
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	var rel []string
+	if strings.Contains(pattern, "**") {
+		re, err := globToRegExp(pattern)
+		if err != nil {
+			return Result{}, fmt.Errorf("glob: bad pattern: %v", err)
+		}
+		_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+			if err != nil || len(rel) >= limit {
+				return nil
+			}
+			rp, err := filepath.Rel(root, p)
+			if err != nil || rp == "." {
+				return nil
+			}
+			if strings.Contains(p, "/.git/") || strings.Contains(p, "/node_modules/") {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if re.MatchString(filepath.ToSlash(rp)) {
+				rel = append(rel, rp)
+			}
+			return nil
+		})
+	} else {
+		matches, _ := filepath.Glob(filepath.Join(root, pattern))
+		for _, m := range matches {
+			rp, _ := filepath.Rel(root, m)
+			rel = append(rel, rp)
+		}
+		sort.Strings(rel)
+	}
+	truncated := len(rel) > limit
+	if truncated {
+		rel = rel[:limit]
+	}
+	return Result{Output: strings.Join(rel, "\n"), Truncated: truncated}, nil
+}
+
+// globToRegExp compiles a glob with ** (any depth), * (within a segment),
+// ? and [...] classes to a regexp over slash-separated paths.
+func globToRegExp(pattern string) (*regexp.Regexp, error) {
+	var sb strings.Builder
+	sb.WriteString("^")
+	pat := filepath.ToSlash(pattern)
+	for i := 0; i < len(pat); {
+		switch pat[i] {
+		case '*':
+			if i+1 < len(pat) && pat[i+1] == '*' {
+				sb.WriteString(".*")
+				i += 2
+				// A trailing slash after ** is optional ("src/**/x" matches "src/x").
+				if i < len(pat) && pat[i] == '/' {
+					sb.WriteString("/?")
+					i++
+				}
+			} else {
+				sb.WriteString("[^/]*")
+				i++
+			}
+		case '?':
+			sb.WriteString("[^/]")
+			i++
+		case '[':
+			j := i + 1
+			for j < len(pat) && pat[j] != ']' {
+				j++
+			}
+			if j >= len(pat) {
+				return nil, fmt.Errorf("unterminated [")
+			}
+			sb.WriteString(pat[i : j+1])
+			i = j + 1
+		default:
+			sb.WriteString(regexp.QuoteMeta(string(pat[i])))
+			i++
+		}
+	}
+	sb.WriteString("$")
+	return regexp.Compile(sb.String())
 }
 
 func (r *Registry) doSkill(_ context.Context, sc SecCtx, args map[string]interface{}) (Result, error) {
@@ -539,7 +823,7 @@ func boolArg(args map[string]interface{}, key string) bool {
 	return false
 }
 
-// timeoutArg reads an optional millisecond timeout (opencode `timeout`).
+// timeoutArg reads an optional millisecond timeout.
 func timeoutArg(args map[string]interface{}) time.Duration {
 	for _, k := range []string{"timeout", "timeout_ms", "timeoutMs"} {
 		switch v := args[k].(type) {
@@ -585,7 +869,6 @@ func (r *Registry) finishTask(id, output, errStr string) {
 		t.Status = "done"
 		t.Output = output
 	}
-	t.DoneAt = time.Time{}
 	t.DoneAt = time.Now()
 }
 
@@ -602,14 +885,18 @@ func (r *Registry) doTaskOutput(_ context.Context, _ SecCtx, args map[string]int
 	}
 	r.mu.Lock()
 	t, ok := r.tasks[id]
-	r.mu.Unlock()
 	if !ok {
+		r.mu.Unlock()
 		return Result{}, fmt.Errorf("task_output: unknown task %q", id)
 	}
-	if t.Status == "running" {
-		return Result{Output: "task " + id + " (" + t.Kind + ") still running: " + t.Label}, nil
+	// Snapshot under the lock: finishTask writes these fields when the
+	// background unit completes (data race when read unlocked).
+	status, kind, label, output := t.Status, t.Kind, t.Label, t.Output
+	r.mu.Unlock()
+	if status == "running" {
+		return Result{Output: "task " + id + " (" + kind + ") still running: " + label}, nil
 	}
-	out := t.Output
+	out := output
 	if len(out) > 30000 {
 		out = out[:30000] + "\n…[truncated; full output retained in task " + id + "]"
 		return Result{Output: out, Truncated: true}, nil
@@ -618,11 +905,16 @@ func (r *Registry) doTaskOutput(_ context.Context, _ SecCtx, args map[string]int
 }
 
 func (r *Registry) doSubagent(ctx context.Context, sc SecCtx, args map[string]interface{}) (Result, error) {
-	if sc.SubagentDepth >= 1 {
-		return Result{}, fmt.Errorf("subagent: nesting depth 1 exceeded (subagents cannot launch subagents)")
+	if sc.SubagentDepth >= r.maxDepth() {
+		return Result{}, fmt.Errorf("subagent: nesting depth %d exceeded (subagents cannot launch subagents)", r.maxDepth())
 	}
 	if r.Subagent == nil {
 		return Result{}, fmt.Errorf("subagent: runner not wired (no model backend)")
+	}
+	// Follow-ups target live child sessions, which Lumina does not keep:
+	// fail loudly instead of silently starting an unrelated child.
+	if s := strArg(args, "sessionID", "sessionId", "session_id"); s != "" {
+		return Result{}, fmt.Errorf("subagent: follow-up via sessionID is not supported; start a new subagent with full context instead")
 	}
 	agentName := strArg(args, "agent", "name", "id")
 	prompt := strArg(args, "prompt", "task")
@@ -630,14 +922,16 @@ func (r *Registry) doSubagent(ctx context.Context, sc SecCtx, args map[string]in
 		return Result{}, fmt.Errorf("subagent: missing agent/prompt (need {agent, description, prompt})")
 	}
 	description := strArg(args, "description")
+	model := strArg(args, "model")
+	req := SubagentRequest{Agent: agentName, Description: description, Prompt: prompt, Model: model}
 	if !boolArg(args, "background") {
-		out, err := r.Subagent(ctx, sc, agentName, description, prompt)
+		out, err := r.Subagent(ctx, sc, req)
 		if err != nil {
 			return Result{}, err
 		}
 		return Result{Output: out}, nil
 	}
-	// background:true detaches like opencode: return the task ID now,
+	// background:true detaches: return the task ID now,
 	// poll with task_output, notify on completion.
 	label := agentName
 	if description != "" {
@@ -648,7 +942,7 @@ func (r *Registry) doSubagent(ctx context.Context, sc SecCtx, args map[string]in
 	childSc := sc
 	childSc.SubagentDepth = sc.SubagentDepth + 1
 	go func() {
-		out, err := r.Subagent(context.Background(), childSc, agentName, description, prompt)
+		out, err := r.Subagent(context.Background(), childSc, req)
 		if err != nil {
 			r.finishTask(id, "", "error: "+err.Error())
 		} else {
@@ -659,7 +953,166 @@ func (r *Registry) doSubagent(ctx context.Context, sc SecCtx, args map[string]in
 	return Result{Output: "started background subagent task " + id + " (poll with task_output)"}, nil
 }
 
-// --- webfetch (opencode `webfetch` parity, reimplemented) ---
+// doQuestion answers via the wired question UI, or guides the model on when
+// none is attached (headless runs) so the turn proceeds with best guesses.
+func (r *Registry) doQuestion(ctx context.Context, sc SecCtx, args map[string]interface{}) (Result, error) {
+	qs, err := parseQuestions(args)
+	if err != nil {
+		return Result{}, err
+	}
+	if r.AskQuestion == nil {
+		return Result{Output: unwiredQuestionGuidance(qs)}, nil
+	}
+	answers, err := r.AskQuestion(ctx, sc, qs)
+	if err != nil {
+		if err == ErrQuestionUnwired {
+			return Result{Output: unwiredQuestionGuidance(qs)}, nil
+		}
+		// Dismissals and transport failures reach the model as guidance to
+		// continue without the answers, never as a stuck turn.
+		return Result{}, fmt.Errorf("question: %v; proceed with your best guess and note the assumption", err)
+	}
+	return Result{Output: formatQuestionAnswers(qs, answers)}, nil
+}
+
+// parseQuestions decodes the question-tool input (opencode Question.Prompt
+// shape: {question, header, options: [{label, description}], multiple}).
+func parseQuestions(args map[string]interface{}) ([]Question, error) {
+	raw, _ := args["questions"].([]interface{})
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("question: missing questions")
+	}
+	qs := make([]Question, 0, len(raw))
+	for i, item := range raw {
+		// Bare-string shorthand ("q1") means {question: "q1"}; models
+		// often ask plain questions without options to pick from.
+		if s, _ := item.(string); s != "" {
+			qs = append(qs, Question{Question: strings.TrimSpace(s)})
+			continue
+		}
+		m, _ := item.(map[string]interface{})
+		if m == nil {
+			return nil, fmt.Errorf("question: questions[%d] must be {question, header, options}", i)
+		}
+		q := Question{
+			Question: strings.TrimSpace(strArg(m, "question")),
+			Header:   strings.TrimSpace(strArg(m, "header")),
+			Multiple: boolArg(m, "multiple"),
+		}
+		if q.Question == "" {
+			return nil, fmt.Errorf("question: questions[%d].question is required", i)
+		}
+		if opts, _ := m["options"].([]interface{}); opts != nil {
+			for j, o := range opts {
+				om, _ := o.(map[string]interface{})
+				if om == nil {
+					return nil, fmt.Errorf("question: questions[%d].options[%d] must be {label, description}", i, j)
+				}
+				label := strings.TrimSpace(strArg(om, "label"))
+				if label == "" {
+					return nil, fmt.Errorf("question: questions[%d].options[%d].label is required", i, j)
+				}
+				q.Options = append(q.Options, QuestionOption{
+					Label:       label,
+					Description: strings.TrimSpace(strArg(om, "description")),
+				})
+			}
+		}
+		qs = append(qs, q)
+	}
+	return qs, nil
+}
+
+// formatQuestionAnswers renders replies model-side, mirroring opencode's
+// QuestionTool.toModelContent.
+func formatQuestionAnswers(qs []Question, answers [][]string) string {
+	parts := make([]string, 0, len(qs))
+	for i, q := range qs {
+		var a []string
+		if i < len(answers) {
+			a = answers[i]
+		}
+		if len(a) == 0 {
+			a = []string{"Unanswered"}
+		}
+		parts = append(parts, fmt.Sprintf("%q=%q", q.Question, strings.Join(a, ", ")))
+	}
+	return "User has answered your questions: " + strings.Join(parts, ", ") + ". You can now continue with the user's answers in mind."
+}
+
+func unwiredQuestionGuidance(qs []Question) string {
+	names := make([]string, 0, len(qs))
+	for _, q := range qs {
+		names = append(names, q.Question)
+	}
+	return "question UI is not wired in this session; proceed with your best guess for (" +
+		strings.Join(names, "; ") + ") and note the assumption"
+}
+
+// doTodoWrite stores the session's todo list and summarizes it, mirroring
+// opencode's todowrite tool.
+func (r *Registry) doTodoWrite(_ context.Context, sc SecCtx, args map[string]interface{}) (Result, error) {
+	raw, _ := args["todos"].([]interface{})
+	todos := make([]Todo, 0, len(raw))
+	for i, item := range raw {
+		m, _ := item.(map[string]interface{})
+		if m == nil {
+			return Result{}, fmt.Errorf("todowrite: todos[%d] must be {content, status}", i)
+		}
+		content := strings.TrimSpace(strArg(m, "content"))
+		status := strings.ToLower(strings.TrimSpace(strArg(m, "status")))
+		switch status {
+		case "pending", "in_progress", "completed", "cancelled":
+		default:
+			return Result{}, fmt.Errorf("todowrite: todos[%d].status must be pending|in_progress|completed|cancelled", i)
+		}
+		if content == "" {
+			return Result{}, fmt.Errorf("todowrite: todos[%d].content is required", i)
+		}
+		todos = append(todos, Todo{Content: content, Status: status})
+	}
+	r.mu.Lock()
+	if r.todos == nil {
+		r.todos = map[string][]Todo{}
+	}
+	r.todos[sc.SessionID] = todos
+	r.mu.Unlock()
+	return Result{Output: summarizeTodos(todos)}, nil
+}
+
+func summarizeTodos(todos []Todo) string {
+	if len(todos) == 0 {
+		return "Todos cleared"
+	}
+	count := func(status string) int {
+		n := 0
+		for _, t := range todos {
+			if t.Status == status {
+				n++
+			}
+		}
+		return n
+	}
+	parts := []string{fmt.Sprintf("%d/%d completed", count("completed"), len(todos))}
+	for _, s := range []string{"in_progress", "pending", "cancelled"} {
+		if n := count(s); n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, strings.ReplaceAll(s, "_", " ")))
+		}
+	}
+	out := "Todos updated: " + strings.Join(parts, ", ")
+	var active []string
+	for _, t := range todos {
+		if t.Status == "in_progress" {
+			active = append(active, t.Content)
+		}
+	}
+	if len(active) > 0 {
+		out += ". In progress: " + strings.Join(active, ", ")
+	}
+	return out
+}
+
+// --- webfetch (reimplemented) ---
 
 func (r *Registry) doWebFetch(_ context.Context, _ SecCtx, args map[string]interface{}) (Result, error) {
 	rawURL := strArg(args, "url")
@@ -669,6 +1122,9 @@ func (r *Registry) doWebFetch(_ context.Context, _ SecCtx, args map[string]inter
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return Result{}, fmt.Errorf("webfetch: only http(s) URLs are allowed")
+	}
+	if security.IsCredentialPath(rawURL) || security.IsGoogleTarget(rawURL) {
+		return Result{}, fmt.Errorf("webfetch: blocked target")
 	}
 	format := strings.ToLower(strArg(args, "format"))
 	if format == "" {
@@ -681,7 +1137,21 @@ func (r *Registry) doWebFetch(_ context.Context, _ SecCtx, args map[string]inter
 	if timeout > 120*time.Second {
 		timeout = 120 * time.Second
 	}
-	client := &http.Client{Timeout: timeout}
+	// ponytail: manual redirect walk so every hop is scheme- and
+	// hard-deny-checked like opencode's webfetch (no silent cross-host hops
+	// past credential/Google blocks).
+	client := &http.Client{Timeout: timeout, CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+		if len(strings.TrimSpace(req.URL.String())) == 0 {
+			return fmt.Errorf("webfetch: empty redirect")
+		}
+		if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+			return fmt.Errorf("webfetch: only http(s) URLs are allowed")
+		}
+		if security.IsCredentialPath(req.URL.String()) || security.IsGoogleTarget(req.URL.String()) {
+			return fmt.Errorf("webfetch: blocked redirect target")
+		}
+		return nil
+	}}
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return Result{}, err
@@ -710,17 +1180,47 @@ func (r *Registry) doWebFetch(_ context.Context, _ SecCtx, args map[string]inter
 	if truncated {
 		b = b[:capBytes]
 	}
-	_ = format // markdown is the default rendering; raw text passes through
 	out := string(b)
+	if format == "markdown" || format == "text" {
+		if strings.Contains(ct, "html") || looksLikeHTML(out) {
+			out = htmlToText(out)
+		}
+	}
 	if truncated {
 		out += "\n…[truncated at 100KB]"
 	}
 	return Result{Output: out, Truncated: truncated}, nil
 }
 
-// --- websearch (opencode provider parity, reimplemented) ---
+// looksLikeHTML sniffs markup when the server omits the content type.
+func looksLikeHTML(s string) bool {
+	t := strings.ToLower(strings.TrimSpace(s))
+	return strings.HasPrefix(t, "<!doctype html") || strings.HasPrefix(t, "<html")
+}
 
-// searchCooldown tracks per-provider 429 backoff (opencode random-selection
+// htmlToText strips markup to readable text: scripts/styles dropped,
+// block tags folded to newlines, entities unescaped, whitespace collapsed.
+func htmlToText(s string) string {
+	reScript := regexp.MustCompile(`(?is)<(script|style|noscript)[^>]*>.*?</(script|style|noscript)>`)
+	s = reScript.ReplaceAllString(s, "\n")
+	reBlock := regexp.MustCompile(`(?i)</?(p|div|br|li|ul|ol|tr|table|h[1-6]|section|article|header|footer|blockquote)[^>]*>`)
+	s = reBlock.ReplaceAllString(s, "\n")
+	reTag := regexp.MustCompile(`<[^>]+>`)
+	s = reTag.ReplaceAllString(s, "")
+	s = html.UnescapeString(s)
+	lines := strings.Split(s, "\n")
+	var kept []string
+	for _, ln := range lines {
+		if t := strings.TrimSpace(regexp.MustCompile(`[ \t]+`).ReplaceAllString(ln, " ")); t != "" {
+			kept = append(kept, t)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
+// --- websearch (multi-provider, reimplemented) ---
+
+// searchCooldown tracks per-provider 429 backoff (random-selection
 // semantics: a rate-limited provider sleeps for Retry-After or 60s).
 var searchCooldown = struct {
 	sync.Mutex
@@ -802,7 +1302,7 @@ func (r *Registry) doWebSearch(_ context.Context, _ SecCtx, args map[string]inte
 			if limited {
 				searchBackoff(p, retryAfter)
 			}
-			// Fixed (non-random) selection surfaces the error like opencode.
+			// Fixed (non-random) selection surfaces the error.
 			if want != "" && want != "random" && want != "auto" {
 				return Result{}, err
 			}

@@ -93,7 +93,7 @@ func TestSubagentNeedsWiring(t *testing.T) {
 func TestSubagentDepthDenied(t *testing.T) {
 	ws := t.TempDir()
 	r := NewRegistry()
-	r.Subagent = func(context.Context, SecCtx, string, string, string) (string, error) {
+	r.Subagent = func(context.Context, SecCtx, SubagentRequest) (string, error) {
 		return "ok", nil
 	}
 	sc := bypassCtx(ws)
@@ -108,7 +108,7 @@ func TestSubagentDepthDenied(t *testing.T) {
 func TestBackgroundSubagentPoll(t *testing.T) {
 	ws := t.TempDir()
 	r := NewRegistry()
-	r.Subagent = func(context.Context, SecCtx, string, string, string) (string, error) {
+	r.Subagent = func(context.Context, SecCtx, SubagentRequest) (string, error) {
 		return "child result", nil
 	}
 	res, err := r.Call(context.Background(), bypassCtx(ws), "subagent", map[string]interface{}{

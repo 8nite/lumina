@@ -96,6 +96,12 @@ export const api = {
     }),
   revert: (id: string) => req<{ status: string }>('POST', `/api/v1/sessions/${id}/revert`, {}),
   unrevert: (id: string) => req<{ status: string }>('POST', `/api/v1/sessions/${id}/unrevert`, {}),
+  answerPermission: (reqId: string, decision: string) =>
+    req<{ status: string }>('POST', `/api/v1/permissions/${reqId}`, { decision }),
+  answerQuestion: (reqId: string, answers: string[][]) =>
+    req<{ status: string }>('POST', `/api/v1/questions/${reqId}`, { answers }),
+  dismissQuestion: (reqId: string) =>
+    req<{ status: string }>('POST', `/api/v1/questions/${reqId}`, { dismissed: true }),
   export: (id: string) =>
     req<{ transcript: { id: string; role: string; text: string }[] }>(`GET`, `/api/v1/sessions/${id}/export`),
   routerState: () => req<{ router: Record<string, string> }>('GET', '/api/v1/router'),
@@ -124,34 +130,57 @@ export const api = {
 };
 
 // SSE subscription over fetch (EventSource cannot send auth headers).
+// Auto-reconnects with backoff so a dropped connection resumes the live
+// stream instead of leaving the UI stuck at working… forever.
 export function subscribe(onEvent: (e: DaemonEvent) => void): () => void {
-  const ctrl = new AbortController();
-  (async () => {
-  const res = await fetch(apiBase + '/api/v1/events', {
-      headers: { Accept: 'text/event-stream' },
-      signal: ctrl.signal,
-    });
-    if (!res.body) return;
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '';
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let idx: number;
-      while ((idx = buf.indexOf('\n\n')) >= 0) {
-        const chunk = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const dataLine = chunk.split('\n').find((l) => l.startsWith('data:'));
-        if (!dataLine) continue;
-        try {
-          onEvent(JSON.parse(dataLine.slice(5).trim()) as DaemonEvent);
-        } catch {
-          /* keepalive */
+  let dead = false;
+  let delayMs = 1000;
+  const ctrls = new Set<AbortController>();
+  const run = async () => {
+    while (!dead) {
+      const ctrl = new AbortController();
+      ctrls.add(ctrl);
+      try {
+        const res = await fetch(apiBase + '/api/v1/events', {
+          headers: { Accept: 'text/event-stream' },
+          signal: ctrl.signal,
+        });
+        if (!res.body) throw new Error('no body');
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        delayMs = 1000;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let idx: number;
+          while ((idx = buf.indexOf('\n\n')) >= 0) {
+            const chunk = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            const dataLine = chunk.split('\n').find((l) => l.startsWith('data:'));
+            if (!dataLine) continue;
+            try {
+              onEvent(JSON.parse(dataLine.slice(5).trim()) as DaemonEvent);
+            } catch {
+              /* keepalive */
+            }
+          }
         }
+      } catch {
+        /* reconnect below unless cleaned up */
+      } finally {
+        ctrls.delete(ctrl);
       }
+      if (dead) return;
+      await new Promise((r) => setTimeout(r, delayMs));
+      delayMs = Math.min(delayMs * 2, 15000);
     }
-  })().catch(() => {});
-  return () => ctrl.abort();
+  };
+  void run();
+  return () => {
+    dead = true;
+    for (const c of ctrls) c.abort();
+    ctrls.clear();
+  };
 }

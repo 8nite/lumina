@@ -109,6 +109,29 @@ func (r *Router) Provider(name string) (Provider, bool) {
 	return p, ok
 }
 
+// ContextWindow returns the provider-advertised context window for a
+// fully-qualified "provider/model", or 0 when the provider does not report
+// one. Metadata failures never propagate — unknown just means the gauge
+// shows used tokens without a window.
+func (r *Router) ContextWindow(ctx context.Context, model string) int {
+	if r == nil || model == "" {
+		return 0
+	}
+	p, mid := r.ProviderFor(model)
+	if p == nil {
+		return 0
+	}
+	lens, ok := p.(ContextLens)
+	if !ok {
+		return 0
+	}
+	n, err := lens.ContextWindow(ctx, mid)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
 // RefreshCopilotKey installs a freshly device-authed token into the live
 // provider (if present) so /model and chat work without a daemon restart.
 // Unknown or non-copilot providers are ignored.

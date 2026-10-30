@@ -10,6 +10,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/8nite/lumina/internal/agent"
 	"github.com/8nite/lumina/internal/kb"
 	"github.com/8nite/lumina/internal/llm"
+	"github.com/8nite/lumina/internal/tools"
 	"github.com/google/uuid"
 )
 
@@ -68,14 +70,33 @@ func (b *Broker) Subscribe(buf int) (<-chan Event, func()) {
 	}
 }
 
-// Publish broadcasts to all subscribers (non-blocking).
+// Publish broadcasts to all subscribers. Progress/delta events drop when
+// a slow consumer falls behind; terminal turn.completed/turn.failed events
+// block briefly instead so a client can never get stuck at working…
+// because its final event was shed under a delta flood.
 func (b *Broker) Publish(e Event) {
+	terminal := e.Type == "turn.completed" || e.Type == "turn.failed"
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	subs := make([]chan Event, 0, len(b.subs))
 	for ch := range b.subs {
+		subs = append(subs, ch)
+	}
+	b.mu.Unlock()
+	for _, ch := range subs {
+		if !terminal {
+			select {
+			case ch <- e:
+			default:
+			}
+			continue
+		}
 		select {
 		case ch <- e:
 		default:
+			select {
+			case ch <- e:
+			case <-time.After(5 * time.Second):
+			}
 		}
 	}
 }
@@ -95,12 +116,18 @@ type Server struct {
 	// running tracks sessions with an in-flight turn (steer/queue gate).
 	running  map[string]bool
 	permReqs map[string]map[string]string
-	// Blocking permission broker (opencode-style permission.asked flow,
+	// Blocking permission broker (permission.asked flow,
 	// reimplemented): Runner.AskPermission publishes permission.asked and
 	// waits here until the TUI answers POST /api/v1/permissions/{reqId}.
 	permMu      sync.Mutex
 	permPending map[string]chan string
 	permMeta    map[string]map[string]string
+	// Blocking question broker (question.asked flow): Runner.AskQuestion
+	// publishes question.asked and waits here until a client answers POST
+	// /api/v1/questions/{reqId} with per-question answer lists.
+	qMu      sync.Mutex
+	qPending map[string]chan questionResult
+	qMeta    map[string]map[string]string
 	// Exec runs one assistant turn (wired by cmd/serve to the agent
 	// Runner). Nil keeps the route as accept-and-broadcast (tests/embeds).
 	Exec func(ctx context.Context, sessionID string, in agent.TurnInput) (string, error)
@@ -148,6 +175,8 @@ func New(o Options) *Server {
 		permReqs:    map[string]map[string]string{},
 		permPending: map[string]chan string{},
 		permMeta:    map[string]map[string]string{},
+		qPending:    map[string]chan questionResult{},
+		qMeta:       map[string]map[string]string{},
 		RouterState: map[string]string{},
 		Redo:        map[string]string{},
 	}
@@ -164,7 +193,7 @@ func (s *Server) MountSPA(h http.Handler) {
 // Broker exposes the event broker for in-process subscribers.
 func (s *Server) Broker() *Broker { return s.broker }
 
-// NoteTurnEnd stashes one finished turn's summary (opencode v2 turn
+// NoteTurnEnd stashes one finished turn's summary (turn
 // summary: model, duration, tokens) for the in-flight prompt goroutine,
 // which merges it into the turn.completed event.
 func (s *Server) NoteTurnEnd(sessionID string, st agent.TurnStats) {
@@ -254,6 +283,7 @@ func (s *Server) routes() {
 	m.HandleFunc("/api/v1/sessions", s.handleSessions)
 	m.HandleFunc("/api/v1/sessions/", s.handleSessionSub)
 	m.HandleFunc("/api/v1/permissions/", s.handlePermissions)
+	m.HandleFunc("/api/v1/questions/", s.handleQuestions)
 	m.HandleFunc("/api/v1/files", s.handleFiles)
 	m.HandleFunc("/api/v1/git/diff", s.handleGitDiff)
 	m.HandleFunc("/api/v1/git/branch", s.handleGitBranch)
@@ -276,7 +306,7 @@ func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 		"info":    map[string]string{"title": "Lumina Daemon API", "version": "0.1.0"},
 		"servers": []map[string]string{{"url": "http://127.0.0.1:7432"}},
 		"paths": map[string]interface{}{
-			"/api/v1/events":                 map[string]string{"get": "SSE: turn.started/progress/delta/tool/completed/failed, permission.asked/resolved, session.*, config.updated"},
+			"/api/v1/events":                 map[string]string{"get": "SSE: turn.started/progress/context/delta/tool/completed/failed, permission.asked/resolved, question.asked/resolved, session.*, config.updated"},
 			"/api/v1/sessions":               map[string]string{"get": "list (?directory=, ?latest=1)", "post": "create"},
 			"/api/v1/sessions/{id}":          map[string]string{"get": "fetch", "patch": "update agent/permission/model/title"},
 			"/api/v1/sessions/{id}/fork":     map[string]string{"post": "fork at turn"},
@@ -285,6 +315,7 @@ func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 			"/api/v1/sessions/{id}/revert":   map[string]string{"post": "shadow-git undo"},
 			"/api/v1/sessions/{id}/unrevert": map[string]string{"post": "shadow-git redo"},
 			"/api/v1/permissions/{reqId}":    map[string]string{"post": "allow_once/session/always or deny"},
+			"/api/v1/questions/{reqId}":      map[string]string{"post": "{\"answers\": [[...per question...]], \"dismissed\": bool}"},
 			"/api/v1/files":                  map[string]string{"get": "file tree (?directory=)"},
 			"/api/v1/git/diff":               map[string]string{"get": "working-tree diff (?directory=)"},
 			"/api/v1/git/branch":             map[string]string{"get": "branch + last commit (?directory=)"},
@@ -311,7 +342,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	ch, unsub := s.broker.Subscribe(64)
+	ch, unsub := s.broker.Subscribe(256)
 	defer unsub()
 	fmt.Fprintf(w, ": connected\n\n")
 	fl.Flush()
@@ -516,7 +547,7 @@ func (s *Server) handleSessionSub(w http.ResponseWriter, r *http.Request) {
 			Text   string `json:"text"`
 			Effort string `json:"effort"`
 			// Delivery selects inbox behavior while a turn is running
-			// (opencode steer/queue parity): steer (default) joins the
+			// (steer/queue): steer (default) joins the
 			// active turn at the next round boundary; queue chains after
 			// it completes. Ignored when the session is idle.
 			Delivery string `json:"delivery"`
@@ -624,6 +655,8 @@ func (s *Server) runTurn(id string, in agent.TurnInput) {
 		data["duration_ms"] = st.DurationMs
 		data["input_tokens"] = st.InputTokens
 		data["output_tokens"] = st.OutputTokens
+		data["context_tokens"] = st.ContextTokens
+		data["max_tokens"] = st.MaxTokens
 	}
 	s.broker.Publish(Event{Type: "turn.completed", SessionID: id, Data: data})
 }
@@ -697,7 +730,7 @@ func (s *Server) handlePermissions(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.permReqs[reqID] = map[string]string{"decision": req.Decision}
 	s.mu.Unlock()
-	// Unblock a waiting turn (opencode-style allow_once/session/deny).
+	// Unblock a waiting turn (allow_once/session/deny).
 	s.permMu.Lock()
 	ch := s.permPending[reqID]
 	delete(s.permPending, reqID)
@@ -714,8 +747,7 @@ func (s *Server) handlePermissions(w http.ResponseWriter, r *http.Request) {
 }
 
 // RequestPermission publishes permission.asked and blocks until the UI
-// answers or ctx ends. Lifecycle mirrors sst/opencode's permission flow
-// (MIT): ask → allow_once / allow_session / deny. Reimplemented here.
+// answers or ctx ends. Lifecycle: ask → allow_once / allow_session / deny.
 func (s *Server) RequestPermission(ctx context.Context, sessionID, tool, target string) (string, error) {
 	reqID := uuid.NewString()[:8]
 	ch := make(chan string, 1)
@@ -738,6 +770,63 @@ func (s *Server) RequestPermission(ctx context.Context, sessionID, tool, target 
 		delete(s.permMeta, reqID)
 		s.permMu.Unlock()
 		return "", ctx.Err()
+	}
+}
+
+// questionResult carries one answered question.asked request back to the
+// waiting turn: either per-question answer lists or a user dismissal.
+type questionResult struct {
+	answers   [][]string
+	dismissed bool
+}
+
+func (s *Server) handleQuestions(w http.ResponseWriter, r *http.Request) {
+	reqID := strings.TrimPrefix(r.URL.Path, "/api/v1/questions/")
+	var req struct {
+		Answers   [][]string `json:"answers"`
+		Dismissed bool       `json:"dismissed"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	s.qMu.Lock()
+	ch := s.qPending[reqID]
+	delete(s.qPending, reqID)
+	delete(s.qMeta, reqID)
+	s.qMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- questionResult{answers: req.Answers, dismissed: req.Dismissed}:
+		default:
+		}
+	}
+	s.broker.Publish(Event{Type: "question.resolved", Data: map[string]string{"request_id": reqID}})
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// RequestQuestion publishes question.asked and blocks until the UI answers
+// or ctx ends. Dismissal (or a silent client) surfaces as an error so the
+// model continues with its best guess instead of hanging.
+func (s *Server) RequestQuestion(ctx context.Context, sessionID string, questions []tools.Question) ([][]string, error) {
+	reqID := uuid.NewString()[:8]
+	ch := make(chan questionResult, 1)
+	s.qMu.Lock()
+	s.qPending[reqID] = ch
+	s.qMeta[reqID] = map[string]string{"session_id": sessionID}
+	s.qMu.Unlock()
+	s.broker.Publish(Event{Type: "question.asked", SessionID: sessionID, Data: map[string]interface{}{
+		"request_id": reqID, "questions": questions,
+	}})
+	select {
+	case res := <-ch:
+		if res.dismissed {
+			return nil, errors.New("question dismissed by user")
+		}
+		return res.answers, nil
+	case <-ctx.Done():
+		s.qMu.Lock()
+		delete(s.qPending, reqID)
+		delete(s.qMeta, reqID)
+		s.qMu.Unlock()
+		return nil, ctx.Err()
 	}
 }
 

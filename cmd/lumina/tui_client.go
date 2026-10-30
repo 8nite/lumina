@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/8nite/lumina/internal/tui"
 	"github.com/8nite/lumina/pkg/sdk"
@@ -47,15 +48,34 @@ func runTUIClient(c *sdk.Client, f tuiFlags) error {
 	}
 	m := tui.New(c, sess)
 	p := tea.NewProgram(m, tea.WithAltScreen())
-	// Fan SSE events into the program.
+	// Fan SSE events into the program. Reconnect with backoff so a dropped
+	// stream resumes instead of leaving the timeline stuck at working…
+	// (a turn still running server-side keeps Working until its real
+	// terminal event arrives, so disconnects stay silent by design).
+	done := make(chan struct{})
 	go func() {
-		_ = c.Subscribe(context.Background(), func(e sdk.Event) {
-			p.Send(tui.EventMsg{Event: e})
-		})
+		delay := time.Second
+		for {
+			_ = c.Subscribe(context.Background(), func(e sdk.Event) {
+				delay = time.Second
+				p.Send(tui.EventMsg{Event: e})
+			})
+			select {
+			case <-done:
+				return
+			default:
+			}
+			time.Sleep(delay)
+			if delay < 15*time.Second {
+				delay *= 2
+			}
+		}
 	}()
 	if _, err := p.Run(); err != nil {
+		close(done)
 		return err
 	}
+	close(done)
 	fmt.Fprintln(os.Stderr, "session "+sess.ID)
 	return nil
 }

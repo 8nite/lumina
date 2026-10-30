@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Responses speaks the OpenAI Responses API (/v1/responses SSE):
@@ -12,9 +14,41 @@ import (
 type Responses struct {
 	BaseURL string
 	APIKey  string
+
+	mu         sync.Mutex
+	ctxCache   map[string]int // model id → advertised window (0 = none)
+	ctxFetched bool           // /models was already pulled once
 }
 
 func (p *Responses) Name() string { return "openai-responses" }
+
+// ContextWindow returns the gateway-advertised window for a bare model id
+// (`context_length`; plain OpenAI has none → 0). The /models document is
+// fetched once and cached per provider.
+func (p *Responses) ContextWindow(ctx context.Context, model string) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if w, ok := p.ctxCache[model]; ok {
+		return w, nil
+	}
+	if p.ctxFetched {
+		return 0, nil
+	}
+	p.ctxFetched = true
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	models, err := listOpenAIModels(cctx, strings.TrimSuffix(p.BaseURL, "/")+"/models", p.APIKey, nil)
+	if err != nil {
+		return 0, err
+	}
+	if p.ctxCache == nil {
+		p.ctxCache = map[string]int{}
+	}
+	for _, m := range models {
+		p.ctxCache[m.ID] = m.ContextWindow
+	}
+	return p.ctxCache[model], nil
+}
 
 // ListModels returns the account's live models (GET /v1/models).
 func (p *Responses) ListModels(ctx context.Context) ([]ModelMeta, error) {
@@ -83,8 +117,7 @@ func (p *Responses) Chat(ctx context.Context, req Request) (<-chan Chunk, error)
 	}
 	sid := newSessionID()
 	resp, err := postJSON(ctx, url, p.APIKey, body, map[string]string{
-		"x-lumina-session":   sid,
-		"x-opencode-session": sid,
+		"x-lumina-session": sid,
 	})
 	if err != nil {
 		return nil, err

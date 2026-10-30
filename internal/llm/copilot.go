@@ -27,6 +27,10 @@ type Copilot struct {
 
 	mu     sync.Mutex
 	cached *copilotSession
+
+	ctxMu      sync.Mutex
+	ctxCache   map[string]int // model id → advertised window (0 = none)
+	ctxFetched bool
 }
 
 type copilotSession struct {
@@ -240,10 +244,54 @@ func (p *Copilot) ListModels(ctx context.Context) ([]ModelMeta, error) {
 		return nil, fmt.Errorf("copilot models: status %d", resp.StatusCode)
 	}
 	var lr struct {
-		Data []ModelMeta `json:"data"`
+		Data []struct {
+			ModelMeta
+			ContextLength int `json:"context_length"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
 		return nil, err
 	}
-	return lr.Data, nil
+	out := make([]ModelMeta, 0, len(lr.Data))
+	for _, m := range lr.Data {
+		mm := m.ModelMeta
+		if m.ContextLength > mm.ContextWindow {
+			mm.ContextWindow = m.ContextLength
+		}
+		out = append(out, mm)
+	}
+	return out, nil
+}
+
+// ContextWindow returns the gateway-advertised window for a bare model id,
+// fetched once from the account's /models and cached. Logged-out or bare
+// endpoints report nothing → 0 (unknown, never an error for the caller).
+// ponytail: decode tolerates the undocumented shape; unknown keys are ignored.
+func (p *Copilot) ContextWindow(ctx context.Context, model string) (int, error) {
+	p.ctxMu.Lock()
+	defer p.ctxMu.Unlock()
+	if w, ok := p.ctxCache[model]; ok {
+		return w, nil
+	}
+	if p.ctxFetched {
+		return 0, nil
+	}
+	p.ctxFetched = true
+	sess, err := p.session(ctx)
+	if err != nil {
+		return 0, err
+	}
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	models, err := listOpenAIModels(cctx, sess.baseURL+"/models", sess.token, copilotHeaders())
+	if err != nil {
+		return 0, err
+	}
+	if p.ctxCache == nil {
+		p.ctxCache = map[string]int{}
+	}
+	for _, m := range models {
+		p.ctxCache[m.ID] = m.ContextWindow
+	}
+	return p.ctxCache[model], nil
 }

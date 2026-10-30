@@ -74,7 +74,7 @@ func TestThinkingHiddenByDefault(t *testing.T) {
 	m := testModel()
 	m = applyEvent(m, eventMsg("turn.delta", "s1", map[string]string{"delta": "hi", "thinking": "secret plan"}))
 	if strings.Contains(m.View(), "secret plan") {
-		t.Fatal("thinking must hide by default (opencode session.thinking)")
+		t.Fatal("thinking must hide by default (session.thinking)")
 	}
 	m.ApplyCommand("/thinking show")
 	if !strings.Contains(m.View(), "secret plan") {

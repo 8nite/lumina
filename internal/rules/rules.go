@@ -256,7 +256,7 @@ func discoverSkillsFromRoots(roots []string) []SkillMeta {
 	return out
 }
 
-// BuiltinAgents mirrors opencode's shipped subagents (reimplemented):
+// BuiltinAgents lists the shipped subagents (reimplemented):
 // general handles multi-step work with broad tools but cannot delegate;
 // explore is read-only research over code and the web.
 func BuiltinAgents() []AgentDef {

@@ -58,13 +58,11 @@ type Usage struct {
 }
 
 // LuminaUserAgent identifies lumina to gateways that block generic
-// HTTP-library user agents (opencode zen requires a real client UA;
-// see https://opencode.ai/v2/docs/console/go/#where-can-i-use-it).
+// HTTP-library user agents (some compat gateways require a real client UA).
 const LuminaUserAgent = "lumina/0.1.0"
 
-// newSessionID mints one routing session for the opencode zen gateway
-// (x-opencode-session). Stable per conversation enables prompt caching;
-// per-request is sufficient for model listing.
+// newSessionID mints one routing session (x-lumina-session). Stable per
+// conversation enables prompt caching; per-request is sufficient for model listing.
 func newSessionID() string {
 	return uuid.NewString()
 }
@@ -98,6 +96,34 @@ type ModelLister interface {
 type ModelMeta struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	// ContextWindow is the provider-advertised context window, or 0 when
+	// the provider does not report one (OpenAI /models has no such
+	// field; OpenRouter-style gateways send `context_length`).
+	ContextWindow int `json:"context_window,omitempty"`
+}
+
+// ContextLens is optionally implemented by providers that can report a
+// model's context window. Failures mean "unknown" (callers show used
+// tokens without a window) — never fail a turn over metadata.
+type ContextLens interface {
+	ContextWindow(ctx context.Context, model string) (int, error)
+}
+
+// modelWindow extracts an advertised window from one loose /models entry.
+func modelWindow(entry map[string]interface{}) int {
+	for _, k := range []string{"context_length", "context_window", "max_context_window"} {
+		switch v := entry[k].(type) {
+		case float64:
+			if v > 0 {
+				return int(v)
+			}
+		case int:
+			if v > 0 {
+				return v
+			}
+		}
+	}
+	return 0
 }
 
 // Complete collects a full stream into text + tool calls (for tests/headless).

@@ -42,6 +42,16 @@ export default function App() {
   const [liveSteps, setLiveSteps] = useState<LiveStep[]>([]);
   const [stage, setStage] = useState('');
   const [summary, setSummary] = useState<TurnSummary | null>(null);
+  const [ctx, setCtx] = useState<{ used: number; max: number } | null>(null);
+  const [permReq, setPermReq] = useState<{ request_id: string; tool: string; target: string } | null>(null);
+  type QOption = { label: string; description?: string };
+  type QModel = { question: string; header?: string; options?: QOption[]; multiple?: boolean };
+  const [qReq, setQReq] = useState<{ request_id: string; questions: QModel[] } | null>(null);
+  // Per-question UI state: selected option labels + custom text.
+  const [qSel, setQSel] = useState<string[][]>([]);
+  const [qText, setQText] = useState<string[]>([]);
+  const [turnStart, setTurnStart] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
   const [effort, setEffort] = useState('');
 
@@ -85,17 +95,30 @@ export default function App() {
   homeModelRef.current = homeModel;
 
   useEffect(() => {
+    if (!working) return;
+    const t = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(t);
+  }, [working]);
+
+  useEffect(() => {
     refresh();
     refreshModels();
     return subscribe((e: DaemonEvent) => {
       const forSession = !e.session_id || !session?.id || e.session_id === session.id;
       if (e.type === 'turn.started' && forSession) {
         setWorking(true);
+        setTurnStart(Date.now());
+        setNow(Date.now());
         setLiveText('');
         setLiveThinking('');
         setLiveSteps([]);
         setStage('');
         setSummary(null);
+        setCtx(null);
+      }
+      if (e.type === 'turn.context' && forSession) {
+        const d = (e.data || {}) as { context_tokens?: number; max_tokens?: number };
+        if (d.context_tokens) setCtx({ used: d.context_tokens, max: d.max_tokens || 0 });
       }
       if ((e.type === 'turn.delta') && forSession) {
         const d = (e.data || {}) as { delta?: string; thinking?: string };
@@ -128,8 +151,9 @@ export default function App() {
       }
       if (e.type === 'turn.completed' && e.session_id && e.session_id === session?.id) {
         const sid = e.session_id;
-        const d = (e.data || {}) as { text?: string; model?: string; duration_ms?: number; output_tokens?: number };
-        setSummary({ model: d.model, duration_ms: d.duration_ms, output_tokens: d.output_tokens });
+        const d = (e.data || {}) as { text?: string; model?: string; duration_ms?: number; output_tokens?: number; input_tokens?: number; context_tokens?: number; max_tokens?: number };
+        setSummary({ model: d.model, duration_ms: d.duration_ms, output_tokens: d.output_tokens, input_tokens: d.input_tokens, context_tokens: d.context_tokens, max_tokens: d.max_tokens });
+        if (d.context_tokens) setCtx({ used: d.context_tokens, max: d.max_tokens || 0 });
         api.export(sid).then((ex) => {
           setTurns(
             (ex.transcript || [])
@@ -145,6 +169,7 @@ export default function App() {
         setLiveSteps([]);
         setStage('');
         setWorking(false);
+        setTurnStart(null);
       }
       if (e.type === 'turn.failed' && forSession) {
         setLiveText('');
@@ -153,6 +178,32 @@ export default function App() {
         setStage('');
         setSummary(null);
         setWorking(false);
+        setTurnStart(null);
+      }
+      if (e.type === 'permission.asked' && forSession) {
+        const d = (e.data || {}) as { request_id?: string; tool?: string; target?: string };
+        if (d.request_id) {
+          setPermReq({ request_id: d.request_id, tool: d.tool || 'tool', target: d.target || '' });
+          setStage(`waiting approval: ${d.tool || 'tool'} ${d.target || ''}`.trim());
+        }
+      }
+      if (e.type === 'permission.resolved' && forSession) {
+        const d = (e.data || {}) as { decision?: string };
+        setPermReq(null);
+        if (d.decision) setStage(`permission: ${d.decision}`);
+      }
+      if (e.type === 'question.asked' && forSession) {
+        const d = (e.data || {}) as { request_id?: string; questions?: QModel[] };
+        if (d.request_id && d.questions) {
+          setQReq({ request_id: d.request_id, questions: d.questions });
+          setQSel(d.questions.map(() => []));
+          setQText(d.questions.map(() => ''));
+          setStage('question: awaiting answer');
+        }
+      }
+      if (e.type === 'question.resolved' && forSession) {
+        setQReq(null);
+        setStage('question: answered');
       }
       if (e.type === 'session.created' || e.type === 'session.updated' || e.type === 'auth.connected') refresh();
     });
@@ -238,6 +289,10 @@ export default function App() {
     setSession(s);
     setTurns([]);
     setInput('');
+    setCtx(null);
+    setPermReq(null);
+    setTurnStart(null);
+    setWorking(false);
     if (s) {
       setWorkspace(s.workspace_dir);
       try {
@@ -269,11 +324,14 @@ export default function App() {
     const shown = text + atts.map((a) => `\n[file: ${a.name}]`).join('');
     setTurns((t) => [...t, { role: 'user', text: shown }]);
     setWorking(true);
+    setTurnStart(Date.now());
+    setNow(Date.now());
     try {
       const r = await api.prompt(s.id, text, atts, effort || undefined, delivery);
       if (r.status === 'queued') setStage(`queued #${r.position ?? ''}`.trim());
     } catch (err) {
       setWorking(false);
+      setTurnStart(null);
       alert(String(err));
     }
   };
@@ -291,7 +349,67 @@ export default function App() {
     setBase(url);
     setSession(null);
     setTurns([]);
+    setCtx(null);
+    setPermReq(null);
+    setQReq(null);
+    setTurnStart(null);
+    setWorking(false);
   };
+
+  const answerPerm = async (decision: string) => {
+    if (!permReq) return;
+    const id = permReq.request_id;
+    setPermReq(null);
+    try {
+      await api.answerPermission(id, decision);
+    } catch (err) {
+      alert(String(err));
+    }
+  };
+
+  const toggleQOpt = (qi: number, label: string) => {
+    if (!qReq) return;
+    const multi = qReq.questions[qi]?.multiple;
+    setQSel((prev) => {
+      const next = prev.map((a) => [...a]);
+      if (multi) {
+        next[qi] = next[qi].includes(label) ? next[qi].filter((l) => l !== label) : [...next[qi], label];
+      } else {
+        next[qi] = [label];
+      }
+      return next;
+    });
+  };
+
+  const submitQuestions = async () => {
+    if (!qReq) return;
+    const answers = qReq.questions.map((q, i) => {
+      const custom = (qText[i] || '').trim();
+      if (custom) return [custom];
+      if (qSel[i].length) return qSel[i];
+      return [(q.options || [])[0]?.label || ''];
+    });
+    const id = qReq.request_id;
+    setQReq(null);
+    try {
+      await api.answerQuestion(id, answers);
+    } catch (err) {
+      alert(String(err));
+    }
+  };
+
+  const dismissQuestions = async () => {
+    if (!qReq) return;
+    const id = qReq.request_id;
+    setQReq(null);
+    try {
+      await api.dismissQuestion(id);
+    } catch (err) {
+      alert(String(err));
+    }
+  };
+
+  const elapsedMs = turnStart != null ? Math.max(0, now - turnStart) : 0;
 
   return (
     <div className="flex h-screen flex-col bg-[#0a0a0b] text-sm text-zinc-200">
@@ -312,7 +430,88 @@ export default function App() {
         onToggleReview={() => setReviewOpen(!reviewOpen)}
         reviewOpen={reviewOpen}
         host={host}
+        ctx={ctx}
       />
+      {permReq && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="w-96 rounded-xl border border-white/10 bg-[#141416] p-4 shadow-xl">
+            <div className="mb-1 text-sm font-medium text-zinc-100">Approve tool call?</div>
+            <div className="mb-4 font-mono text-xs text-zinc-400">
+              {permReq.tool} {permReq.target.slice(0, 120)}
+            </div>
+            <div className="flex gap-2">
+              <button
+                className="flex-1 rounded bg-white/10 px-3 py-1.5 text-xs text-zinc-100 hover:bg-white/20"
+                onClick={() => void answerPerm('allow_once')}
+              >
+                Allow once
+              </button>
+              <button
+                className="flex-1 rounded bg-white/10 px-3 py-1.5 text-xs text-zinc-100 hover:bg-white/20"
+                onClick={() => void answerPerm('allow_session')}
+              >
+                Allow session
+              </button>
+              <button
+                className="flex-1 rounded border border-red-500/30 px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/10"
+                onClick={() => void answerPerm('deny')}
+              >
+                Deny
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {qReq && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="max-h-[80vh] w-[28rem] overflow-y-auto rounded-xl border border-white/10 bg-[#141416] p-4 shadow-xl">
+            <div className="mb-3 text-sm font-medium text-zinc-100">Answer the model&apos;s questions</div>
+            {(qReq.questions || []).map((q, qi) => (
+              <div key={qi} className="mb-3">
+                <div className="text-xs font-medium text-zinc-200">
+                  {q.header ? `${q.header}: ` : ''}{q.question}
+                  {q.multiple ? ' (pick several)' : ''}
+                </div>
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {(q.options || []).map((o) => {
+                    const on = (qSel[qi] || []).includes(o.label);
+                    return (
+                      <button
+                        key={o.label}
+                        title={o.description || ''}
+                        className={`rounded px-2 py-1 text-xs ${on ? 'bg-white/30 text-zinc-50' : 'bg-white/10 text-zinc-200 hover:bg-white/20'}`}
+                        onClick={() => void toggleQOpt(qi, o.label)}
+                      >
+                        {o.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <input
+                  className="mt-1 w-full rounded bg-white/5 px-2 py-1 text-xs text-zinc-100 outline-none"
+                  placeholder="...or type your own answer"
+                  value={qText[qi] || ''}
+                  onChange={(e) => setQText((prev) => prev.map((t, i) => (i === qi ? e.target.value : t)))}
+                />
+              </div>
+            ))}
+            <div className="flex gap-2">
+              <button
+                className="flex-1 rounded bg-white/10 px-3 py-1.5 text-xs text-zinc-100 hover:bg-white/20"
+                onClick={() => void submitQuestions()}
+              >
+                Submit answers
+              </button>
+              <button
+                className="flex-1 rounded border border-red-500/30 px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/10"
+                onClick={() => void dismissQuestions()}
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="flex min-h-0 flex-1">
         <main className="flex min-w-0 flex-1 flex-col">
           {!session ? (
@@ -365,6 +564,8 @@ export default function App() {
               liveSteps={liveSteps}
               stage={stage}
               summary={summary}
+              ctx={ctx}
+              elapsedMs={elapsedMs}
             />
           )}
         </main>

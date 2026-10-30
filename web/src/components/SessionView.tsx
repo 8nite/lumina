@@ -22,6 +22,21 @@ export interface TurnSummary {
   model?: string;
   duration_ms?: number;
   output_tokens?: number;
+  input_tokens?: number;
+  context_tokens?: number;
+  max_tokens?: number;
+}
+
+function fmtk(n: number): string {
+  if (!n || n <= 0) return '0';
+  if (n < 1000) return `${n}`;
+  return `${(n / 1000).toFixed(1)}k`;
+}
+
+export function formatCtx(ctx: { used: number; max: number } | null | undefined): string {
+  if (!ctx || !ctx.used) return '';
+  if (ctx.max > 0) return `ctx ~${fmtk(ctx.used)}/${fmtk(ctx.max)}`;
+  return `ctx ~${fmtk(ctx.used)}`;
 }
 
 export function formatSummary(s: TurnSummary | null): string {
@@ -34,6 +49,9 @@ export function formatSummary(s: TurnSummary | null): string {
   }
   if (s.output_tokens && s.output_tokens > 0 && s.duration_ms && s.duration_ms > 0) {
     parts.push(`${Math.round(s.output_tokens / (s.duration_ms / 1000))} tok/s`);
+  }
+  if (s.context_tokens && s.context_tokens > 0) {
+    parts.push(formatCtx({ used: s.context_tokens, max: s.max_tokens || 0 }));
   }
   return parts.join(' · ');
 }
@@ -60,12 +78,15 @@ export function SessionView(props: {
   onAttach: (f: FileList | null) => void;
   onRemoveAttachment: (i: number) => void;
   // Live run state: streamed text/thinking, tool steps, status stage,
-  // and the just-finished turn summary (opencode v2 turn summary).
+  // and the just-finished turn summary.
   liveText: string;
   liveThinking: string;
   liveSteps: LiveStep[];
   stage: string;
   summary: TurnSummary | null;
+  // Live context gauge + elapsed wall-clock for the in-flight turn.
+  ctx: { used: number; max: number } | null;
+  elapsedMs: number;
 }) {
   const [showSteps, setShowSteps] = useState(true);
   const summaryText = formatSummary(props.summary);
@@ -147,8 +168,17 @@ export function SessionView(props: {
           })}
           {props.working && (
             <div className="rounded-lg border border-white/10 bg-white/[0.02] px-4 py-3">
-              <div className="mb-1 text-xs text-zinc-500">
-                {props.stage || 'working…'}
+              <div className="mb-1 flex items-center gap-2 text-xs text-zinc-500">
+                <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
+                <span>
+                  {props.stage || 'working…'}
+                  {props.elapsedMs > 0 ? ` · ${Math.floor(props.elapsedMs / 1000)}s` : ''}
+                </span>
+                {formatCtx(props.ctx) && (
+                  <span className="rounded border border-white/10 px-1.5 py-0.5 font-mono text-[11px] text-zinc-400">
+                    {formatCtx(props.ctx)}
+                  </span>
+                )}
               </div>
               {props.liveSteps.length > 0 && (
                 <div className="mb-2 flex flex-wrap gap-1.5">

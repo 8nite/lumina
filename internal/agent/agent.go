@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -16,10 +18,10 @@ import (
 // Runner executes the turn loop: system prompt assembly, model call,
 // security-gated tool execution, checkpointing, and compaction.
 //
-// Progress + approval lifecycle mirrors sst/opencode (MIT): the runner
+// Progress + approval lifecycle: the runner
 // emits stage updates (thinking → tool → done) and pauses on
 // permission.asked until the UI answers allow_once / allow_session /
-// deny. Reimplemented here without copying opencode sources.
+// deny. Reimplemented here.
 type Runner struct {
 	store   *Store
 	router  *llm.Router
@@ -33,9 +35,14 @@ type Runner struct {
 	// "allow_always", or "deny". Nil preserves the legacy behavior
 	// (tool call fails with an ask error fed back to the model).
 	AskPermission func(ctx context.Context, sessionID, tool, target string) (string, error)
+	// AskQuestion blocks until the UI answers a question.asked request,
+	// returning one string list per question (multiple:true may yield
+	// several). Nil keeps headless behavior: the question tool answers
+	// with proceed-with-best-guess guidance instead of hanging the turn.
+	AskQuestion func(ctx context.Context, sessionID string, questions []tools.Question) ([][]string, error)
 	// OnDelta streams one model chunk (text and/or reasoning) for the
 	// session. The daemon publishes it as a turn.delta SSE event.
-	// Reasoning display follows opencode v2 (`session.thinking`): hidden
+	// Reasoning display follows `session.thinking`: hidden
 	// by default, toggleable per client. Nil disables streaming.
 	OnDelta func(sessionID, delta, thinking string)
 	// OnToolStart/OnToolDone bracket one executed tool call (approval
@@ -43,15 +50,20 @@ type Runner struct {
 	OnToolStart func(sessionID, tool, target string)
 	OnToolDone  func(sessionID, tool, target, preview string, isErr bool, durationMs int64)
 	// OnTurnEnd reports one finished turn (agent/model/duration/tokens,
-	// like opencode's turn summary). Tokens are zero when the provider
+	// turn-summary style). Tokens are zero when the provider
 	// does not report usage; tok/s is then omitted, never estimated.
 	OnTurnEnd func(sessionID string, s TurnStats)
+	// OnContext reports estimated context usage (prompt tokens vs window)
+	// at turn start and as the agentic loop grows the message list. The
+	// daemon publishes it as a turn.context SSE event; estimates use a
+	// ~4 chars/token heuristic (ponytail: no tokenizer dependency).
+	OnContext func(sessionID string, used, max int)
 
 	mu      sync.Mutex
 	granted map[string]bool // sessionID|tool-prefix → allow_session
 
-	// inboxMu guards steered/queued prompts for running turns (opencode
-	// steer/queue parity): steered text joins the active turn at the next
+	// inboxMu guards steered/queued prompts for running turns
+	// (steer/queue inbox): steered text joins the active turn at the next
 	// round boundary; queued turns chain after it completes.
 	inboxMu sync.Mutex
 	steered map[string][]string
@@ -66,6 +78,15 @@ func NewRunner(store *Store, router *llm.Router, reg *tools.Registry) *Runner {
 		}}
 	if reg != nil {
 		reg.Subagent = r.runSubagentText
+		// Lazy closure: AskQuestion may be assigned after NewRunner (the
+		// daemon wires it once serve starts). A nil hook surfaces as
+		// ErrQuestionUnwired so headless runs never block.
+		reg.AskQuestion = func(ctx context.Context, sc tools.SecCtx, qs []tools.Question) ([][]string, error) {
+			if r.AskQuestion == nil {
+				return nil, tools.ErrQuestionUnwired
+			}
+			return r.AskQuestion(ctx, sc.SessionID, qs)
+		}
 		reg.OnBackgroundDone = func(sessionID, taskID, kind, label string) {
 			r.progress(sessionID, "background done: "+taskID+" ("+kind+")")
 		}
@@ -73,31 +94,118 @@ func NewRunner(store *Store, router *llm.Router, reg *tools.Registry) *Runner {
 	return r
 }
 
-// toolGuidance adapts opencode's backend system prompt and its generated
-// per-tool guidance (MIT, anomalyco/opencode:
-// packages/core/src/session/runner/prompt/system.txt and
-// packages/core/src/session/system-prompt.ts) to Lumina's toolset.
-// Lines marked [lumina] cover Lumina-only tools and rules.
-const toolGuidance = `# Harness
+// toolGuidanceBase is the static backbone of the backend system prompt. It
+// mirrors opencode v2 `packages/core/src/session/runner/prompt/system.txt`.
+// Per-tool lines are appended by renderToolGuidance, mirroring opencode v2
+// `session/system-prompt.ts:render()` (shell/write/edit lines only when the
+// tool is in the model-visible snapshot) plus Lumina's builtin (# Basic
+// tools) and Lumina-only guidance. Lines marked [lumina] cover Lumina-only
+// tools and rules.
+const toolGuidanceBase = `# Harness
 - Responses are rendered as GitHub-flavored Markdown.
+- ` + "`<system-reminder>`" + ` blocks are harness instructions, not user-authored content. Read and follow them.
 - Prefer parallelizing independent tool calls (batch them in one block).
-- Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need.
-- Do not chain shell commands with separators like ` + "`echo \"====\";`" + ` or ` + "`printf '---'`" + `; the output becomes noisy in a way that makes the user's side of the conversation worse.
-- Use the write tool to create files or completely replace their content. Prefer using the edit tool for targeted changes.
-- Use the edit tool for targeted changes to existing text files. It replaces the exact text in ` + "`old_string`" + ` with ` + "`new_string`" + `, and the values must differ. By default, ` + "`old_string`" + ` must occur exactly once; include more surrounding context to make it unique.
 # Communication
 - Use clear file paths when referring to files.
 - Keep responses clear and concise, and avoid unnecessary technical jargon.
 # Working in codebases
 - Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.
-- Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.
-# Lumina tools [lumina]
-- Web: ` + "`websearch`" + ` needs a provider key (TAVILY_API_KEY, EXA_API_KEY, FIRECRAWL_API_KEY, PARALLEL_API_KEY, or TINYFISH_API_KEY); when it reports no provider available, use ` + "`webfetch`" + ` on a direct URL or public JSON API instead (no key needed).
-- Delegation: ` + "`subagent`" + ` launches a scoped child (general for multi-step work, explore for read-only research); pass {agent, description, prompt}. Children cannot launch subagents.
-- Background work: ` + "`bash`" + ` with background:true detaches long jobs (no timeout unless supplied); ` + "`subagent`" + ` with background:true detaches child sessions. Poll either with ` + "`task_output`" + ` until done — never leave a started task unpolled.
-- Memory: ` + "`kb_query`" + ` searches Markdown+graphify memory before grepping the codebase for project questions; ` + "`memory_write`" + ` saves durable facts to ./memory/<topic>.md.
-- Skills: load a ` + "`skill`" + ` playbook body by name before doing the task it describes.
-- After tool results arrive, continue the task; call more tools if needed, else reply substantively, gathering every result (web, subagent, background) into the final answer.`
+- Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.`
+
+// renderToolGuidance builds the generated per-tool section for one model
+// snapshot: only lines for tools the model can actually call.
+func renderToolGuidance(specs []llm.ToolSpec) string {
+	active := map[string]bool{}
+	for _, s := range specs {
+		active[strings.ToLower(s.Name)] = true
+	}
+	var sb strings.Builder
+	if active["bash"] || active["shell"] {
+		sb.WriteString("- Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need.\n")
+		sb.WriteString("- Do not chain shell commands with separators like `echo \"====\";` or `printf '---'`; the output becomes noisy in a way that makes the user's side of the conversation worse.\n")
+	}
+	if active["write"] {
+		sb.WriteString("- Use the write tool to create files or completely replace their content. Prefer using the edit tool for targeted changes.\n")
+	}
+	if active["patch"] {
+		sb.WriteString("- Use the patch tool for multi-file or diff-style edits expressed as *** Begin Patch *** (Add/Update/Delete File); prefer edit for single targeted changes.\n")
+	}
+	if active["edit"] {
+		sb.WriteString("- Use the edit tool for targeted changes to existing text files. It replaces the exact text in `old_string` with `new_string`, and the values must differ. By default, `old_string` must occur exactly once; include more surrounding context to make it unique, or set `replaceAll` to replace every occurrence.\n")
+	}
+	if active["read"] || active["grep"] || active["glob"] {
+		sb.WriteString("# Basic tools\n")
+		if active["read"] {
+			sb.WriteString("- Read a file or directory with the read tool; text lines come back as 1-based `line: content` (line numbers are for reference only, never include them in edits). Use offset/limit for large files; prefer one larger read over many small slices, and use grep to find content in large files.\n")
+		}
+		if active["grep"] || active["glob"] {
+			sb.WriteString("- Search file contents with grep (regex or literal, narrow with path/include) and find files with glob (e.g. `**/*.ts`, `src/**/*.tsx`).\n")
+		}
+	}
+	if active["webfetch"] || active["websearch"] {
+		sb.WriteString("- Fetch one HTTP(S) URL with webfetch (markdown default, text/html available); it is read-only and truncates past the cap. Use it for direct URLs or public JSON APIs.")
+		if active["websearch"] {
+			sb.WriteString(" websearch needs a provider key; when it reports no provider available, fall back to webfetch.")
+		}
+		sb.WriteString("\n")
+	}
+	lumina := false
+	if active["websearch"] {
+		sb.WriteString("# Lumina tools [lumina]\n")
+		lumina = true
+		sb.WriteString("- Web: `websearch` needs a provider key (TAVILY_API_KEY, EXA_API_KEY, FIRECRAWL_API_KEY, PARALLEL_API_KEY, or TINYFISH_API_KEY); when it reports no provider available, use `webfetch` on a direct URL or public JSON API instead (no key needed).\n")
+	}
+	if active["subagent"] {
+		if !lumina {
+			sb.WriteString("# Lumina tools [lumina]\n")
+			lumina = true
+		}
+		sb.WriteString("- Delegation: `subagent` launches a scoped child (general for multi-step work, explore for read-only research); pass {agent, description, prompt} plus optional model override. Children cannot launch subagents.\n")
+	}
+	if active["bash"] && active["subagent"] {
+		if !lumina {
+			sb.WriteString("# Lumina tools [lumina]\n")
+			lumina = true
+		}
+		sb.WriteString("- Background work: `bash` with background:true detaches long jobs (no timeout unless supplied); `subagent` with background:true detaches child sessions. Poll either with `task_output` until done — never leave a started task unpolled.\n")
+	}
+	if active["kb_query"] || active["memory_write"] {
+		if !lumina {
+			sb.WriteString("# Lumina tools [lumina]\n")
+			lumina = true
+		}
+		sb.WriteString("- Memory: `kb_query` searches Markdown+graphify memory before grepping the codebase for project questions; `memory_write` saves durable facts to ./memory/<topic>.md.\n")
+	}
+	if active["skill"] {
+		if !lumina {
+			sb.WriteString("# Lumina tools [lumina]\n")
+			lumina = true
+		}
+		sb.WriteString("- Skills: load a `skill` playbook body by name before doing the task it describes.\n")
+	}
+	sb.WriteString("- After tool results arrive, continue the task; call more tools if needed, else reply substantively, gathering every result (web, subagent, background) into the final answer.")
+	return sb.String()
+}
+
+// envBlock renders the opencode-parity environment block (builtins.ts):
+// today's date plus working directory, git presence, platform, and tmp
+// preference. Pure string surgery — zero LLM tokens.
+func envBlock(workspaceDir string) string {
+	isGit := "no"
+	if st, err := os.Stat(workspaceDir + "/.git"); err == nil && st != nil {
+		isGit = "yes"
+	} else if workspaceDir == "" {
+		isGit = "unknown"
+	}
+	return "Today's date: " + time.Now().Format("Mon Jan 02 2006") + "\n" +
+		"Here is some useful information about the environment you are running in:\n" +
+		"<env>\n" +
+		"  Working directory: " + workspaceDir + "\n" +
+		"  Is directory a git repo: " + isGit + "\n" +
+		"  Platform: " + runtime.GOOS + "\n" +
+		"  Prefer " + os.TempDir() + " over generic system temporary directories such as /tmp; it is pre-created and approved for external access.\n" +
+		"</env>"
+}
 
 // Steer appends text to the running turn's inbox. The loop picks it up
 // at the next round boundary; leftovers chain as a queued turn so steering
@@ -188,22 +296,39 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 		specs = withoutTool(specs, "websearch")
 	}
 	turns, _ := r.store.ListTurns(sessionID)
+	// Provider-advertised window for the gauge AND the compaction budget
+	// (0 = unknown, shown as used-only with the legacy message ceiling).
+	// Looked up once per turn; providers cache, and the cap keeps a slow
+	// gateway from stalling the turn over metadata.
+	modelName := sess.Model
+	if modelName == "" && r.router != nil {
+		modelName = r.router.ModelFor("executor", sess.Agent)
+	}
+	maxTokens := 0
+	if r.router != nil && modelName != "" {
+		lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		maxTokens = r.router.ContextWindow(lctx, modelName)
+		cancel()
+	}
 	msgs := []llm.Message{{
 		Role: "system",
 		Content: bundle.SystemPrompt + "\n\n# Session\n" +
 			"- workspace_dir: " + sess.WorkspaceDir + "\n" +
 			"- agent: " + sess.Agent + " (plan=read-only except plan.md/.lumina/plans; build=full)\n" +
 			"- permission_mode: " + sess.PermissionMode + "\n\n" +
-			toolGuidance + "\n",
+			envBlock(sess.WorkspaceDir) + "\n\n" +
+			toolGuidanceBase + "\n" + renderToolGuidance(specs) + "\n",
 	}}
 	for _, t := range turns {
-		if len(msgs) > 40 {
-			break // compaction window; Compact() shrinks older turns offline
-		}
 		if t.Role == "user" || t.Role == "assistant" {
 			msgs = append(msgs, llm.Message{Role: t.Role, Content: t.Text})
 		}
 	}
+	// Provider-aware compaction: keep the newest turns under 80% of the
+	// advertised window (or the newest 40 messages when unknown), so a long
+	// session degrades to a smaller window instead of failing — or silently
+	// dropping the current prompt, as the old oldest-first cap did.
+	msgs = compactPrompt(msgs, specs, maxTokens)
 	r.progress(sessionID, "thinking…")
 	stream := r.deltaFunc(sessionID)
 	turnStart := time.Now()
@@ -213,6 +338,8 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 			inTok, outTok = u.Input, u.Output
 		}
 	}
+	ctxUsed := EstimateContextTokens(msgs, specs)
+	r.emitContext(sessionID, ctxUsed, maxTokens)
 	finishTurn := func() {
 		if r.OnTurnEnd != nil {
 			model := sess.Model
@@ -222,8 +349,17 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 			r.OnTurnEnd(sessionID, TurnStats{
 				Model: model, DurationMs: time.Since(turnStart).Milliseconds(),
 				InputTokens: inTok, OutputTokens: outTok,
+				ContextTokens: ctxUsed, MaxTokens: maxTokens,
 			})
 		}
+	}
+	// Pre-flight: when the provider advertises a window and even the
+	// compacted prompt cannot fit (e.g. a 19k system prompt vs a 12k
+	// model), fail fast instead of sending a doomed request.
+	if maxTokens > 0 && ctxUsed > maxTokens {
+		err := fmt.Errorf("model %q advertises a ~%d-token window but this turn needs ~%d tokens: /compact history or /model to a larger window", modelName, maxTokens, ctxUsed)
+		finishTurn()
+		return "", err
 	}
 	text2, calls, usage, err := completeStream(ctx, mustProvider(r, sess), llm.Request{
 		Model: sess.Model, Messages: msgs, Tools: specs,
@@ -265,7 +401,7 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 		}
 		userMsg := "Tool results:\n" + feedback.String() + "Continue the task; call more tools if needed, else give the final answer."
 		if s := r.takeSteered(sessionID); s != "" {
-			// Steered input joins the active turn (opencode steer parity).
+			// Steered input joins the active turn.
 			_, _ = r.store.AddTurn(sessionID, "", "user", s)
 			r.progress(sessionID, "steered ✓")
 			userMsg += "\n\nSteered input (answer this too):\n" + s
@@ -274,6 +410,12 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 			llm.Message{Role: "assistant", Content: text2},
 			llm.Message{Role: "user", Content: userMsg},
 		)
+		// Re-compact every round: tool feedback can balloon past the window
+		// mid-loop. Newest-first eviction keeps the latest exchange alive
+		// (guard below always preserves system + the last round).
+		msgs = compactPrompt(msgs, specs, maxTokens)
+		ctxUsed = EstimateContextTokens(msgs, specs)
+		r.emitContext(sessionID, ctxUsed, maxTokens)
 		text2, calls, usage, err = completeStream(ctx, mustProvider(r, sess), llm.Request{
 			Model: sess.Model, Messages: msgs, Tools: specs,
 			Images: in.Images, ReasoningEffort: in.Effort,
@@ -284,7 +426,7 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 			return "", err
 		}
 	}
-	// opencode `steps` parity: on the final step the tools are removed and
+	// Step-cap: on the final step the tools are removed and
 	// the model is asked to summarize in text, so a turn that hits the
 	// round cap still ends with a substantive reply gathering all results.
 	if len(calls) > 0 {
@@ -319,6 +461,14 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 func (r *Runner) progress(sessionID, stage string) {
 	if r.OnProgress != nil && sessionID != "" && stage != "" {
 		r.OnProgress(sessionID, stage)
+	}
+}
+
+// emitContext publishes the estimated context gauge (used vs window;
+// max 0 = provider does not advertise one, shown as used-only).
+func (r *Runner) emitContext(sessionID string, used, max int) {
+	if r.OnContext != nil && sessionID != "" && used > 0 {
+		r.OnContext(sessionID, used, max)
 	}
 }
 
@@ -454,13 +604,38 @@ func approvalTarget(name string, args map[string]interface{}) string {
 	return name
 }
 
+// EstimateContextTokens approximates prompt tokens as ~4 chars/token over
+// roles + contents + thinking, plus a per-tool schema allowance.
+// ponytail: deliberately dependency-free; providers that report real
+// usage still win for in/out, this only feeds the context gauge.
+func EstimateContextTokens(msgs []llm.Message, specs []llm.ToolSpec) int {
+	total := len(specs) * 220
+	for _, m := range msgs {
+		total += len(m.Role) + len(m.Content) + len(m.Thinking)
+	}
+	return total/4 + 1
+}
+
+// FormatTokens renders 12345 as "12.3k".
+func FormatTokens(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return fmt.Sprintf("%.1fk", float64(n)/1000)
+}
+
 // TurnStats summarizes a finished turn for footers and turn summaries
-// (opencode v2: agent, model, duration; tok/s when usage is reported).
+// (agent, model, duration; tok/s when usage is reported).
 type TurnStats struct {
 	Model        string
 	DurationMs   int64
 	InputTokens  int
 	OutputTokens int
+	// ContextTokens is the estimated prompt size (chars/4 heuristic) and
+	// MaxTokens the provider-advertised window (0 = provider does not
+	// report one; the gauge then shows used-only).
+	ContextTokens int
+	MaxTokens     int
 }
 
 // TokPerSec returns output tokens/sec, or 0 when usage is unknown.
@@ -471,8 +646,9 @@ func (s TurnStats) TokPerSec() float64 {
 	return float64(s.OutputTokens) / (float64(s.DurationMs) / 1000)
 }
 
-// Summary renders the opencode-style turn footer: model · duration · tok/s,
-// omitting whatever is unknown.
+// Summary renders the turn footer: model · duration · tok/s,
+// omitting whatever is unknown. Context usage appends as ctx ~used/max,
+// or ctx ~used when the provider advertises no window.
 func (s TurnStats) Summary() string {
 	var parts []string
 	if s.Model != "" {
@@ -484,10 +660,17 @@ func (s TurnStats) Summary() string {
 	if tps := s.TokPerSec(); tps > 0 {
 		parts = append(parts, fmt.Sprintf("%.0f tok/s", tps))
 	}
+	if s.ContextTokens > 0 {
+		if s.MaxTokens > 0 {
+			parts = append(parts, fmt.Sprintf("ctx ~%s/%s", FormatTokens(s.ContextTokens), FormatTokens(s.MaxTokens)))
+		} else {
+			parts = append(parts, fmt.Sprintf("ctx ~%s", FormatTokens(s.ContextTokens)))
+		}
+	}
 	return strings.Join(parts, " · ")
 }
 
-// FormatDuration renders milliseconds like opencode durations.
+// FormatDuration renders milliseconds as short durations.
 func FormatDuration(ms int64) string {
 	if ms < 1000 {
 		return fmt.Sprintf("%dms", ms)
@@ -574,21 +757,23 @@ func toolSpecs() []llm.ToolSpec {
 		return map[string]interface{}{"type": "object", "properties": props, "required": req}
 	}
 	return []llm.ToolSpec{
-		{Name: "read", Description: "Read a workspace file (offset/limit lines)",
+		{Name: "read", Description: "Read a file or directory. Text lines return as 1-based line: content (line numbers for reference only, never include them in edits). Use offset/limit for large files; prefer one larger read over many small slices, and use grep to find content in large files.",
 			Schema: obj(map[string]interface{}{"path": str, "offset": map[string]interface{}{"type": "integer"}, "limit": map[string]interface{}{"type": "integer"}}, "path")},
-		{Name: "edit", Description: "Replace exact old_string with new_string in a file",
-			Schema: obj(map[string]interface{}{"path": str, "old_string": str, "new_string": str}, "path", "old_string", "new_string")},
-		{Name: "write", Description: "Create or overwrite a file with content",
+		{Name: "edit", Description: "Edit a file by finding and replacing exact text. Preserves indentation; omit read line-number prefixes in old_string/new_string. old_string must be unique unless replaceAll is true.",
+			Schema: obj(map[string]interface{}{"path": str, "old_string": str, "new_string": str, "replaceAll": boolT}, "path", "old_string", "new_string")},
+		{Name: "write", Description: "Write a file to the filesystem, overwriting if one exists. Missing parent directories are created automatically. Use this to create new files or overwrite existing files. For partial changes, use edit instead.",
 			Schema: obj(map[string]interface{}{"path": str, "content": str}, "path", "content")},
-		{Name: "bash", Description: "Run a shell command in the workspace (background:true detaches; poll with task_output)",
-			Schema: obj(map[string]interface{}{"command": str, "background": boolT, "timeout": map[string]interface{}{"type": "integer"}}, "command")},
-		{Name: "grep", Description: "Search file contents (skips credential files)",
-			Schema: obj(map[string]interface{}{"pattern": str, "path": str}, "pattern")},
-		{Name: "glob", Description: "Find files by glob pattern",
-			Schema: obj(map[string]interface{}{"pattern": str}, "pattern")},
+		{Name: "patch", Description: "Apply a *** Begin Patch *** multi-file diff (*** Add/Update/Delete File *** with @@ hunks). Use for multi-file or diff-style edits; prefer edit for single targeted changes.",
+			Schema: obj(map[string]interface{}{"patchText": str}, "patchText")},
+		{Name: "bash", Description: "Execute a shell command and return its output. Prefer dedicated tools over shell commands when possible. Set workdir to run in a subdirectory; background:true runs detached; poll with task_output.",
+			Schema: obj(map[string]interface{}{"command": str, "workdir": str, "background": boolT, "timeout": map[string]interface{}{"type": "integer"}}, "command")},
+		{Name: "grep", Description: "Search file contents using regex or literal text. Use it to locate code, symbols, or text; narrow with path or include. Returns file paths, line numbers, and previews. Skips credential files.",
+			Schema: obj(map[string]interface{}{"pattern": str, "path": str, "include": str, "literal": boolT, "caseSensitive": boolT, "limit": map[string]interface{}{"type": "integer"}}, "pattern")},
+		{Name: "glob", Description: "Search file paths using a glob pattern (examples: \"**/*.ts\", \"src/**/*.tsx\").",
+			Schema: obj(map[string]interface{}{"pattern": str, "path": str, "limit": map[string]interface{}{"type": "integer"}}, "pattern")},
 		{Name: "lsp", Description: "Code intelligence: symbols/refs (grep-backed)",
 			Schema: obj(map[string]interface{}{"pattern": str, "path": str}, "pattern")},
-		{Name: "skill", Description: "Load a SKILL.md playbook body by name",
+		{Name: "skill", Description: "Load a specialized skill's instructions into the conversation when the task matches its description.",
 			Schema: obj(map[string]interface{}{"name": str}, "name")},
 		{Name: "kb_query", Description: "Query Markdown+graphify memory",
 			Schema: obj(map[string]interface{}{"query": str, "budget": map[string]interface{}{"type": "integer"}}, "query")},
@@ -596,12 +781,16 @@ func toolSpecs() []llm.ToolSpec {
 			Schema: obj(map[string]interface{}{"topic": str, "content": str}, "topic", "content")},
 		{Name: "mcp", Description: "Call a local MCP server tool (see .lumina/mcp.json)",
 			Schema: obj(map[string]interface{}{"server": str, "tool": str}, "server", "tool")},
-		{Name: "webfetch", Description: "Fetch one HTTP(S) URL as markdown/text (cap 100KB)",
+		{Name: "webfetch", Description: "Fetch an HTTP(S) URL as markdown (default), text, or HTML. Read-only; large results truncate past the cap. Use for direct URLs or public JSON APIs.",
 			Schema: obj(map[string]interface{}{"url": str, "format": str}, "url")},
-		{Name: "websearch", Description: "Search the web for current info (needs a provider key)",
+		{Name: "websearch", Description: fmt.Sprintf("Search the web for current info beyond knowledge cutoff (needs a provider key). The current year is %d. Use this year when searching for recent information.", time.Now().Year()),
 			Schema: obj(map[string]interface{}{"query": str}, "query")},
-		{Name: "subagent", Description: "Launch a scoped subagent child (general/explore/custom); background:true detaches",
-			Schema: obj(map[string]interface{}{"agent": str, "description": str, "prompt": str, "background": boolT}, "agent", "prompt")},
+		{Name: "question", Description: "Ask the user questions during execution to gather preferences, clarify ambiguity, or decide direction. Answers return inline; continue with them in mind.",
+			Schema: obj(map[string]interface{}{"questions": map[string]interface{}{"type": "array"}}, "questions")},
+		{Name: "todowrite", Description: "Track task progress as a todo list. Send the full updated list on each call.",
+			Schema: obj(map[string]interface{}{"todos": map[string]interface{}{"type": "array"}}, "todos")},
+		{Name: "subagent", Description: "Launch a scoped subagent child (general/explore/custom); optional model override (provider/model). background:true detaches",
+			Schema: obj(map[string]interface{}{"agent": str, "description": str, "prompt": str, "model": str, "background": boolT}, "agent", "prompt")},
 		{Name: "task_output", Description: "Poll a background bash/subagent task by ID",
 			Schema: obj(map[string]interface{}{"task_id": str}, "task_id")},
 	}
@@ -641,8 +830,9 @@ func (r *Runner) RunSubagent(ctx context.Context, sessionID, task string, allowe
 // configured subagent (general/explore/custom, mode subagent|all), runs a
 // full agentic tool loop with its restricted tool set, and returns the final
 // text. The child inherits the parent's workspace, model default, and
-// permission mode; nesting is capped at depth 1 (opencode parity).
-func (r *Runner) runSubagentText(ctx context.Context, sc tools.SecCtx, agentName, description, prompt string) (string, error) {
+// permission mode; nesting is capped by the registry's max depth. An explicit
+// model override (provider/model) wins over the agent default.
+func (r *Runner) runSubagentText(ctx context.Context, sc tools.SecCtx, req tools.SubagentRequest) (string, error) {
 	if r.router == nil {
 		return "", fmt.Errorf("subagent: no model backend configured")
 	}
@@ -650,14 +840,17 @@ func (r *Runner) runSubagentText(ctx context.Context, sc tools.SecCtx, agentName
 		return "", fmt.Errorf("subagent: no tool registry")
 	}
 	bundle := r.rulesFn(sc.WorkspaceDir)
-	def, ok := findAgent(bundle, agentName)
+	def, ok := findAgent(bundle, req.Agent)
 	if !ok {
-		return "", fmt.Errorf("subagent: unknown agent %q (available: %s)", agentName, agentNames(bundle))
+		return "", fmt.Errorf("subagent: unknown agent %q (available: %s)", req.Agent, agentNames(bundle))
 	}
 	if mode := strings.ToLower(def.Mode); mode != "subagent" && mode != "all" {
-		return "", fmt.Errorf("subagent: agent %q is primary-only (mode=%q)", agentName, def.Mode)
+		return "", fmt.Errorf("subagent: agent %q is primary-only (mode=%q)", req.Agent, def.Mode)
 	}
-	model := def.Model
+	model := req.Model
+	if model == "" {
+		model = def.Model
+	}
 	if model == "" {
 		if sess, err := r.store.GetSession(sc.SessionID); err == nil {
 			model = sess.Model
@@ -667,13 +860,17 @@ func (r *Runner) runSubagentText(ctx context.Context, sc tools.SecCtx, agentName
 		} else {
 			model = r.router.ModelFor("executor", "build")
 		}
+	} else if prov, _ := r.router.ProviderFor(model); prov == nil {
+		return "", fmt.Errorf("subagent: no provider for model %q (use provider/model)", model)
 	}
 	// Guard the child context window: a model-drafted delegation prompt can
 	// balloon (pasted transcripts, dumps). Truncate with a note instead of
 	// letting one call blow the turn's token budget.
+	prompt := req.Prompt
 	if len(prompt) > 6000 {
 		prompt = prompt[:6000] + "\n…[delegation prompt truncated at 6000 chars]"
 	}
+	description := req.Description
 	if len(description) > 2000 {
 		description = description[:2000] + "…[truncated]"
 	}
@@ -683,7 +880,7 @@ func (r *Runner) runSubagentText(ctx context.Context, sc tools.SecCtx, agentName
 		system += "\n\nTask context: " + description
 	}
 	system += "\n\nScope: use only the provided tools; you cannot launch subagents. When done, summarize findings with file references."
-	system += "\n\n" + toolGuidance
+	system += "\n\n" + toolGuidanceBase + "\n" + renderToolGuidance(specs)
 	r.progress(sc.SessionID, "subagent: "+def.Name)
 	childSc := sc
 	childSc.SubagentDepth = sc.SubagentDepth + 1
@@ -727,7 +924,7 @@ func agentNames(bundle *rules.Bundle) string {
 	return strings.Join(out, ", ")
 }
 
-// subagentSpecs restricts the child tool envelope (opencode parity):
+// subagentSpecs restricts the child tool envelope:
 // explore is read-only research incl. web; general gets everything but
 // subagent delegation; custom agents default to the general envelope.
 func subagentSpecs(agentName string) []llm.ToolSpec {
@@ -816,6 +1013,8 @@ func (r *Runner) runChildLoop(ctx context.Context, sc tools.SecCtx, model, syste
 
 // Compact summarizes stale tool-output turns, keeping rules, diffs, and
 // memory pointers intact. Pure string surgery — zero LLM tokens.
+// (Offline/persisted-history API; the live per-prompt budget is
+// compactPrompt below, which RunPrompt applies every turn and every round.)
 func Compact(turns []*Turn, keepRecent int) []*Turn {
 	if len(turns) <= keepRecent {
 		return turns
@@ -833,4 +1032,28 @@ func Compact(turns []*Turn, keepRecent int) []*Turn {
 		kept = append(kept, t)
 	}
 	return kept
+}
+
+// compactPrompt bounds one prompt's history to the model's window: the
+// newest turns under 80% of the provider-advertised window, or the newest
+// 40 messages when the provider reports none (legacy ceiling). The system
+// prompt (msgs[0]) is never dropped; callers fail fast when even it exceeds
+// the window (see the RunPrompt pre-flight). Newest-first eviction is
+// deliberate: the previous oldest-first cap silently dropped the current
+// user prompt once history passed 40 messages.
+func compactPrompt(msgs []llm.Message, specs []llm.ToolSpec, window int) []llm.Message {
+	if len(msgs) <= 1 {
+		return msgs
+	}
+	if window > 0 {
+		budget := window * 8 / 10
+		for len(msgs) > 3 && EstimateContextTokens(msgs, specs) > budget {
+			msgs = append(msgs[:1], msgs[2:]...) // drop oldest turn
+		}
+		return msgs
+	}
+	if len(msgs) > 41 {
+		return append(msgs[:1], msgs[len(msgs)-40:]...)
+	}
+	return msgs
 }

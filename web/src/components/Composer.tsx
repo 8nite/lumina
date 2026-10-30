@@ -6,7 +6,7 @@ const perms = ['ask', 'auto-edit', 'auto-approve', 'bypass'];
 
 // Centered composer card: attachments, textarea, agent / model / effort /
 // permission controls. Enter steers the active turn; Ctrl+X then Enter
-// queues for later (opencode parity); Esc cancels an armed queue.
+// queues for later; Esc cancels an armed queue.
 export function Composer(props: {
   value: string;
   onChange: (v: string) => void;

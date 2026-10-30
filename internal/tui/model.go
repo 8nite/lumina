@@ -32,6 +32,32 @@ type PermModal struct {
 	Cursor    int // 0=Allow Once, 1=Allow Session, 2=Deny
 }
 
+// QuestionModal is an inline question card: one model question at a time,
+// answered by typing free text or a comma-separated option number list
+// ("1,3"), enter to submit, esc to dismiss the whole prompt.
+type QuestionModal struct {
+	RequestID string
+	Questions []QuestionItem
+	Idx       int // current question
+	Cursor    int // highlighted option
+	Typed     string
+	Answers   [][]string
+}
+
+// QuestionItem mirrors tools.Question over the SSE boundary.
+type QuestionItem struct {
+	Question string
+	Header   string
+	Options  []QuestionOption
+	Multiple bool
+}
+
+// QuestionOption mirrors tools.QuestionOption over the SSE boundary.
+type QuestionOption struct {
+	Label       string
+	Description string
+}
+
 // EventMsg carries one daemon SSE event into Update.
 type EventMsg struct{ Event sdk.Event }
 
@@ -203,6 +229,7 @@ type Model struct {
 	Cursor   int // rune index into Input (not byte index)
 
 	Modal    *PermModal
+	QModal   *QuestionModal
 	Sessions []*sdk.Session // /resume picker entries
 	// Model picker (/model) entries + mode flag. Reuses PickIdx.
 	ModelOptions []string
@@ -230,14 +257,20 @@ type Model struct {
 	// plain until turn.completed replaces it with the final markdown.
 	Pending         string
 	PendingThinking string
-	// ShowThinking mirrors opencode v2 `session.thinking` (default hide):
+	// ShowThinking mirrors `session.thinking` (default hide):
 	// reasoning streams but only renders when enabled (/thinking).
 	ShowThinking bool
 	// Working tracks an in-flight turn (send/turn.started → completed/failed).
-	// Enter steers it, Ctrl+X then Enter queues for later (opencode parity).
+	// Enter steers it, Ctrl+X then Enter queues for later.
 	Working    bool
 	QueueArmed bool
-	quitting   bool
+	// CtxUsed/CtxMax is the live context gauge (estimated prompt tokens vs
+	// window, from turn.context SSE); TurnStart feeds the elapsed working
+	// indicator.
+	CtxUsed   int
+	CtxMax    int
+	TurnStart time.Time
+	quitting  bool
 }
 
 // mdCache holds a single shared glamour renderer. Recreated only when the
@@ -369,7 +402,7 @@ func (m *Model) pushSystem(s string) {
 	m.appendLine("_" + s + "_")
 }
 
-// sendDelivery picks steer vs queue (opencode parity): Enter steers the
+// sendDelivery picks steer vs queue: Enter steers the
 // active turn, Ctrl+X then Enter queues for later.
 func (m *Model) sendDelivery() string {
 	if m.Working && m.QueueArmed {
@@ -885,6 +918,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Question card captures all keys while open.
+	if m.QModal != nil {
+		return m.updateQuestionKey(msg)
+	}
 	// Modal captures all keys while open.
 	if m.Modal != nil {
 		switch msg.String() {
@@ -1107,11 +1144,147 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.CompleteOptions = nil
 		m.CompleteIdx = 0
 	default:
-		if msg.Type == tea.KeyRunes {
+		// Printable runes batch as KeyRunes, except a bare space which
+		// arrives as KeySpace (bubbletea maps it to " " for compat).
+		if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
 			m.insertRunes(msg.String())
 		}
 	}
 	return m, m.computeCompletions()
+}
+
+// Question-card key handling (updateQuestionKey and helpers).
+func (m Model) updateQuestionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	qm := m.QModal
+	if qm == nil || qm.Idx >= len(qm.Questions) {
+		m.QModal = nil
+		return m, nil
+	}
+	q := qm.Questions[qm.Idx]
+	switch msg.String() {
+	case "up", "k":
+		if qm.Cursor > 0 {
+			qm.Cursor--
+		}
+	case "down", "j":
+		if qm.Cursor+1 < len(q.Options) {
+			qm.Cursor++
+		}
+	case "backspace":
+		if qm.Typed != "" {
+			qm.Typed = qm.Typed[:len(qm.Typed)-1]
+		}
+	case "enter":
+		ans := parseQuestionAnswer(q, qm.Typed, qm.Cursor)
+		qm.Answers = append(qm.Answers, ans)
+		qm.Idx++
+		qm.Cursor = 0
+		qm.Typed = ""
+		if qm.Idx >= len(qm.Questions) {
+			return m.submitQuestion()
+		}
+	case "esc":
+		m.QModal = nil
+		m.Status = "question: dismissed"
+		if m.Client != nil && qm.RequestID != "" {
+			c, id := m.Client, qm.RequestID
+			return m, func() tea.Msg {
+				if err := c.DismissQuestion(bg(), id); err != nil {
+					return ErrMsg{err}
+				}
+				return nil
+			}
+		}
+	default:
+		if s := msg.String(); len(s) == 1 {
+			qm.Typed += s
+		}
+	}
+	return m, nil
+}
+
+// submitQuestion posts the collected answers and closes the card.
+func (m Model) submitQuestion() (tea.Model, tea.Cmd) {
+	qm := m.QModal
+	m.QModal = nil
+	m.Status = "question: answered"
+	if m.Client == nil || qm == nil || qm.RequestID == "" {
+		return m, nil
+	}
+	c, id, answers := m.Client, qm.RequestID, qm.Answers
+	return m, func() tea.Msg {
+		if err := c.AnswerQuestion(bg(), id, answers); err != nil {
+			return ErrMsg{err}
+		}
+		return nil
+	}
+}
+
+// decodeQuestionItem parses one daemon question payload (question/header/
+// options/multiple) into modal state; unknown shapes degrade to plain text.
+func decodeQuestionItem(v interface{}) QuestionItem {
+	m, _ := v.(map[string]interface{})
+	if m == nil {
+		return QuestionItem{Question: ""}
+	}
+	str := func(key string) string {
+		s, _ := m[key].(string)
+		return s
+	}
+	qi := QuestionItem{Question: str("question"), Header: str("header")}
+	if b, _ := m["multiple"].(bool); b {
+		qi.Multiple = true
+	}
+	if opts, _ := m["options"].([]interface{}); opts != nil {
+		for _, o := range opts {
+			om, _ := o.(map[string]interface{})
+			if om == nil {
+				continue
+			}
+			label, _ := om["label"].(string)
+			desc, _ := om["description"].(string)
+			if label != "" {
+				qi.Options = append(qi.Options, QuestionOption{Label: label, Description: desc})
+			}
+		}
+	}
+	return qi
+}
+
+// parseQuestionAnswer maps typed input to option labels: a comma-separated
+// number list ("1,3") selects those options, anything else is a free-text
+// answer, and empty input takes the highlighted option.
+func parseQuestionAnswer(q QuestionItem, typed string, cursor int) []string {
+	if t := strings.TrimSpace(typed); t != "" {
+		var picks []string
+		numbered := true
+		for _, part := range strings.Split(t, ",") {
+			n := 0
+			for _, r := range strings.TrimSpace(part) {
+				if r < '0' || r > '9' {
+					numbered = false
+					break
+				}
+				n = n*10 + int(r-'0')
+			}
+			if !numbered || n < 1 || n > len(q.Options) {
+				numbered = false
+				break
+			}
+			picks = append(picks, q.Options[n-1].Label)
+		}
+		if numbered && len(picks) > 0 {
+			if !q.Multiple {
+				return picks[:1]
+			}
+			return picks
+		}
+		return []string{t}
+	}
+	if cursor >= 0 && cursor < len(q.Options) {
+		return []string{q.Options[cursor].Label}
+	}
+	return []string{""}
 }
 
 func (m Model) pushAgentCmd() tea.Cmd {
@@ -1149,13 +1322,14 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 		switch e.Type {
 		case "turn.completed", "turn.failed", "turn.started", "turn.progress",
 			"turn.delta", "turn.tool",
-			"permission.asked", "permission":
+			"permission.asked", "permission",
+			"question.asked":
 			return m, nil
 		}
 	}
 	switch e.Type {
 	case "turn.started":
-		// opencode-style pending state (reimplemented): show what the
+		// Pending state: show what the
 		// daemon accepted so long runs never look frozen.
 		var d map[string]string
 		preview := "working…"
@@ -1168,6 +1342,7 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 		}
 		m.Status = preview
 		m.Working = true
+		m.TurnStart = time.Now()
 	case "turn.progress":
 		var d map[string]string
 		if err := jsonUnmarshal(e.Data, &d); err == nil {
@@ -1185,13 +1360,23 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 			}
 			m.Status = "working…"
 		}
+	case "turn.context":
+		var d map[string]interface{}
+		if err := jsonUnmarshal(e.Data, &d); err == nil {
+			m.CtxUsed = numField(d, "context_tokens")
+			m.CtxMax = numField(d, "max_tokens")
+		}
 	case "turn.tool":
 		var d map[string]interface{}
 		if err := jsonUnmarshal(e.Data, &d); err == nil {
 			tool, _ := d["tool"].(string)
 			target, _ := d["target"].(string)
 			if tool != "" {
-				m.Status = "tool: " + tool
+				st := "tool: " + tool
+				if target != "" {
+					st += " " + truncate(target, 60)
+				}
+				m.Status = st
 				if phase, _ := d["phase"].(string); phase == "done" {
 					preview, _ := d["preview"].(string)
 					if isErr, _ := d["error"].(bool); isErr {
@@ -1207,12 +1392,18 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 			}
 		}
 	case "turn.completed":
-		// opencode v2 turn summary: agent, model, duration (+tok/s when
+		// Turn summary: agent, model, duration (+tok/s when
 		// the provider reported usage) as the assistant footer.
 		var d map[string]interface{}
 		if err := jsonUnmarshal(e.Data, &d); err == nil {
 			if t, _ := d["text"].(string); t != "" {
 				m.appendLine(t)
+			}
+			if u := numField(d, "context_tokens"); u > 0 {
+				m.CtxUsed = u
+			}
+			if mx := numField(d, "max_tokens"); mx > 0 {
+				m.CtxMax = mx
 			}
 			if f := turnFooter(m.Agent, d); f != "" {
 				m.appendLine(f)
@@ -1241,6 +1432,34 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 		m.QueueArmed = false
 	case "session.updated":
 		m.Status = "session updated"
+	case "question.resolved":
+		var d map[string]string
+		if err := jsonUnmarshal(e.Data, &d); err == nil {
+			m.Status = "question: answered"
+		}
+		if m.QModal != nil {
+			m.QModal = nil
+		}
+	case "question.asked", "question":
+		var d map[string]interface{}
+		qm := &QuestionModal{}
+		if err := jsonUnmarshal(e.Data, &d); err == nil {
+			if v, _ := d["request_id"].(string); v != "" {
+				qm.RequestID = v
+			}
+			if qs, _ := d["questions"].([]interface{}); qs != nil {
+				for _, qi := range qs {
+					qm.Questions = append(qm.Questions, decodeQuestionItem(qi))
+				}
+			}
+		} else if s := string(e.Data); s != "" {
+			qm.Questions = []QuestionItem{{Question: s}}
+		}
+		if len(qm.Questions) == 0 {
+			qm.Questions = []QuestionItem{{Question: string(e.Data)}}
+		}
+		m.QModal = qm
+		m.Status = "question: awaiting answer"
 	case "permission.resolved":
 		var d map[string]string
 		if err := jsonUnmarshal(e.Data, &d); err == nil {
@@ -1277,7 +1496,7 @@ func (m Model) View() string {
 	var sb strings.Builder
 	agentPill := agentStyle.Render(" " + strings.ToUpper(m.Agent) + " ")
 	permPill := permStyle(m.Perm).Render(" " + strings.ToUpper(m.Perm) + " ")
-	fmt.Fprintf(&sb, "%s %s  %s\n", agentPill, permPill, dimStyle.Render(sessID(m.Session)))
+	fmt.Fprintf(&sb, "%s %s  %s%s\n", agentPill, permPill, dimStyle.Render(sessID(m.Session)), ctxPill(m.CtxUsed, m.CtxMax))
 	sb.WriteString(strings.Repeat("─", maxInt(20, m.Width)) + "\n")
 	lines := m.Rendered
 	if m.Height > 0 {
@@ -1286,6 +1505,9 @@ func (m Model) View() string {
 		reserved := 6
 		if m.Modal != nil {
 			reserved += 3
+		}
+		if m.QModal != nil {
+			reserved += len(m.QModal.Questions) + 5
 		}
 		if m.Picking {
 			reserved += len(m.Sessions) + 1
@@ -1321,6 +1543,9 @@ func (m Model) View() string {
 	}
 	if m.Modal != nil {
 		sb.WriteString(modalStyle.Render(m.renderModal()) + "\n")
+	}
+	if m.QModal != nil {
+		sb.WriteString(modalStyle.Render(m.renderQuestionModal()) + "\n")
 	}
 	if m.Picking {
 		sb.WriteString(dimStyle.Render("(picker: choose session, enter to attach, esc to close)") + "\n")
@@ -1400,9 +1625,22 @@ func (m Model) renderPending() string {
 	return sb.String()
 }
 
-// turnFooter renders the opencode v2 turn summary (agent · model ·
-// duration · tok/s). Empty when the event carries no summary, so old
-// daemons and tests render nothing extra.
+// numField reads a JSON number (float64/int/int64) as int, else 0.
+func numField(d map[string]interface{}, k string) int {
+	switch v := d[k].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	}
+	return 0
+}
+
+// turnFooter renders the turn summary (agent · model ·
+// duration · tok/s · ctx ~used/max). Empty when the event carries no
+// summary, so old daemons and tests render nothing extra.
 func turnFooter(agent string, d map[string]interface{}) string {
 	model, _ := d["model"].(string)
 	ms, _ := d["duration_ms"].(float64)
@@ -1431,13 +1669,29 @@ func turnFooter(agent string, d map[string]interface{}) string {
 	if out > 0 && ms > 0 {
 		parts = append(parts, fmt.Sprintf("%.0f tok/s", float64(out)/(ms/1000)))
 	}
+	if u := numField(d, "context_tokens"); u > 0 {
+		mx := numField(d, "max_tokens")
+		if mx > 0 {
+			parts = append(parts, fmt.Sprintf("ctx ~%s/%s", formatTokens(u), formatTokens(mx)))
+		} else {
+			parts = append(parts, fmt.Sprintf("ctx ~%s", formatTokens(u)))
+		}
+	}
 	if len(parts) == 0 {
 		return ""
 	}
 	return "_" + strings.Join(parts, " · ") + "_"
 }
 
-// formatDuration renders milliseconds like opencode durations.
+// formatTokens renders 12345 as "12.3k".
+func formatTokens(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return fmt.Sprintf("%.1fk", float64(n)/1000)
+}
+
+// formatDuration renders milliseconds as short durations.
 func formatDuration(ms int64) string {
 	if ms < 1000 {
 		return fmt.Sprintf("%dms", ms)
@@ -1469,11 +1723,53 @@ func (m Model) renderModal() string {
 	return "Approve " + m.Modal.Tool + " " + m.Modal.Target + "?\n" + strings.Join(parts, " ")
 }
 
+func (m Model) renderQuestionModal() string {
+	qm := m.QModal
+	if qm == nil || len(qm.Questions) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	if len(qm.Questions) > 1 {
+		fmt.Fprintf(&sb, "Question %d/%d\n", qm.Idx+1, len(qm.Questions))
+	}
+	q := qm.Questions[qm.Idx]
+	if q.Header != "" {
+		sb.WriteString(q.Header + "\n")
+	}
+	sb.WriteString(q.Question + "\n")
+	for i, o := range q.Options {
+		mark := "  "
+		if i == qm.Cursor {
+			mark = "> "
+		}
+		fmt.Fprintf(&sb, "%s%d. %s", mark, i+1, o.Label)
+		if o.Description != "" {
+			sb.WriteString(" — " + o.Description)
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("answer (number, 1,3, or text; enter submits, esc dismisses): " + qm.Typed)
+	return sb.String()
+}
+
 var (
 	agentStyle = lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("62")).Foreground(lipgloss.Color("230"))
 	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	modalStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	ctxStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 )
+
+// ctxPill renders the live context gauge (" ctx ~12.3k/128k"), or "" when
+// no estimate has arrived yet (old daemons).
+func ctxPill(used, max int) string {
+	if used <= 0 {
+		return ""
+	}
+	if max > 0 {
+		return ctxStyle.Render(fmt.Sprintf("  ctx ~%s/%s", formatTokens(used), formatTokens(max)))
+	}
+	return ctxStyle.Render(fmt.Sprintf("  ctx ~%s", formatTokens(used)))
+}
 
 func permStyle(p string) lipgloss.Style {
 	switch p {

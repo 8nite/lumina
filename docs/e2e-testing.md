@@ -156,3 +156,29 @@ TUI `/model` skipped every non-copilot provider; the web picker did the same
 Daemon stopped, `/tmp/lumina-e2e-*`, `/tmp/lumina-ws-*`, temp test file, and
 SIDs removed. Repo diff limited to the two compile fixes; 20+ other dirty files
 are pre-existing uncommitted work, untouched.
+
+## 8. Window, compaction, BUSY + behavioral evals fix (2026-10-30)
+
+Four gaps closed (all five providers now advertise windows via `/models` /
+`/api/show`; gauge shows used-only when unknown):
+
+1. **Provider-aware compaction wired into `RunPrompt`** (`internal/agent/agent.go`):
+   newest-first history under 80% of the advertised window, newest-40
+   ceiling when unknown, re-compacted every agentic round. This also fixes a
+   latent inversion: the old oldest-first 40-msg cap silently dropped the
+   *current* user prompt once history passed 40 messages.
+2. **Pre-flight window check**: a compacted prompt that still exceeds the
+   advertised window fails fast with model + sizes (the 19k-prompt vs 12k-model
+   incident now errors before any provider request instead of mid-turn).
+3. **`SQLITE_BUSY` root-caused**: `busy_timeout` was set on one pooled
+   connection only. `Store` now uses `SetMaxOpenConns(1)` (one daemon owns the
+   DB; all statements serialize) plus a bounded busy-retry on every write path
+   for cross-process contention (`lumina run` sharing `LUMINA_DB`).
+4. **Behavioral eval suite** (`internal/agent/behavioral_test.go`): 4 fast,
+   deterministic, local-only tests asserting harness actions, not prose —
+   over-window fails fast with zero provider hits, 200-turn history compacts
+   under 80% keeping newest / evicting oldest, 16×25 concurrent writes lose
+   nothing, unknown window keeps the newest-40 ceiling.
+
+Verified: `CGO_ENABLED=0 go test -count=1 ./...` all PASS,
+`go test -race ./internal/agent/` clean, `go vet` clean.

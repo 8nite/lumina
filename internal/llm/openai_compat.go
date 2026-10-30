@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 // OpenAICompat speaks /v1/chat/completions (+ /v1/responses fallback) SSE.
@@ -15,6 +17,38 @@ type OpenAICompat struct {
 	APIKey  string
 	// Headers are extra request headers (Copilot editor/integration headers).
 	Headers map[string]string
+
+	mu         sync.Mutex
+	ctxCache   map[string]int // model id → advertised window (0 = none)
+	ctxFetched bool           // /models was already pulled once
+}
+
+// ContextWindow returns the gateway-advertised window for a bare model id
+// (OpenRouter-style `context_length`; plain OpenAI has none → 0). The
+// /models document is fetched once and cached per provider.
+func (p *OpenAICompat) ContextWindow(ctx context.Context, model string) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if w, ok := p.ctxCache[model]; ok {
+		return w, nil
+	}
+	if p.ctxFetched {
+		return 0, nil
+	}
+	p.ctxFetched = true
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	models, err := listOpenAIModels(cctx, strings.TrimSuffix(p.BaseURL, "/")+"/models", p.APIKey, p.Headers)
+	if err != nil {
+		return 0, err
+	}
+	if p.ctxCache == nil {
+		p.ctxCache = map[string]int{}
+	}
+	for _, m := range models {
+		p.ctxCache[m.ID] = m.ContextWindow
+	}
+	return p.ctxCache[model], nil
 }
 
 func (p *OpenAICompat) Name() string { return "openai-compatible" }
@@ -38,14 +72,13 @@ func listOpenAIModels(ctx context.Context, url, key string, headers map[string]s
 		}
 		req.Header.Set(k, v)
 	}
-	// Gateways (opencode zen) reject generic library UAs and require a
+	// Gateways reject generic library UAs and require a
 	// routing session even for GET /models.
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", LuminaUserAgent)
 	}
-	if req.Header.Get("x-opencode-session") == "" {
+	if req.Header.Get("x-lumina-session") == "" {
 		sid := newSessionID()
-		req.Header.Set("x-opencode-session", sid)
 		req.Header.Set("x-lumina-session", sid)
 	}
 	resp, err := newClient().Do(req)
@@ -57,12 +90,23 @@ func listOpenAIModels(ctx context.Context, url, key string, headers map[string]s
 		return nil, fmt.Errorf("list models: status %d", resp.StatusCode)
 	}
 	var lr struct {
-		Data []ModelMeta `json:"data"`
+		Data []struct {
+			ModelMeta
+			ContextLength int `json:"context_length"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
 		return nil, err
 	}
-	return lr.Data, nil
+	out := make([]ModelMeta, 0, len(lr.Data))
+	for _, m := range lr.Data {
+		mm := m.ModelMeta
+		if m.ContextLength > mm.ContextWindow {
+			mm.ContextWindow = m.ContextLength
+		}
+		out = append(out, mm)
+	}
+	return out, nil
 }
 
 func (p *OpenAICompat) Chat(ctx context.Context, req Request) (<-chan Chunk, error) {
@@ -112,20 +156,14 @@ func (p *OpenAICompat) Chat(ctx context.Context, req Request) (<-chan Chunk, err
 		}
 		body["tools"] = tools
 	}
-	// Session routing headers: lumina's own plus the opencode zen gateway's
-	// (x-opencode-session), required when BaseURL points at opencode.ai/zen.
+	// Session routing header: lumina's own session id for gateways
+	// that key prompt caching / model listing off a stable session.
 	headers := map[string]string{}
 	for k, v := range p.Headers {
 		headers[k] = v
 	}
-	sid := ""
-	for _, k := range []string{"x-opencode-session", "x-lumina-session"} {
-		if _, ok := headers[k]; !ok {
-			if sid == "" {
-				sid = newSessionID()
-			}
-			headers[k] = sid
-		}
+	if _, ok := headers["x-lumina-session"]; !ok {
+		headers["x-lumina-session"] = newSessionID()
 	}
 	resp, err := postJSON(ctx, url, p.APIKey, body, headers)
 	if err != nil {

@@ -89,3 +89,28 @@ func TestBuildPermissionMatrix(t *testing.T) {
 		t.Fatalf("auto-approve should still ask destructive shell, got %s", got)
 	}
 }
+
+func TestPlanQuestionAndTodo(t *testing.T) {
+	if got := Authorize(AgentPlan, PermBypass, "question", "question", ws, nil, false); got != Allow {
+		t.Fatalf("plan must allow question, got %s", got)
+	}
+	if got := Authorize(AgentPlan, PermBypass, "todowrite", "todos", ws, nil, false); got != Deny {
+		t.Fatalf("plan must deny todowrite, got %s", got)
+	}
+	if got := Authorize(AgentBuild, PermAsk, "question", "question", ws, nil, false); got != Allow {
+		t.Fatalf("build ask-mode must allow question without prompting, got %s", got)
+	}
+	if got := Authorize(AgentBuild, PermAsk, "todowrite", "todos", ws, map[string]string{"*": "ask"}, false); got != Ask {
+		t.Fatalf("build ask-mode todowrite should ask, got %s", got)
+	}
+}
+
+func TestPlanPatchBroker(t *testing.T) {
+	// Broker lets patch through in plan; doPatch enforces per-file scope.
+	if got := Authorize(AgentPlan, PermBypass, "patch", "plan.md", ws, nil, false); got != Allow {
+		t.Fatalf("plan patch broker must allow, got %s", got)
+	}
+	if got := Authorize(AgentBuild, PermAsk, "patch", "a.go", ws, map[string]string{"*": "ask"}, false); got != Ask {
+		t.Fatalf("build ask-mode patch should ask, got %s", got)
+	}
+}

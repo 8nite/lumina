@@ -15,7 +15,7 @@ func TestToolSpecsAdvertiseWebAndSubagents(t *testing.T) {
 	for _, s := range toolSpecs() {
 		seen[s.Name] = true
 	}
-	for _, want := range []string{"webfetch", "websearch", "subagent", "task_output", "bash"} {
+	for _, want := range []string{"webfetch", "websearch", "subagent", "task_output", "bash", "question", "todowrite", "patch"} {
 		if !seen[want] {
 			t.Fatalf("toolSpecs missing %q", want)
 		}
@@ -27,7 +27,7 @@ func TestExploreSpecsAreReadOnly(t *testing.T) {
 	for _, s := range subagentSpecs("explore") {
 		seen[s.Name] = true
 	}
-	for _, banned := range []string{"edit", "write", "memory_write", "subagent"} {
+	for _, banned := range []string{"edit", "write", "memory_write", "subagent", "patch", "todowrite"} {
 		if seen[banned] {
 			t.Fatalf("explore must not include %q", banned)
 		}
@@ -65,7 +65,7 @@ func TestRunSubagentTextRejectsUnknownAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	sc := tools.SecCtx{WorkspaceDir: sess.WorkspaceDir, SessionID: sess.ID}
-	if _, err := r.runSubagentText(context.Background(), sc, "no-such-agent", "", "do x"); err == nil {
+	if _, err := r.runSubagentText(context.Background(), sc, tools.SubagentRequest{Agent: "no-such-agent", Prompt: "do x"}); err == nil {
 		t.Fatal("expected unknown agent error")
 	} else if !strings.Contains(err.Error(), "unknown agent") {
 		t.Fatalf("wrong error: %v", err)

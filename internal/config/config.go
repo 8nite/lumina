@@ -87,7 +87,7 @@ type KBConfig struct {
 	StandingOps         bool `toml:"standing_ops"`
 }
 
-// WebSearchConfig mirrors opencode's `websearch` setting: pick one of
+// WebSearchConfig selects the websearch backend: pick one of
 // exa | firecrawl | parallel | tavily | tinyfish | random, or disable.
 // Empty provider means auto-detect from env keys.
 type WebSearchConfig struct {
@@ -258,7 +258,7 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// Validate the websearch provider name (opencode parity).
+// Validate the websearch provider name.
 var validWebSearchProviders = map[string]bool{
 	"": true, "random": true, "auto": true,
 	"exa": true, "firecrawl": true, "parallel": true,

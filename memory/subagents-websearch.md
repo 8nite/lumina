@@ -1,11 +1,11 @@
 ---
 date_modified: 2026-10-30
-tags: [agents, subagents, background-tasks, websearch, webfetch, opencode-parity]
+tags: [agents, subagents, background-tasks, websearch, webfetch]
 ---
 
-# Subagents, Background Tasks & Web Search (opencode parity)
+# Subagents, Background Tasks & Web Search
 
-- **Source of truth:** `https://opencode.ai/v2/docs/agents`, `/websearch`, `/tools`, `/permissions` (opencode V2 docs; semantics reimplemented, no sources copied). Provider REST shapes verified against Tavily/Exa/Firecrawl/Parallel/TinyFish API references.
+- **Semantics:** scoped child sessions, web fetch/search, and background tasks with permission gating (reimplemented). Provider REST shapes verified against Tavily/Exa/Firecrawl/Parallel/TinyFish API references.
 - **Tools (`internal/tools`, `toolSpecs` in `internal/agent/agent.go`):**
   - `subagent {agent, description, prompt, background}` — child session with a configured subagent; `background:true` detaches (poll with `task_output`, completion fires `OnBackgroundDone` → `turn.progress` SSE).
   - `bash {command, background, timeout}` — `background:true` detaches (no timeout unless supplied); foreground keeps the 2-min cap.

@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,7 +27,7 @@ func TestReadEditWriteRoundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err := r.Call(context.Background(), testCtx(ws), "read", map[string]interface{}{"path": "a.txt"})
-	if err != nil || res.Output != "hello" {
+	if err != nil || res.Output != "1: hello" {
 		t.Fatalf("read=%q err=%v", res.Output, err)
 	}
 	if _, err := r.Call(context.Background(), testCtx(ws), "edit", map[string]interface{}{"path": "a.txt", "old_string": "hello", "new_string": "world"}); err != nil {
@@ -136,5 +138,134 @@ func TestPluginHooksFireAroundCalls(t *testing.T) {
 	}
 	if _, err := r.Call(context.Background(), ctx, "read", map[string]interface{}{"path": "h.txt"}); err == nil {
 		t.Fatal("expected plugin block on allowed call")
+	}
+}
+
+func TestReadLineNumbersAndDir(t *testing.T) {
+	ws := t.TempDir()
+	r := NewRegistry()
+	ctx := testCtx(ws)
+	os.WriteFile(filepath.Join(ws, "b.txt"), []byte("l1\nl2\nl3"), 0o644)
+	res, err := r.Call(context.Background(), ctx, "read", map[string]interface{}{"path": "b.txt", "offset": 2, "limit": 1})
+	if err != nil || res.Output != "2: l2" {
+		t.Fatalf("read window=%q err=%v", res.Output, err)
+	}
+	dres, err := r.Call(context.Background(), ctx, "read", map[string]interface{}{"path": "."})
+	if err != nil || !strings.Contains(dres.Output, "b.txt") {
+		t.Fatalf("dir read=%q err=%v", dres.Output, err)
+	}
+	os.WriteFile(filepath.Join(ws, "bin.dat"), []byte{0, 1, 2}, 0o644)
+	if _, err := r.Call(context.Background(), ctx, "read", map[string]interface{}{"path": "bin.dat"}); err == nil {
+		t.Fatal("expected binary reject")
+	}
+	os.WriteFile(filepath.Join(ws, "c.txt"), []byte("a a"), 0o644)
+	if _, err := r.Call(context.Background(), ctx, "edit", map[string]interface{}{"path": "c.txt", "oldString": "a", "newString": "b", "replaceAll": true}); err != nil {
+		t.Fatalf("replaceAll edit: %v", err)
+	}
+}
+
+func TestGrepOptions(t *testing.T) {
+	ws := t.TempDir()
+	r := NewRegistry()
+	ctx := testCtx(ws)
+	os.WriteFile(filepath.Join(ws, "a.go"), []byte("FooBar\nfoobar\n"), 0o644)
+	os.WriteFile(filepath.Join(ws, "a.txt"), []byte("foobar\n"), 0o644)
+	res, _ := r.Call(context.Background(), ctx, "grep", map[string]interface{}{"pattern": "Foo.*"})
+	if !strings.Contains(res.Output, "a.go:1:") || strings.Contains(res.Output, "a.txt") {
+		t.Fatalf("regex grep wrong: %q", res.Output)
+	}
+	res, _ = r.Call(context.Background(), ctx, "grep", map[string]interface{}{"pattern": "foobar", "literal": true, "caseSensitive": false, "include": "*.txt"})
+	if !strings.Contains(res.Output, "a.txt:1:") || strings.Contains(res.Output, "a.go") {
+		t.Fatalf("literal grep wrong: %q", res.Output)
+	}
+	if _, err := r.Call(context.Background(), ctx, "grep", map[string]interface{}{"pattern": "([bad"}); err == nil {
+		t.Fatal("expected invalid regex error")
+	}
+}
+
+func TestGlobStarStar(t *testing.T) {
+	ws := t.TempDir()
+	r := NewRegistry()
+	ctx := testCtx(ws)
+	os.MkdirAll(filepath.Join(ws, "src", "deep"), 0o755)
+	os.WriteFile(filepath.Join(ws, "src", "a.ts"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(ws, "src", "deep", "b.ts"), []byte("x"), 0o644)
+	res, err := r.Call(context.Background(), ctx, "glob", map[string]interface{}{"pattern": "**/*.ts"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Output, "src/a.ts") || !strings.Contains(res.Output, "src/deep/b.ts") {
+		t.Fatalf("** glob missed: %q", res.Output)
+	}
+}
+
+func TestBashWorkdir(t *testing.T) {
+	ws := t.TempDir()
+	r := NewRegistry()
+	ctx := bypassCtx(ws)
+	os.MkdirAll(filepath.Join(ws, "sub"), 0o755)
+	res, err := r.Call(context.Background(), ctx, "bash", map[string]interface{}{"command": "pwd", "workdir": "sub"})
+	if err != nil || !strings.HasSuffix(strings.TrimSpace(res.Output), "sub") {
+		t.Fatalf("workdir pwd=%q err=%v", res.Output, err)
+	}
+	if _, err := r.Call(context.Background(), ctx, "bash", map[string]interface{}{"command": "pwd", "workdir": "../escape"}); err == nil {
+		t.Fatal("expected workdir escape deny")
+	}
+}
+
+func TestTodoWriteAndQuestion(t *testing.T) {
+	ws := t.TempDir()
+	r := NewRegistry()
+	ctx := testCtx(ws)
+	if _, err := r.Call(context.Background(), ctx, "todowrite", map[string]interface{}{"todos": []interface{}{map[string]interface{}{"content": "x", "status": "bogus"}}}); err == nil {
+		t.Fatal("expected bad status error")
+	}
+	res, err := r.Call(context.Background(), ctx, "todowrite", map[string]interface{}{"todos": []interface{}{map[string]interface{}{"content": "do it", "status": "in_progress"}}})
+	if err != nil || !strings.Contains(res.Output, "0/1 completed") || !strings.Contains(res.Output, "do it") {
+		t.Fatalf("todowrite=%q err=%v", res.Output, err)
+	}
+	qres, err := r.Call(context.Background(), ctx, "question", map[string]interface{}{"questions": []interface{}{"q1"}})
+	if err != nil || !strings.Contains(qres.Output, "not wired") {
+		t.Fatalf("question unwired=%q err=%v", qres.Output, err)
+	}
+	r.AskQuestion = func(context.Context, SecCtx, []Question) ([][]string, error) {
+		return [][]string{{"opt-a"}}, nil
+	}
+	wired, err := r.Call(context.Background(), ctx, "question", map[string]interface{}{"questions": []interface{}{map[string]interface{}{
+		"question": "pick one", "header": "Pick", "options": []interface{}{map[string]interface{}{"label": "opt-a", "description": "first"}},
+	}}})
+	if err != nil || !strings.Contains(wired.Output, `"pick one"="opt-a"`) {
+		t.Fatalf("question wired=%q err=%v", wired.Output, err)
+	}
+	if _, err := r.Call(context.Background(), ctx, "question", map[string]interface{}{"questions": []interface{}{map[string]interface{}{"header": "no-question"}}}); err == nil {
+		t.Fatal("expected missing question error")
+	}
+}
+
+func TestSubagentSessionIDRejected(t *testing.T) {
+	ws := t.TempDir()
+	r := NewRegistry()
+	r.Subagent = func(context.Context, SecCtx, SubagentRequest) (string, error) {
+		return "ok", nil
+	}
+	_, err := r.Call(context.Background(), bypassCtx(ws), "subagent", map[string]interface{}{"agent": "explore", "prompt": "x", "sessionID": "ses-1"})
+	if err == nil || !strings.Contains(err.Error(), "sessionID") {
+		t.Fatalf("expected sessionID error, got %v", err)
+	}
+}
+
+func TestWebFetchStripsHTML(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html><body><h1>Hi</h1><script>evil()</script></body></html>")
+	}))
+	defer srv.Close()
+	r := NewRegistry()
+	res, err := r.Call(context.Background(), bypassCtx(t.TempDir()), "webfetch", map[string]interface{}{"url": srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Output, "Hi") || strings.Contains(res.Output, "evil") || strings.Contains(res.Output, "<h1>") {
+		t.Fatalf("html strip wrong: %q", res.Output)
 	}
 }

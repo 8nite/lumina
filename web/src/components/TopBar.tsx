@@ -1,6 +1,12 @@
 import { useState } from 'react';
 import type { Session } from '../api/client';
 
+function fmtk(n: number): string {
+  if (!n || n <= 0) return '0';
+  if (n < 1000) return `${n}`;
+  return `${(n / 1000).toFixed(1)}k`;
+}
+
 export function TopBar(props: {
   session: Session | null;
   sessions: Session[];
@@ -12,7 +18,18 @@ export function TopBar(props: {
   onToggleReview: () => void;
   reviewOpen: boolean;
   host: string;
+  ctx?: { used: number; max: number } | null;
 }) {
+  const ctxText =
+    props.ctx && props.ctx.used
+      ? props.ctx.max > 0
+        ? `ctx ~${fmtk(props.ctx.used)}/${fmtk(props.ctx.max)}`
+        : `ctx ~${fmtk(props.ctx.used)}`
+      : '';
+  const ctxPct =
+    props.ctx && props.ctx.used && props.ctx.max > 0
+      ? Math.min(100, Math.round((props.ctx.used / props.ctx.max) * 100))
+      : 0;
   const [menu, setMenu] = useState(false);
   return (
     <div className="flex h-12 shrink-0 items-center gap-1 border-b border-white/10 px-2 text-sm">
@@ -65,6 +82,14 @@ export function TopBar(props: {
         )}
       </div>
       <div className="flex-1" />
+      {ctxText && (
+        <span
+          className="mr-1 rounded border border-white/10 px-1.5 py-0.5 font-mono text-[11px] text-zinc-400"
+          title={ctxPct ? `~${ctxPct}% of context window` : 'estimated context usage'}
+        >
+          {ctxText}
+        </span>
+      )}
       <button
         className="flex items-center gap-1.5 rounded px-2 py-1 text-xs text-zinc-400 hover:bg-white/5"
         onClick={props.onShowServers}

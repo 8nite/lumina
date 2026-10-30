@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,7 +53,23 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Single-connection pool: one daemon owns this DB, so every statement
+	// serializes through one SQLite connection. Without this, database/sql
+	// opens extra pooled connections that never saw the busy_timeout below,
+	// and concurrent writers fail fast with SQLITE_BUSY (the parallel-prompt
+	// turn loss). WAL + busy_timeout cover the rest; exec() retries the
+	// cross-process remainder (e.g. headless `lumina run` on one LUMINA_DB
+	// while the daemon writes).
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+		return nil, err
+	}
+	// Concurrent turns (steer bursts, queued chains) must wait on the
+	// writer lock instead of failing with SQLITE_BUSY.
+	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`PRAGMA synchronous=NORMAL`); err != nil {
 		return nil, err
 	}
 	s := &Store{db: db, path: path}
@@ -87,6 +104,32 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func nowStr() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
+// exec runs a write, retrying SQLITE_BUSY with backoff. In-process writers
+// never collide (single-connection pool above), but a second process on the
+// same DB file can hold the write lock briefly; losing a turn over that
+// would be silent data loss, so wait it out instead.
+func (s *Store) exec(query string, args ...any) (sql.Result, error) {
+	var res sql.Result
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		res, err = s.db.Exec(query, args...)
+		if err == nil || !isBusy(err) {
+			return res, err
+		}
+		time.Sleep(time.Duration(25<<attempt) * time.Millisecond)
+	}
+	return res, err
+}
+
+// isBusy reports lock-contention errors worth retrying (never logic errors).
+func isBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "locked") || strings.Contains(msg, "busy")
+}
+
 // CreateSession inserts a workspace-attributed session.
 func (s *Store) CreateSession(workspaceDir, agent, perm, model, title string) (*Session, error) {
 	if agent == "" {
@@ -100,7 +143,7 @@ func (s *Store) CreateSession(workspaceDir, agent, perm, model, title string) (*
 		Agent: agent, PermissionMode: perm, Model: model, Title: title,
 		CreatedAt: nowStr(), UpdatedAt: nowStr(),
 	}
-	_, err := s.db.Exec(`INSERT INTO sessions(id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at)
+	_, err := s.exec(`INSERT INTO sessions(id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at)
  VALUES(?,?,?,?,?,?,?,?,?)`, sess.ID, "", sess.WorkspaceDir, sess.Agent, sess.PermissionMode, sess.Model, sess.Title, sess.CreatedAt, sess.UpdatedAt)
 	return sess, err
 }
@@ -113,7 +156,7 @@ func (s *Store) InsertSession(sess *Session) error {
 	if sess.UpdatedAt == "" {
 		sess.UpdatedAt = sess.CreatedAt
 	}
-	_, err := s.db.Exec(`INSERT INTO sessions(id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at)
+	_, err := s.exec(`INSERT INTO sessions(id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at)
  VALUES(?,?,?,?,?,?,?,?,?)`, sess.ID, sess.ParentID, sess.WorkspaceDir, sess.Agent, sess.PermissionMode, sess.Model, sess.Title, sess.CreatedAt, sess.UpdatedAt)
 	return err
 }
@@ -182,7 +225,7 @@ func (s *Store) UpdateSession(id string, agent, perm, model, title *string) (*Se
 		sess.Title = *title
 	}
 	sess.UpdatedAt = nowStr()
-	_, err = s.db.Exec(`UPDATE sessions SET agent=?,permission_mode=?,model=?,title=?,updated_at=? WHERE id=?`,
+	_, err = s.exec(`UPDATE sessions SET agent=?,permission_mode=?,model=?,title=?,updated_at=? WHERE id=?`,
 		sess.Agent, sess.PermissionMode, sess.Model, sess.Title, sess.UpdatedAt, id)
 	return sess, err
 }
@@ -200,7 +243,7 @@ func (s *Store) ForkSession(id, turnID string) (*Session, error) {
 		CreatedAt: nowStr(), UpdatedAt: nowStr(),
 	}
 	fork.Agent = src.Agent
-	_, err = s.db.Exec(`INSERT INTO sessions(id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at)
+	_, err = s.exec(`INSERT INTO sessions(id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at)
  VALUES(?,?,?,?,?,?,?,?,?)`, fork.ID, fork.ParentID, fork.WorkspaceDir, fork.Agent, fork.PermissionMode, fork.Model, fork.Title, fork.CreatedAt, fork.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -211,7 +254,7 @@ func (s *Store) ForkSession(id, turnID string) (*Session, error) {
 		return nil, err
 	}
 	for _, t := range turns {
-		_, err = s.db.Exec(`INSERT INTO turns(id,session_id,parent_id,role,text,created_at) VALUES(?,?,?,?,?,?)`,
+		_, err = s.exec(`INSERT INTO turns(id,session_id,parent_id,role,text,created_at) VALUES(?,?,?,?,?,?)`,
 			uuid.NewString()[:8], fork.ID, t.ParentID, t.Role, t.Text, t.CreatedAt)
 		if err != nil {
 			return nil, err
@@ -226,12 +269,12 @@ func (s *Store) ForkSession(id, turnID string) (*Session, error) {
 // AddTurn appends a turn node.
 func (s *Store) AddTurn(sessionID, parentID, role, text string) (*Turn, error) {
 	t := &Turn{ID: uuid.NewString()[:8], SessionID: sessionID, ParentID: parentID, Role: role, Text: text, CreatedAt: nowStr()}
-	_, err := s.db.Exec(`INSERT INTO turns(id,session_id,parent_id,role,text,created_at) VALUES(?,?,?,?,?,?)`,
+	_, err := s.exec(`INSERT INTO turns(id,session_id,parent_id,role,text,created_at) VALUES(?,?,?,?,?,?)`,
 		t.ID, t.SessionID, t.ParentID, t.Role, t.Text, t.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
-	_, _ = s.db.Exec(`UPDATE sessions SET updated_at=? WHERE id=?`, t.CreatedAt, sessionID)
+	_, _ = s.exec(`UPDATE sessions SET updated_at=? WHERE id=?`, t.CreatedAt, sessionID)
 	return t, nil
 }
 

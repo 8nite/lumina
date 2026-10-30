@@ -20,6 +20,12 @@ import (
 func TestAgenticToolLoop(t *testing.T) {
 	var calls int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			// Runner's context-window lookup; not part of the round count.
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		n := atomic.AddInt64(&calls, 1)
 		if n == 1 {

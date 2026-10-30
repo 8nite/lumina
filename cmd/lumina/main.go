@@ -163,7 +163,7 @@ func runServe(args []string) error {
 	}
 	srv.Store = st
 	runner := agent.NewRunner(st, router, reg)
-	// opencode-style live feedback (reimplemented): stage updates become
+	// Live feedback: stage updates become
 	// turn.progress SSE; approval pauses publish permission.asked and wait
 	// for the TUI answer instead of failing the tool call.
 	runner.OnProgress = func(sessionID, stage string) {
@@ -172,22 +172,27 @@ func runServe(args []string) error {
 	runner.OnDelta = func(sessionID, delta, thinking string) {
 		srv.Broker().Publish(server.Event{Type: "turn.delta", SessionID: sessionID, Data: map[string]string{"delta": delta, "thinking": thinking}})
 	}
+	// Context gauge (estimated prompt tokens vs window) rides turn.context.
+	runner.OnContext = func(sessionID string, used, max int) {
+		srv.Broker().Publish(server.Event{Type: "turn.context", SessionID: sessionID, Data: map[string]int{"context_tokens": used, "max_tokens": max}})
+	}
 	runner.OnToolStart = func(sessionID, tool, target string) {
 		srv.Broker().Publish(server.Event{Type: "turn.tool", SessionID: sessionID, Data: map[string]interface{}{"phase": "start", "tool": tool, "target": target}})
 	}
 	runner.OnToolDone = func(sessionID, tool, target, preview string, isErr bool, durationMs int64) {
 		srv.Broker().Publish(server.Event{Type: "turn.tool", SessionID: sessionID, Data: map[string]interface{}{"phase": "done", "tool": tool, "target": target, "preview": preview, "error": isErr, "duration_ms": durationMs}})
 	}
-	// Turn summaries (opencode v2: agent, model, duration, tok/s) ride the
+	// Turn summaries (agent, model, duration, tok/s) ride the
 	// turn.completed event; the prompt handler picks them up below.
 	runner.OnTurnEnd = srv.NoteTurnEnd
-	// Inbox: steer/queue while a turn runs (opencode parity).
+	// Inbox: steer/queue while a turn runs.
 	srv.SteerPrompt = runner.Steer
 	srv.QueuePrompt = runner.Queue
 	srv.TakeQueued = runner.TakeQueued
 	runner.AskPermission = func(ctx context.Context, sessionID, tool, target string) (string, error) {
 		return srv.RequestPermission(ctx, sessionID, tool, target)
 	}
+	runner.AskQuestion = srv.RequestQuestion
 	var provNames []string
 	for name := range cfg.Providers {
 		provNames = append(provNames, name)
@@ -837,7 +842,7 @@ func runEvolve(args []string) error {
 // ---------- models & auth (provider connect) ----------
 
 // runModels lists live models for any provider implementing ModelLister
-// (copilot gateway, opencode zen, openai-compatible /models, ...).
+// (copilot gateway, openai-compatible /models, ...).
 func runModels(args []string) error {
 	provider := ""
 	for i := 0; i < len(args); i++ {

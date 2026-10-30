@@ -154,7 +154,7 @@ type PromptInput struct {
 	Images []PromptAttachment `json:"images,omitempty"`
 	Effort string             `json:"effort,omitempty"`
 	// Delivery selects inbox behavior while a turn is running
-	// (opencode steer/queue parity): steer (default) joins the active
+	// (steer/queue): steer (default) joins the active
 	// turn; queue chains after it completes.
 	Delivery string `json:"delivery,omitempty"`
 }
@@ -193,6 +193,27 @@ func (c *Client) Unrevert(ctx context.Context, id string) error {
 // AnswerPermission resolves a permission prompt.
 func (c *Client) AnswerPermission(ctx context.Context, reqID, decision string) error {
 	resp, err := c.req(ctx, http.MethodPost, "/api/v1/permissions/"+reqID, map[string]string{"decision": decision})
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// AnswerQuestion resolves a question prompt with one string list per
+// question (multiple:true questions may carry several).
+func (c *Client) AnswerQuestion(ctx context.Context, reqID string, answers [][]string) error {
+	resp, err := c.req(ctx, http.MethodPost, "/api/v1/questions/"+reqID, map[string]interface{}{"answers": answers})
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
+}
+
+// DismissQuestion closes a question prompt without answers.
+func (c *Client) DismissQuestion(ctx context.Context, reqID string) error {
+	resp, err := c.req(ctx, http.MethodPost, "/api/v1/questions/"+reqID, map[string]bool{"dismissed": true})
 	if err != nil {
 		return err
 	}

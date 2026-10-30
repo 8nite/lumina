@@ -36,3 +36,6 @@ lumina.db*
 # OS / Editor
 .DS_Store
 *.swp
+
+# Local-only reference notes (never commit: upstream attribution, scratch)
+.lumina/local-notes/

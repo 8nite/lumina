@@ -10,11 +10,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/8nite/lumina/internal/agent"
 	"github.com/8nite/lumina/internal/llm"
+	"github.com/8nite/lumina/internal/tools"
 )
 
 func TestOpenAPIValid(t *testing.T) {
@@ -332,10 +335,13 @@ func TestDeviceRejectsNonCopilot(t *testing.T) {
 }
 
 func TestPromptWithImagesAndEffort(t *testing.T) {
+	var mu sync.Mutex
 	var got agent.TurnInput
 	s := New(Options{})
 	s.Exec = func(ctx context.Context, id string, in agent.TurnInput) (string, error) {
+		mu.Lock()
 		got = in
+		mu.Unlock()
 		return "seen", nil
 	}
 	h := s.Handler()
@@ -356,11 +362,16 @@ func TestPromptWithImagesAndEffort(t *testing.T) {
 	if rec.Code != 202 {
 		t.Fatalf("prompt status=%d", rec.Code)
 	}
+	get := func() agent.TurnInput {
+		mu.Lock()
+		defer mu.Unlock()
+		return got
+	}
 	deadline := time.Now().Add(5 * time.Second)
-	for got.Text == "" && time.Now().Before(deadline) {
+	for get().Text == "" && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if got.Text != "what is this" || got.Effort != "high" || len(got.Images) != 1 || got.Images[0].Name != "a.png" {
+	if got := get(); got.Text != "what is this" || got.Effort != "high" || len(got.Images) != 1 || got.Images[0].Name != "a.png" {
 		t.Fatalf("exec got %+v", got)
 	}
 }
@@ -539,5 +550,232 @@ func TestDevicePollRefreshesRouter(t *testing.T) {
 	}
 	if gotProvider != "copilot" || gotToken != "ghu-fresh-9" {
 		t.Fatalf("OnAuthRefresh = (%q, %q)", gotProvider, "<redacted-check>")
+	}
+}
+
+func TestConcurrentPromptsSingleFlight(t *testing.T) {
+	// While a turn runs, overlapping prompts must steer/queue — never start
+	// a second concurrent Exec on the same session (the SQLITE_BUSY /
+	// stuck-working failure seen in long sessions on a stale binary).
+	var inflight, maxInflight int64
+	release := make(chan struct{})
+	s := New(Options{})
+	var mu sync.Mutex
+	var steered []string
+	var queued int
+	s.SteerPrompt = func(_ string, text string) {
+		mu.Lock()
+		steered = append(steered, text)
+		mu.Unlock()
+	}
+	s.QueuePrompt = func(_ string, _ agent.TurnInput) int {
+		mu.Lock()
+		defer mu.Unlock()
+		queued++
+		return queued
+	}
+	s.TakeQueued = func(_ string) (agent.TurnInput, bool) { return agent.TurnInput{}, false }
+	s.Exec = func(ctx context.Context, _ string, in agent.TurnInput) (string, error) {
+		cur := atomic.AddInt64(&inflight, 1)
+		for {
+			m := atomic.LoadInt64(&maxInflight)
+			if cur <= m || atomic.CompareAndSwapInt64(&maxInflight, m, cur) {
+				break
+			}
+		}
+		defer atomic.AddInt64(&inflight, -1)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-release:
+		}
+		return "done:" + in.Text, nil
+	}
+	ch, unsub := s.Broker().Subscribe(256)
+	defer unsub()
+	h := s.Handler()
+	prompt := func(id, body string) map[string]interface{} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/api/v1/sessions/"+id+"/prompt", strings.NewReader(body))
+		h.ServeHTTP(rec, req)
+		if rec.Code != 202 {
+			t.Fatalf("prompt status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var out map[string]interface{}
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return out
+	}
+	cr := httptest.NewRecorder()
+	h.ServeHTTP(cr, httptest.NewRequest("POST", "/api/v1/sessions",
+		strings.NewReader(`{"workspace_dir":"/tmp/ws","agent":"build"}`)))
+	var created struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(cr.Body.Bytes(), &created)
+
+	if got := prompt(created.ID, `{"text":"first"}`)["status"]; got != "accepted" {
+		t.Fatalf("first=%v", got)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt64(&inflight) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if atomic.LoadInt64(&inflight) != 1 {
+		t.Fatal("first turn did not start")
+	}
+	// Overlapping prompts while the first turn is still running.
+	if got := prompt(created.ID, `{"text":"second"}`)["status"]; got != "steered" {
+		t.Fatalf("overlapping prompt must steer, got %v", got)
+	}
+	if got := prompt(created.ID, `{"text":"third","delivery":"queue"}`)["status"]; got != "queued" {
+		t.Fatalf("queued prompt must queue, got %v", got)
+	}
+	close(release)
+	completed := 0
+	deadline = time.Now().Add(10 * time.Second)
+	for completed == 0 && time.Now().Before(deadline) {
+		select {
+		case e := <-ch:
+			if e.Type == "turn.completed" && e.SessionID == created.ID {
+				completed++
+			}
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if completed != 1 {
+		t.Fatalf("expected exactly 1 completion, got %d", completed)
+	}
+	if m := atomic.LoadInt64(&maxInflight); m != 1 {
+		t.Fatalf("concurrent Exec runs on one session: max=%d", m)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(steered) != 1 || steered[0] != "second" || queued != 1 {
+		t.Fatalf("inbox not routed: steered=%v queued=%d", steered, queued)
+	}
+}
+
+func TestTurnCompletedCarriesContext(t *testing.T) {
+	s := New(Options{})
+	s.Exec = func(_ context.Context, id string, _ agent.TurnInput) (string, error) {
+		s.NoteTurnEnd(id, agent.TurnStats{
+			Model: "prov/m", DurationMs: 2000, InputTokens: 40, OutputTokens: 100,
+			ContextTokens: 12000, MaxTokens: 200000,
+		})
+		return "seen", nil
+	}
+	ch, unsub := s.Broker().Subscribe(16)
+	defer unsub()
+	h := s.Handler()
+	cr := httptest.NewRecorder()
+	creq := httptest.NewRequest("POST", "/api/v1/sessions", strings.NewReader(`{"workspace_dir":"/tmp/ws","agent":"build"}`))
+	h.ServeHTTP(cr, creq)
+	var created struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(cr.Body.Bytes(), &created)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/sessions/"+created.ID+"/prompt", strings.NewReader(`{"text":"hi"}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != 202 {
+		t.Fatalf("prompt status=%d", rec.Code)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case e := <-ch:
+			if e.Type != "turn.completed" || e.SessionID != created.ID {
+				continue
+			}
+			var d map[string]interface{}
+			raw, err := json.Marshal(e.Data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(raw, &d); err != nil {
+				t.Fatal(err)
+			}
+			if d["context_tokens"] != float64(12000) || d["max_tokens"] != float64(200000) {
+				t.Fatalf("context missing in completed: %v", d)
+			}
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("no turn.completed with context")
+}
+
+func TestQuestionRoundTrip(t *testing.T) {
+	s := New(Options{})
+	done := make(chan struct{})
+	var got [][]string
+	go func() {
+		defer close(done)
+		ans, err := s.RequestQuestion(context.Background(), "ses-1", []tools.Question{{Question: "pick one"}})
+		if err != nil {
+			t.Errorf("request: %v", err)
+			return
+		}
+		got = ans
+	}()
+	time.Sleep(50 * time.Millisecond)
+	// Find the generated request id from pending map.
+	s.qMu.Lock()
+	var id string
+	for k := range s.qPending {
+		id = k
+	}
+	s.qMu.Unlock()
+	if id == "" {
+		t.Fatal("no pending question")
+	}
+	body := `{"answers": [["opt-a", "opt-b"], ["free text"]]}`
+	req := httptest.NewRequest("POST", "/api/v1/questions/"+id, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("answer status=%d", rec.Code)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("question answer never arrived")
+	}
+	if len(got) != 2 || len(got[0]) != 2 || got[1][0] != "free text" {
+		t.Fatalf("answers wrong: %v", got)
+	}
+}
+
+func TestQuestionDismissed(t *testing.T) {
+	s := New(Options{})
+	done := make(chan struct{})
+	var rerr error
+	go func() {
+		defer close(done)
+		_, rerr = s.RequestQuestion(context.Background(), "ses-1", []tools.Question{{Question: "pick one"}})
+	}()
+	time.Sleep(50 * time.Millisecond)
+	s.qMu.Lock()
+	var id string
+	for k := range s.qPending {
+		id = k
+	}
+	s.qMu.Unlock()
+	if id == "" {
+		t.Fatal("no pending question")
+	}
+	req := httptest.NewRequest("POST", "/api/v1/questions/"+id, strings.NewReader(`{"dismissed": true}`))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("dismiss status=%d", rec.Code)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dismiss never arrived")
+	}
+	if rerr == nil {
+		t.Fatal("expected dismiss error")
 	}
 }

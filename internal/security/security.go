@@ -174,11 +174,12 @@ func IsDestructiveBash(cmd string) bool {
 	return false
 }
 
-// readTools are always allowed in every mode (discovery + web research).
+// readTools are always allowed in every mode (discovery + web research +
+// user questions: asking is safe and never needs approval itself).
 func isReadTool(tool string) bool {
 	switch strings.ToLower(tool) {
 	case "read", "read_file", "glob", "grep", "kb_query", "lsp", "skill",
-		"webfetch", "websearch", "task_output":
+		"webfetch", "websearch", "task_output", "question", "ask_question":
 		return true
 	}
 	return false
@@ -186,7 +187,7 @@ func isReadTool(tool string) bool {
 
 func isEditTool(tool string) bool {
 	switch strings.ToLower(tool) {
-	case "edit", "edit_file", "write", "write_file", "memory_write":
+	case "edit", "edit_file", "write", "write_file", "memory_write", "todowrite", "patch":
 		return true
 	}
 	return false
@@ -222,9 +223,9 @@ func Authorize(agent AgentMode, perm PermissionMode, tool, target, workspaceDir 
 func authorizePlan(tool, target, workspaceDir string) Decision {
 	t := strings.ToLower(strings.TrimSpace(tool))
 	switch t {
-	case "read", "read_file", "glob", "grep", "lsp", "kb_query", "skill", "ask_question",
+	case "read", "read_file", "glob", "grep", "lsp", "kb_query", "skill", "question", "ask_question",
 		"webfetch", "websearch", "task_output":
-		// opencode `explore` parity: plan research may read the web and
+		// plan research may read the web, ask questions, and
 		// poll background tasks, but never mutates via delegation.
 		return Allow
 	case "bash", "shell":
@@ -237,6 +238,11 @@ func authorizePlan(tool, target, workspaceDir string) Decision {
 			return Allow
 		}
 		return Deny
+	case "patch":
+		// Per-file plan scope is enforced inside doPatch (multi-file
+		// patches authorize on the first path only); allow the call
+		// through so plan.md patches still work.
+		return Allow
 	case "subagent":
 		// Delegation could bypass the read-only fence (a build child
 		// edits while the parent stays in plan), so plan denies it.
