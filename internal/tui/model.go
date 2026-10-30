@@ -253,6 +253,11 @@ type Model struct {
 	Status string
 	Width  int
 	Height int
+	// Scroll is the history offset from the live tail (0 = follow).
+	// PgUp/Shift+Up (or Up with an empty picker/completion stack) scrolls
+	// up; PgDown/Shift+Down/End snaps back. Any appended timeline line
+	// resets it to 0 so new output is never hidden.
+	Scroll int
 	// Pending holds live-streamed assistant text (turn.delta), rendered
 	// plain until turn.completed replaces it with the final markdown.
 	Pending         string
@@ -320,6 +325,85 @@ func renderCached(src string, width int) string {
 func (m *Model) appendLine(src string) {
 	m.Lines = append(m.Lines, src)
 	m.Rendered = append(m.Rendered, renderCached(src, m.Width))
+	m.Scroll = 0 // new output snaps back to the live tail
+}
+
+// flatLines expands rendered blocks (which contain embedded newlines) into
+// individual visual rows for paging and scroll math.
+func (m Model) flatLines() []string {
+	var out []string
+	for _, block := range m.Rendered {
+		out = append(out, strings.Split(block, "\n")...)
+	}
+	return out
+}
+
+// historyBudget returns how many visual history rows fit the current Height,
+// mirroring the reserved rows accounted for in View (header, input, status,
+// help, modals, pickers, completion).
+func (m Model) historyBudget() int {
+	if m.Height <= 0 {
+		return 100
+	}
+	reserved := 6
+	if m.Modal != nil {
+		reserved += 3
+	}
+	if m.QModal != nil {
+		reserved += len(m.QModal.Questions) + 5
+	}
+	if m.Picking {
+		reserved += len(m.Sessions) + 1
+	}
+	if m.PickingConnect {
+		reserved += len(m.ConnectOptions) + 1
+	}
+	if m.PickingModel {
+		reserved += len(m.ModelOptions) + 1
+	}
+	if m.Completing {
+		reserved += len(m.CompleteOptions) + 1
+	}
+	if m.Status != "" {
+		reserved++
+	}
+	budget := m.Height - reserved
+	if budget < 5 {
+		budget = 5
+	}
+	return budget
+}
+
+// maxScroll clamps the offset so the window never scrolls past the oldest row.
+func (m Model) maxScroll() int {
+	total := len(m.flatLines())
+	max := total - m.historyBudget()
+	if max < 0 {
+		return 0
+	}
+	return max
+}
+
+// scrollUp moves the viewport toward older history, clamping at the top.
+func (m *Model) scrollUp(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	m.Scroll += n
+	if max := m.maxScroll(); m.Scroll > max {
+		m.Scroll = max
+	}
+}
+
+// scrollDown moves the viewport toward the live tail, clamping at 0.
+func (m *Model) scrollDown(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	m.Scroll -= n
+	if m.Scroll < 0 {
+		m.Scroll = 0
+	}
 }
 
 // rerenderAll rebuilds the rendered cache after a width change.
@@ -327,6 +411,9 @@ func (m *Model) rerenderAll() {
 	m.Rendered = m.Rendered[:0]
 	for _, ln := range m.Lines {
 		m.Rendered = append(m.Rendered, renderCached(ln, m.Width))
+	}
+	if max := m.maxScroll(); m.Scroll > max {
+		m.Scroll = max
 	}
 }
 
@@ -830,6 +917,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if changed {
 			m.rerenderAll()
 		}
+		if max := m.maxScroll(); m.Scroll > max {
+			m.Scroll = max
+		}
 		return m, nil
 	case tea.KeyMsg:
 		return m.updateKey(msg)
@@ -1060,6 +1150,24 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c", "ctrl+d":
 		m.quitting = true
 		return m, tea.Quit
+	case "pgup", "shift+up", "ctrl+b":
+		m.scrollUp(m.historyBudget()/2 + 1)
+		return m, nil
+	case "pgdown", "shift+down", "ctrl+f":
+		m.scrollDown(m.historyBudget()/2 + 1)
+		return m, nil
+	case "home":
+		m.Scroll = m.maxScroll()
+		return m, nil
+	case "end":
+		m.Scroll = 0
+		return m, nil
+	case "up":
+		m.scrollUp(3)
+		return m, nil
+	case "down":
+		m.scrollDown(3)
+		return m, nil
 	case "tab":
 		m.ToggleAgent()
 		return m, m.pushAgentCmd()
@@ -1143,6 +1251,7 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.Completing = false
 		m.CompleteOptions = nil
 		m.CompleteIdx = 0
+		m.Scroll = 0 // esc also snaps back to the live tail
 	default:
 		// Printable runes batch as KeyRunes, except a bare space which
 		// arrives as KeySpace (bubbletea maps it to " " for compat).
@@ -1498,38 +1607,36 @@ func (m Model) View() string {
 	permPill := permStyle(m.Perm).Render(" " + strings.ToUpper(m.Perm) + " ")
 	fmt.Fprintf(&sb, "%s %s  %s%s\n", agentPill, permPill, dimStyle.Render(sessID(m.Session)), ctxPill(m.CtxUsed, m.CtxMax))
 	sb.WriteString(strings.Repeat("─", maxInt(20, m.Width)) + "\n")
-	lines := m.Rendered
+	lines := m.flatLines()
 	if m.Height > 0 {
-		// Reserve: header(2) + input(1) + status(0-1) + help(1) +
-		// modal/pickers/completion (variable). Keep at least 5 rows for history.
-		reserved := 6
-		if m.Modal != nil {
-			reserved += 3
+		budget := m.historyBudget()
+		// Scroll banner occupies one row when active.
+		if m.Scroll > 0 {
+			budget--
+			if budget < 1 {
+				budget = 1
+			}
 		}
-		if m.QModal != nil {
-			reserved += len(m.QModal.Questions) + 5
-		}
-		if m.Picking {
-			reserved += len(m.Sessions) + 1
-		}
-		if m.PickingConnect {
-			reserved += len(m.ConnectOptions) + 1
-		}
-		if m.PickingModel {
-			reserved += len(m.ModelOptions) + 1
-		}
-		if m.Completing {
-			reserved += len(m.CompleteOptions) + 1
-		}
-		if m.Status != "" {
-			reserved++
-		}
-		budget := m.Height - reserved
-		if budget < 5 {
-			budget = 5
+		scroll := m.Scroll
+		if max := m.maxScroll(); scroll > max {
+			scroll = max
 		}
 		if len(lines) > budget {
-			lines = lines[len(lines)-budget:]
+			end := len(lines) - scroll
+			if end > len(lines) {
+				end = len(lines)
+			}
+			if end < 0 {
+				end = 0
+			}
+			start := end - budget
+			if start < 0 {
+				start = 0
+			}
+			lines = lines[start:end]
+		}
+		if m.Scroll > 0 {
+			fmt.Fprintf(&sb, "%s\n", dimStyle.Render(fmt.Sprintf("… scroll %d↑ · pgdn/end to follow …", m.Scroll)))
 		}
 	} else if len(lines) > 100 {
 		// Headless / tests: cap so a long session cannot blow up View.
@@ -1597,7 +1704,7 @@ func (m Model) View() string {
 	if m.Status != "" {
 		sb.WriteString(dimStyle.Render(m.Status) + "\n")
 	}
-	sb.WriteString(dimStyle.Render("tab plan↔build · shift+tab approval · enter steers · ctrl+x queues · /resume /undo /compact") + "\n")
+	sb.WriteString(dimStyle.Render("tab plan↔build · shift+tab approval · pgup/pgdn scroll · enter steers · ctrl+x queues · /resume /undo /compact") + "\n")
 	return sb.String()
 }
 
