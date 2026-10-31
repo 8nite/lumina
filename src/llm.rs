@@ -540,6 +540,9 @@ async fn chat_openai(
     for (k, v) in extra_headers {
         http = http.header(*k, v.clone());
     }
+    // Session routing (stable per request; opencode zen routes on these).
+    let sid = uuid::Uuid::new_v4().to_string();
+    http = http.header("x-lumina-session", &sid).header("x-opencode-session", &sid);
     let res = http.json(&body).send().await?;
     if !res.status().is_success() {
         let st = res.status();
@@ -993,15 +996,24 @@ async fn chat_responses(
                 "parameters": if t.schema.is_null() { serde_json::json!({"type":"object"}) } else { t.schema.clone() }})
         ).collect::<Vec<_>>());
     }
-    let res = client().post(&url).headers(auth_headers(def)).json(&body).send().await?;
+    let res = client()
+        .post(&url)
+        .headers(auth_headers(def))
+        .header("x-lumina-session", uuid::Uuid::new_v4().to_string())
+        .header("x-opencode-session", uuid::Uuid::new_v4().to_string())
+        .json(&body)
+        .send()
+        .await?;
     if !res.status().is_success() {
         let st = res.status();
         let t = res.text().await.unwrap_or_default();
         return Err(LlmError::Msg(format!("responses {url}: {st}: {t}")));
     }
     let mut pending: HashMap<u32, (String, String, String)> = HashMap::new(); // idx -> (id, name, args)
+    let mut saw_text = false;
     let mut stream = res.bytes_stream();
     let mut buf = Vec::<u8>::new();
+    let debug_sse = std::env::var("LUMINA_DEBUG_SSE").is_ok();
     while let Some(item) = stream.next().await {
         let bytes = item.map_err(LlmError::Http)?;
         buf.extend_from_slice(&bytes);
@@ -1013,6 +1025,9 @@ async fn chat_responses(
             if data == "[DONE]" {
                 continue;
             }
+            if debug_sse {
+                eprintln!("[sse] {data:.300}");
+            }
             let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
             let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let idx = v.get("output_index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
@@ -1020,6 +1035,17 @@ async fn chat_responses(
                 "response.output_text.delta" => {
                     let t = v.get("delta").and_then(|d| d.as_str()).unwrap_or("");
                     if !t.is_empty() {
+                        saw_text = true;
+                        let _ = tx.send(Chunk { delta: t.into(), ..Default::default() });
+                    }
+                }
+                // Full-text fallback: some gateways batch text into .done with
+                // no preceding deltas. Only use it when nothing streamed (the
+                // .done text otherwise duplicates the deltas).
+                "response.output_text.done" => {
+                    let t = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                    if !t.is_empty() && !saw_text {
+                        saw_text = true;
                         let _ = tx.send(Chunk { delta: t.into(), ..Default::default() });
                     }
                 }
@@ -1040,6 +1066,33 @@ async fn chat_responses(
                 "response.function_call_arguments.delta" => {
                     let d = v.get("delta").and_then(|x| x.as_str()).unwrap_or("");
                     pending.entry(idx).or_default().2.push_str(d);
+                }
+                // Full-args fallback for the same batching case.
+                "response.function_call_arguments.done" => {
+                    let full = v.get("arguments").and_then(|x| x.as_str()).unwrap_or("");
+                    let e = pending.entry(idx).or_default();
+                    if e.2.is_empty() {
+                        e.2 = full.to_string();
+                    }
+                }
+                // Item-done carries call identity (backup when .added was missed).
+                "response.output_item.done" => {
+                    if let Some(item) = v.get("item") {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                            let e = pending.entry(idx).or_default();
+                            if e.0.is_empty() {
+                                e.0 = item
+                                    .get("call_id")
+                                    .or_else(|| item.get("id"))
+                                    .and_then(|i| i.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                            }
+                            if e.1.is_empty() {
+                                e.1 = item.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                            }
+                        }
+                    }
                 }
                 "response.completed" | "response.incomplete" | "response.failed" => {
                     if !pending.is_empty() {
@@ -1121,5 +1174,79 @@ mod tests {
         };
         assert_eq!(r.model_for("executor", "plan"), "o/m");
         assert_eq!(r.model_for("fast", "build"), "o/m");
+    }
+}
+
+#[cfg(test)]
+mod responses_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Fake SSE server: emits a .done-only text event (no deltas) to prove
+    /// the fallback path delivers text that would otherwise be dropped.
+    #[tokio::test]
+    async fn done_only_text_is_delivered() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else { return };
+            let mut buf = [0u8; 8192];
+            // Read just the headers; the client closes after the stream ends.
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
+                let mut b = [0u8; 1];
+                if s.read(&mut b).is_err() || b[0] == 0 && head.is_empty() {
+                    break;
+                }
+                head.push(b[0]);
+                if head.len() > 8192 {
+                    break;
+                }
+            }
+            let _ = buf;
+            let body = concat!(
+                "event: response.output_text.done\n",
+                "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"text\":\"DONE FALLBACK\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\"}\n\n",
+            );
+            let _ = s.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ).as_bytes());
+        });
+        let def = ProviderDef {
+            protocol: "openai-responses".into(),
+            base_url: format!("http://{addr}"),
+            api_key: String::new(),
+            github_token: String::new(),
+            token_url: String::new(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = Request {
+            model: "m".into(),
+            messages: vec![llm_message("user", "hi")],
+            tools: vec![],
+            max_tokens: 0,
+            reasoning_effort: String::new(),
+            images: vec![],
+        };
+        let usage = chat_responses(&def, req, tx).await.expect("stream");
+        let _ = usage;
+        let mut text = String::new();
+        let mut done = false;
+        while let Some(c) = rx.recv().await {
+            text.push_str(&c.delta);
+            if c.done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(text, "DONE FALLBACK", "fallback .done text must be delivered");
+    }
+
+    fn llm_message(role: &str, content: &str) -> Message {
+        Message { role: role.into(), content: content.into(), thinking: String::new() }
     }
 }

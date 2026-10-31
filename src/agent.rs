@@ -123,7 +123,7 @@ impl Runner {
                 }
             }
         }
-        store.add_turn(session_id, "user", &user_text)?;
+        let user_turn = store.add_turn(session_id, "user", &user_text)?;
 
         let mut messages = vec![llm::Message {
             role: "system".into(),
@@ -193,24 +193,23 @@ impl Runner {
         } else {
             sess.model.clone()
         };
-        let (final_text, mutated) = self
-            .loop_until_done(router, &reg, &sc, &agent_name, &model, effort, images, &mut messages, &mut on_event)
+        let final_text = self
+            .loop_until_done(
+                router,
+                &reg,
+                &sc,
+                &agent_name,
+                &model,
+                effort,
+                images,
+                &mut messages,
+                &mut on_event,
+                store,
+                session_id,
+                &user_turn.id,
+            )
             .await?;
-        let turn = store.add_turn(session_id, "assistant", &final_text)?;
-        // Shadow-Git checkpoint after mutating turns (best-effort: plain
-        // directories and non-repos simply skip).
-        if mutated {
-            match crate::checkpoints::snapshot(&workspace, session_id, &turn.id) {
-                Ok(commit) => {
-                    let _ = store.add_trace(
-                        session_id,
-                        "checkpoint",
-                        &serde_json::json!({"turn": turn.id, "commit": commit}).to_string(),
-                    );
-                }
-                Err(e) => tracing::warn!("checkpoint skipped: {e}"),
-            }
-        }
+        store.add_turn(session_id, "assistant", &final_text)?;
         Ok(final_text)
     }
 
@@ -225,9 +224,12 @@ impl Runner {
         images: &[ImageAttachment],
         messages: &mut Vec<llm::Message>,
         on_event: &mut (dyn FnMut(&str, &str) + Send),
-    ) -> Result<(String, bool), AgentError> {
+        store: &Store,
+        session_id: &str,
+        user_turn_id: &str,
+    ) -> Result<String, AgentError> {
         let mut last_text = String::new();
-        let mut mutated = false;
+        let mut snapshotted = false;
         for _ in 0..self.max_steps {
             let (tx, mut rx) = mpsc::unbounded_channel::<Chunk>();
             let req = Request {
@@ -261,17 +263,40 @@ impl Runner {
                 .await
                 .map_err(|e| AgentError::Msg(format!("stream task: {e}")))??;
             if calls.is_empty() {
-                return Ok((last_text, mutated));
+                return Ok(last_text);
             }
             // Execute requested tools, feed results back as user messages.
-            for tc in &calls {
-                if matches!(tc.name.as_str(), "edit" | "write" | "bash" | "memory_write") {
-                    mutated = true;
+            // Shadow-Git pre-image: snapshot before the first mutating tool
+            // runs, so /undo restores the pre-turn tree (best-effort).
+            if !snapshotted && calls.iter().any(|tc| is_mutating(&tc.name)) {
+                match crate::checkpoints::snapshot(&sc.workspace, session_id, user_turn_id) {
+                    Ok(commit) => {
+                        let _ = store.add_trace(
+                            session_id,
+                            "checkpoint",
+                            &serde_json::json!({"turn": user_turn_id, "commit": commit}).to_string(),
+                        );
+                    }
+                    Err(e) => tracing::warn!("checkpoint skipped: {e}"),
                 }
+                snapshotted = true;
+            }
+            for tc in &calls {
                 let args: HashMap<String, serde_json::Value> = tc.args.clone();
                 let result = reg.call(sc, &tc.name, &args);
                 let rendered = match result {
-                    Ok(o) => format!("tool {} →\n{}{}", tc.name, o.output, if o.truncated { "\n[truncated]" } else { "" }),
+                    Ok(o) => {
+                        // Cap what flows back into context (full blobs stay out of
+                        // the loop; the model can re-read files if it needs more).
+                        let mut out = o.output;
+                        let mut note = String::new();
+                        if out.len() > 4000 {
+                            let total = out.len();
+                            out.truncate(4000);
+                            note = format!("\n[truncated {total} chars to 4000]");
+                        }
+                        format!("tool {} →\n{out}{note}", tc.name)
+                    }
                     Err(e) => format!("tool {} failed: {e}", tc.name),
                 };
                 on_event("", &rendered);
@@ -280,8 +305,13 @@ impl Runner {
             messages.push(llm::Message { role: "assistant".into(), content: last_text.clone(), thinking: String::new() });
             last_text.clear();
         }
-        Ok((last_text, mutated))
+        Ok(last_text)
     }
+}
+
+/// Tools whose execution mutates the workspace (checkpoint trigger).
+fn is_mutating(name: &str) -> bool {
+    matches!(name, "edit" | "write" | "bash" | "memory_write" | "patch")
 }
 
 

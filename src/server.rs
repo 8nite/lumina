@@ -921,11 +921,19 @@ async fn revert(
     let Some((turn, commit)) = checkpoint else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "no checkpoint for this session yet (mutating turns create them)"}))).into_response();
     };
-    // Remember where we were so /redo can come back.
-    let head = std::process::Command::new("git").arg("-C").arg(&ws).arg("rev-parse").arg("HEAD").output();
-    if let Ok(o) = head {
-        if o.status.success() {
-            let _ = st.store.add_trace(&id, "revert_from", &serde_json::json!({"commit": String::from_utf8_lossy(&o.stdout).trim()}).to_string());
+    // Remember the pre-revert working tree (including uncommitted turn
+    // output) so /redo can come back. Best-effort: without it, unrevert 404s.
+    match crate::checkpoints::snapshot(&ws, &id, "pre-revert") {
+        Ok(pre) => {
+            let _ = st.store.add_trace(&id, "revert_from", &serde_json::json!({"commit": pre}).to_string());
+        }
+        Err(_) => {
+            let head = std::process::Command::new("git").arg("-C").arg(&ws).arg("rev-parse").arg("HEAD").output();
+            if let Ok(o) = head {
+                if o.status.success() {
+                    let _ = st.store.add_trace(&id, "revert_from", &serde_json::json!({"commit": String::from_utf8_lossy(&o.stdout).trim()}).to_string());
+                }
+            }
         }
     }
     match crate::checkpoints::restore(&ws, &commit) {

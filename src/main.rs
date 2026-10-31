@@ -474,6 +474,10 @@ fn cmd_session(args: &[String]) -> MainResult {
         }
         Some("show") => {
             let Some(id) = args.get(1) else { eprintln!("usage: lumina session show <id>"); std::process::exit(64); };
+            if store.get_session(id).map_err(|e| format!("store: {e}"))?.is_none() {
+                eprintln!("session {id} not found");
+                std::process::exit(64);
+            }
             for t in store.turns(id).map_err(|e| format!("store: {e}"))? {
                 println!("## {}\n\n{}\n", t.role, t.text);
             }
