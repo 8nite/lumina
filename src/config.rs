@@ -78,6 +78,19 @@ pub struct RouterConfig {
     pub improver: String,
 }
 
+impl RouterConfig {
+    /// Tier model lookup; empty string means unset.
+    /// Planner fallback to executor happens in `agent` (mirrors Go `ModelFor`).
+    pub fn model_for_role(&self, role: &str) -> &str {
+        match role {
+            "fast" => &self.fast,
+            "planner" => &self.planner,
+            "improver" => &self.improver,
+            _ => &self.executor,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KbConfig {
     #[serde(default = "default_idle")]
