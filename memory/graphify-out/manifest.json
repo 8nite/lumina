@@ -1,62 +1,92 @@
 {
- "MEMORY.md": {
-  "mtime": 1793364795.817577,
-  "seen": 1793364810.1668148,
-  "ast_hash": "77430647b601f85d417e1e02f55b0903",
-  "semantic_hash": "77430647b601f85d417e1e02f55b0903"
- },
- "project.md": {
-  "mtime": 1793323467.4902844,
-  "seen": 1793364810.1668148,
-  "ast_hash": "d2d27adc22c3f79a5dfc6bdbc8f732b7",
-  "semantic_hash": "d2d27adc22c3f79a5dfc6bdbc8f732b7"
- },
- "lumina-build.md": {
-  "mtime": 1793318505.973173,
-  "seen": 1793364810.1668148,
-  "ast_hash": "c02b74cb0c1130b0395476f5f3f62cb8",
-  "semantic_hash": "c02b74cb0c1130b0395476f5f3f62cb8"
- },
- "lumina-live.md": {
-  "mtime": 1793323385.7810447,
-  "seen": 1793364810.1668148,
-  "ast_hash": "aef4ced44397002ea6643650e2be08b0",
-  "semantic_hash": "aef4ced44397002ea6643650e2be08b0"
- },
- "prompt-e2e.md": {
-  "mtime": 1793363426.5582392,
-  "seen": 1793364810.1668148,
-  "ast_hash": "a5f0f32f890f31f9147317f43bbf7526",
-  "semantic_hash": "a5f0f32f890f31f9147317f43bbf7526"
- },
- "subagents-websearch.md": {
-  "mtime": 1793363653.0165138,
-  "seen": 1793364810.1668148,
-  "ast_hash": "5d885b5ee7050a33756188a60daa5760",
-  "semantic_hash": "5d885b5ee7050a33756188a60daa5760"
- },
- "verbose-streaming.md": {
-  "mtime": 1793363653.0165138,
-  "seen": 1793364810.1668148,
-  "ast_hash": "1cbd9099310f11542f5b9a195176a649",
-  "semantic_hash": "1cbd9099310f11542f5b9a195176a649"
- },
- "long-session-fixes.md": {
-  "mtime": 1793364219.316163,
-  "seen": 1793364810.1668148,
-  "ast_hash": "4351baa28abb417ab1ab11039083d0a8",
-  "semantic_hash": "4351baa28abb417ab1ab11039083d0a8"
- },
- "context-from-providers.md": {
-  "mtime": 1793363928.2689018,
-  "seen": 1793364810.1668148,
-  "ast_hash": "9762f30176291b8596a240218b3952bb",
-  "semantic_hash": "9762f30176291b8596a240218b3952bb"
- },
- "prompts-parity.md": {
-  "mtime": 1793364731.447586,
-  "seen": 1793364810.1668148,
-  "ast_hash": "c1583587733a25804203eb7bdb588915",
-  "semantic_hash": "c1583587733a25804203eb7bdb588915"
- }
+  "MEMORY.md": {
+    "mtime": 1793461153.4117768,
+    "seen": 1793461164.5235894,
+    "ast_hash": "355878472f5a794d02231d8b238e70d7",
+    "semantic_hash": "355878472f5a794d02231d8b238e70d7"
+  },
+  "project.md": {
+    "mtime": 1793323467.4902844,
+    "seen": 1793364810.1668148,
+    "ast_hash": "d2d27adc22c3f79a5dfc6bdbc8f732b7",
+    "semantic_hash": "d2d27adc22c3f79a5dfc6bdbc8f732b7"
+  },
+  "lumina-build.md": {
+    "mtime": 1793318505.973173,
+    "seen": 1793364810.1668148,
+    "ast_hash": "c02b74cb0c1130b0395476f5f3f62cb8",
+    "semantic_hash": "c02b74cb0c1130b0395476f5f3f62cb8"
+  },
+  "lumina-live.md": {
+    "mtime": 1793460611.8993473,
+    "seen": 1793460638.7462926,
+    "ast_hash": "05e505f149c18966bed11e5a4d98eaf5",
+    "semantic_hash": "05e505f149c18966bed11e5a4d98eaf5"
+  },
+  "prompt-e2e.md": {
+    "mtime": 1793363426.5582392,
+    "seen": 1793364810.1668148,
+    "ast_hash": "a5f0f32f890f31f9147317f43bbf7526",
+    "semantic_hash": "a5f0f32f890f31f9147317f43bbf7526"
+  },
+  "subagents-websearch.md": {
+    "mtime": 1793363653.0165138,
+    "seen": 1793364810.1668148,
+    "ast_hash": "5d885b5ee7050a33756188a60daa5760",
+    "semantic_hash": "5d885b5ee7050a33756188a60daa5760"
+  },
+  "verbose-streaming.md": {
+    "mtime": 1793363653.0165138,
+    "seen": 1793364810.1668148,
+    "ast_hash": "1cbd9099310f11542f5b9a195176a649",
+    "semantic_hash": "1cbd9099310f11542f5b9a195176a649"
+  },
+  "long-session-fixes.md": {
+    "mtime": 1793364219.316163,
+    "seen": 1793364810.1668148,
+    "ast_hash": "4351baa28abb417ab1ab11039083d0a8",
+    "semantic_hash": "4351baa28abb417ab1ab11039083d0a8"
+  },
+  "context-from-providers.md": {
+    "mtime": 1793363928.2689018,
+    "seen": 1793364810.1668148,
+    "ast_hash": "9762f30176291b8596a240218b3952bb",
+    "semantic_hash": "9762f30176291b8596a240218b3952bb"
+  },
+  "prompts-parity.md": {
+    "mtime": 1793366263.9887383,
+    "seen": 1793366336.297251,
+    "ast_hash": "a0aa09c8bd6dc47d8165dd4cd1469e3cba6bcc9b1603ee62a502c803c80f40f6",
+    "semantic_hash": "a0aa09c8bd6dc47d8165dd4cd1469e3cba6bcc9b1603ee62a502c803c80f40f6"
+  },
+  "config-defaults-fix.md": {
+    "mtime": 1793373651.4770539,
+    "seen": 1793373667.247684,
+    "ast_hash": "8ac91d56286ee764b91d28608b17f605a1304c5f5061c631e628c02939c72bcb",
+    "semantic_hash": "8ac91d56286ee764b91d28608b17f605a1304c5f5061c631e628c02939c72bcb"
+  },
+  "browser-skills.md": {
+    "mtime": 1793414717.0838783,
+    "seen": 1793456933.7041416,
+    "ast_hash": "8bc4e67d2a9e0b0f72894d92618d385d",
+    "semantic_hash": "8bc4e67d2a9e0b0f72894d92618d385d"
+  },
+  "vault-placeholders.md": {
+    "mtime": 1793458086.1703217,
+    "seen": 1793460638.7462926,
+    "ast_hash": "0cb7b6c8c75211982298c4ae5f9e4c89",
+    "semantic_hash": "0cb7b6c8c75211982298c4ae5f9e4c89"
+  },
+  "resync-variants.md": {
+    "mtime": 1793460611.8923473,
+    "seen": 1793460638.7462926,
+    "ast_hash": "63140ed52b00b736fd7fd7bc47656aab",
+    "semantic_hash": "63140ed52b00b736fd7fd7bc47656aab"
+  },
+  "loops-and-claims.md": {
+    "mtime": 1793461151.1347408,
+    "seen": 1793461164.5235214,
+    "ast_hash": "49b6819c4773ac52e043de2ae8193b2d",
+    "semantic_hash": "49b6819c4773ac52e043de2ae8193b2d"
+  }
 }

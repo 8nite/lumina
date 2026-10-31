@@ -95,7 +95,11 @@ func TestVerificationMatrix(t *testing.T) {
 			fmt.Sprintf(".kube/config_deny=%v grep_leaked_.env=%v (grep out=%q)", kubeDeny, grepLeakedEnv, strings.TrimSpace(grepRes.Output)))
 
 		// TP-02.5: workspace escape via "file" alias vs "path"
-		outsideFile := filepath.Join(t.TempDir(), "escaped.txt")
+		// NOTE: must use a non-whitelisted absolute path. t.TempDir()
+		// (/tmp/...) is intentionally writable per IsWhitelistedWrite,
+		// so it cannot prove the escape fence (see TestFileAliasEscapeBlocked
+		// which uses /var/empty for the same reason).
+		outsideFile := "/var/empty/lumina-escape-test.txt"
 		_, errPath := reg.Call(context.Background(), scBuildBypass, "write", map[string]interface{}{"path": outsideFile, "content": "x"})
 		_, errFileAlias := reg.Call(context.Background(), scBuildBypass, "write", map[string]interface{}{"file": outsideFile, "content": "x"})
 		verdict(t, "TP-02.5", errPath != nil && errFileAlias != nil,
@@ -176,6 +180,12 @@ func TestVerificationMatrix(t *testing.T) {
 		var reqTools []interface{}
 		round := 0
 		mockLLM := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/models" {
+				// Runner's context-window lookup; not part of the round count.
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"data":[]}`)
+				return
+			}
 			var body map[string]interface{}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			if ts, ok := body["tools"].([]interface{}); ok {
@@ -465,7 +475,7 @@ func TestConfigDefaultsSeedFlags(t *testing.T) {
 		t.Fatalf("CLI flag must win over config: %+v", g)
 	}
 	t.Setenv("LUMINA_CONFIG", filepath.Join(dir, "missing.toml"))
-	if h := configBaseFlags(); h.agent != "build" || h.perm != "ask" {
-		t.Fatalf("missing config must fall back to build/ask: %+v", h)
+	if h := configBaseFlags(); h.agent != "build" || h.perm != "bypass" {
+		t.Fatalf("missing config must fall back to build/bypass: %+v", h)
 	}
 }

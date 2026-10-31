@@ -312,7 +312,7 @@ type tuiFlags struct {
 	perm             string
 }
 
-func defaultFlags() tuiFlags { return tuiFlags{agent: "build", perm: "ask"} }
+func defaultFlags() tuiFlags { return tuiFlags{agent: "build", perm: "bypass"} }
 
 // configPath honors LUMINA_CONFIG like loadStack.
 func configPath() string {
@@ -324,7 +324,7 @@ func configPath() string {
 
 // configBaseFlags returns TUI defaults from [defaults] in config.toml
 // (LUMINA_CONFIG or ~/.config/lumina/config.toml), falling back to
-// build/ask. CLI flags parsed afterwards still win over the file.
+// build/bypass. CLI flags parsed afterwards still win over the file.
 func configBaseFlags() tuiFlags {
 	f := defaultFlags()
 	cfg, err := config.Load(configPath())
@@ -454,6 +454,10 @@ func runHeadless(args []string) error {
 	if plan {
 		agentMode = "plan"
 	}
+	if !llm.ValidEffort(effort) {
+		return fmt.Errorf("lumina run: invalid --effort %q (want auto|low|medium|high|xhigh|max)", effort)
+	}
+	effort = llm.NormalizeEffort(effort)
 
 	_, router, reg := loadStack()
 	st, err := openStore()
@@ -903,7 +907,7 @@ func runEvolve(args []string) error {
 	fmt.Println("evolve landed: " + strings.Join(landed, ",") + " @ " + commit)
 	lib := &harness.Library{Dir: harness.DefaultLibraryDir()}
 	_ = lib.Promote("evolve-"+time.Now().Format("20060102"), "# evolve run", "offline pass landed "+strings.Join(landed, ","))
-	_ = security.Normalize("ask")
+	_ = security.Normalize("bypass")
 	return nil
 }
 

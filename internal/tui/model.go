@@ -1,6 +1,6 @@
 // Package tui is the Terminal TUI client: streaming timeline, Tab primary
-// agent toggle (PLAN↔BUILD), Shift+Tab approval cycling, /resume picker,
-// @file & [[memory]] completion, and inline permission modals. It talks to
+// agent toggle (PLAN↔BUILD), Shift+Tab approval cycling, /resume + /continue
+// same-workspace session attach, @file & [[memory]] completion, and inline permission modals. It talks to
 // `lumina serve` exclusively through pkg/sdk. The state machine is
 // headless-testable: Update is pure except for the SDK command constructors.
 package tui
@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/8nite/lumina/internal/llm"
 	"github.com/8nite/lumina/internal/rules"
 	"github.com/8nite/lumina/pkg/sdk"
 	tea "github.com/charmbracelet/bubbletea"
@@ -61,8 +62,12 @@ type QuestionOption struct {
 // EventMsg carries one daemon SSE event into Update.
 type EventMsg struct{ Event sdk.Event }
 
-// SessionsMsg carries the /resume picker entries.
+// SessionsMsg carries the /resume picker entries (same-workspace only).
 type SessionsMsg struct{ Sessions []*sdk.Session }
+
+// AttachedMsg carries a direct /continue attach (latest previous session
+// in the same workspace, current session excluded).
+type AttachedMsg struct{ Session *sdk.Session }
 
 // ModelsMsg carries the /model picker entries (provider-qualified ids).
 type ModelsMsg struct{ Models []string }
@@ -87,6 +92,26 @@ type ForkDoneMsg struct{ Session *sdk.Session }
 
 // TurnDoneMsg carries a completed assistant turn.
 type TurnDoneMsg struct{ Text string }
+
+// RequestResyncMsg asks the model to refetch authoritative session state
+// (transcript + running flag + pending prompts). Sent on startup and after
+// every SSE reconnect so missed events reconcile instead of leaving a dead
+// spinner and an empty timeline.
+type RequestResyncMsg struct{}
+
+// ResyncMsg carries the reconciled timeline. Lines holds the full rebuilt
+// transcript in display form; Working/Status restore the spinner; the
+// modals restore approval/question prompts missed while disconnected.
+type ResyncMsg struct {
+	Lines    []string
+	Working  bool
+	Status   string
+	CtxUsed  int
+	CtxMax   int
+	Modal    *PermModal
+	QModal   *QuestionModal
+	HadState bool // false when the daemon was unreachable (keep local view)
+}
 
 // ErrMsg surfaces failures.
 type ErrMsg struct{ Err error }
@@ -198,13 +223,15 @@ func builtinSlashCommands() []CompleteItem {
 		{"/plan", "switch to read-only plan mode"},
 		{"/build", "switch to full build mode"},
 		{"/model", "pick a model or connect a provider (usage: /model [filter])"},
+		{"/variant", "pick the reasoning-effort variant (usage: /variant [" + strings.Join(llm.EffortVariants, "|") + "])"},
 		{"/mode", "view or set approval mode (ask|auto-edit|auto-approve|bypass)"},
 		{"/connect", "connect a provider via device web-auth (usage: /connect [provider] [github-url])"},
 		{"/compact", "summarize context to free the window"},
 		{"/thinking", "show or hide model reasoning while working (show|hide)"},
 		{"/undo", "restore the last shadow-git checkpoint"},
 		{"/redo", "re-apply the undone checkpoint"},
-		{"/resume", "pick a session to attach"},
+		{"/resume", "pick a previous session in this workspace"},
+		{"/continue", "attach the latest session in this workspace"},
 		{"/fork", "branch this session at the latest turn"},
 		{"/graphify", "refresh the knowledge graph"},
 		{"/evolve", "run a Harness² self-improvement pass"},
@@ -235,7 +262,12 @@ type Model struct {
 	ModelOptions []string
 	Picking      bool
 	PickingModel bool
-	PickIdx      int
+	// Variant picker (/variant) entries + mode flag. Reuses PickIdx.
+	// Effort holds the current reasoning-effort variant ("" = auto).
+	Effort          string
+	VariantOptions  []string
+	PickingVariant  bool
+	PickIdx         int
 	// /connect wizard: provider picker, GitHub URL prompt, device polling.
 	ConnectOptions  []string
 	PickingConnect  bool
@@ -321,11 +353,66 @@ func renderCached(src string, width int) string {
 	return strings.TrimRight(out, "\n")
 }
 
-// appendLine stores source + its rendered form together.
+// appendLine stores source + its rendered form together. Tool and error
+// lines are colored by group (see renderLine) so thinking, reads, edits,
+// exec/bash, web, and failures scan apart; everything else renders as
+// plain markdown. Lines stays plain text (tests + copy-paste).
 func (m *Model) appendLine(src string) {
 	m.Lines = append(m.Lines, src)
-	m.Rendered = append(m.Rendered, renderCached(src, m.Width))
+	m.Rendered = append(m.Rendered, renderLine(src, m.Width))
 	m.Scroll = 0 // new output snaps back to the live tail
+}
+
+// renderLine renders one markdown block once. Tool and error lines skip
+// glamour and render directly: glamour's dark style paints every `code`
+// span the same red, which would hide the per-group color on the tool
+// name. View must never call this per frame; lines are rendered on append
+// and on width change only.
+func renderLine(src string, width int) string {
+	if strings.HasPrefix(src, "· `") {
+		return renderToolLine(src)
+	}
+	if strings.HasPrefix(src, "**error:**") {
+		return errToolStyle.Render("error: " + strings.TrimSpace(strings.TrimPrefix(src, "**error:**")))
+	}
+	return renderCached(src, width)
+}
+
+// renderToolLine colors one `· `tool` target → preview` row by group:
+// the tool name carries the lane color, target/preview stay dim (red on
+// error) so the lane scans at a glance.
+func renderToolLine(src string) string {
+	rest := strings.TrimPrefix(src, "· `")
+	tool := rest
+	after := ""
+	if i := strings.Index(rest, "`"); i >= 0 {
+		tool = rest[:i]
+		after = rest[i+1:]
+	}
+	target, preview := after, ""
+	if i := strings.Index(after, "→"); i >= 0 {
+		target = strings.TrimSpace(after[:i])
+		preview = strings.TrimSpace(after[i+len("→"):])
+	} else {
+		target = strings.TrimSpace(after)
+	}
+	isErr := strings.HasPrefix(preview, "error:")
+	st := toolLineStyle(tool, isErr)
+	var sb strings.Builder
+	sb.WriteString(dimStyle.Render("· "))
+	sb.WriteString(st.Render(tool))
+	if target != "" {
+		sb.WriteString(" " + dimStyle.Render(target))
+	}
+	if preview != "" || strings.Contains(after, "→") {
+		sb.WriteString(" " + dimStyle.Render("→") + " ")
+		if isErr {
+			sb.WriteString(errToolStyle.Render(preview))
+		} else {
+			sb.WriteString(dimStyle.Render(preview))
+		}
+	}
+	return sb.String()
 }
 
 // flatLines expands rendered blocks (which contain embedded newlines) into
@@ -360,6 +447,9 @@ func (m Model) historyBudget() int {
 	}
 	if m.PickingModel {
 		reserved += len(m.ModelOptions) + 1
+	}
+	if m.PickingVariant {
+		reserved += len(m.VariantOptions) + 1
 	}
 	if m.Completing {
 		reserved += len(m.CompleteOptions) + 1
@@ -410,7 +500,7 @@ func (m *Model) scrollDown(n int) {
 func (m *Model) rerenderAll() {
 	m.Rendered = m.Rendered[:0]
 	for _, ln := range m.Lines {
-		m.Rendered = append(m.Rendered, renderCached(ln, m.Width))
+		m.Rendered = append(m.Rendered, renderLine(ln, m.Width))
 	}
 	if max := m.maxScroll(); m.Scroll > max {
 		m.Scroll = max
@@ -419,7 +509,7 @@ func (m *Model) rerenderAll() {
 
 // New creates a model bound to a session.
 func New(c *sdk.Client, sess *sdk.Session) Model {
-	agent, perm := "build", "ask"
+	agent, perm := "build", "bypass"
 	if sess != nil {
 		if sess.Agent != "" {
 			agent = sess.Agent
@@ -443,12 +533,155 @@ func sessID(s *sdk.Session) string {
 	return s.ID
 }
 
-// Init subscribes to SSE when a client is attached.
-func (m Model) Init() tea.Cmd {
-	if m.Client == nil {
+// transcriptToLines maps persisted transcript rows onto the same timeline
+// shapes the live event path appends: user turns as `**you:** …`,
+// assistant turns verbatim, tool/tool_error turns as `· …` rows.
+func transcriptToLines(turns []sdk.TranscriptTurn) []string {
+	var out []string
+	for _, t := range turns {
+		switch t.Role {
+		case "user":
+			out = append(out, "**you:** "+t.Text)
+		case "assistant":
+			out = append(out, t.Text)
+		case "tool", "tool_error":
+			text := strings.TrimSpace(t.Text)
+			if text == "" {
+				text = "(no output)"
+			}
+			if t.Role == "tool_error" {
+				out = append(out, "· error: "+text)
+			} else {
+				out = append(out, "· "+text)
+			}
+		}
+	}
+	return out
+}
+
+// resyncCmd fetches authoritative session state (running flag + pending
+// prompts) plus the persisted transcript, and returns a ResyncMsg. The
+// daemon stores the user turn at turn start and tool turns incrementally,
+// so a mid-turn resync already shows partial history.
+func (m Model) resyncCmd() tea.Cmd {
+	c, sess := m.Client, m.Session
+	if c == nil || sess == nil {
 		return nil
 	}
-	return m.subscribeCmd()
+	id := sess.ID
+	return func() tea.Msg {
+		st, err := c.SessionState(bg(), id)
+		if err != nil {
+			return ResyncMsg{HadState: false}
+		}
+		turns, err := c.ExportTranscript(bg(), id)
+		if err != nil {
+			return ResyncMsg{HadState: false}
+		}
+		msg := ResyncMsg{HadState: true, Working: st.Running}
+		msg.Lines = transcriptToLines(turns)
+		if st.Running {
+			msg.Status = "working… (reconnected — catching up…)"
+		}
+		if st.Permission != nil && st.Permission.RequestID != "" {
+			msg.Modal = &PermModal{Tool: st.Permission.Tool, Target: st.Permission.Target, RequestID: st.Permission.RequestID}
+			if msg.Modal.Tool == "" {
+				msg.Modal.Tool = "tool"
+			}
+			msg.Status = "waiting approval: " + strings.TrimSpace(msg.Modal.Tool+" "+msg.Modal.Target)
+			msg.Working = true
+		}
+		if st.Question != nil && st.Question.RequestID != "" && len(st.Question.Questions) > 0 {
+			qm := &QuestionModal{RequestID: st.Question.RequestID}
+			for _, q := range st.Question.Questions {
+				item := QuestionItem{Question: q.Question, Header: q.Header, Multiple: q.Multiple}
+				for _, o := range q.Options {
+					item.Options = append(item.Options, QuestionOption{Label: o.Label, Description: o.Description})
+				}
+				qm.Questions = append(qm.Questions, item)
+			}
+			msg.QModal = qm
+			msg.Status = "question: awaiting answer"
+			msg.Working = true
+		}
+		return msg
+	}
+}
+
+// applyResync rebuilds the timeline from a ResyncMsg. The two header lines
+// ("# lumina" + session line) are always kept; transcript lines replace
+// everything after them, except a locally-appended trailing `**you:**`
+// row the export raced ahead of (POST returns before the async runner
+// persists) is preserved so a just-sent prompt never vanishes.
+func (m *Model) applyResync(msg ResyncMsg) {
+	if !msg.HadState {
+		return
+	}
+	head := 0
+	if len(m.Lines) > 0 && m.Lines[0] == "# lumina" {
+		head = 1
+		if len(m.Lines) > 1 {
+			head = 2
+		}
+	}
+	trailing := ""
+	if n := len(m.Lines); n > head {
+		if last := m.Lines[n-1]; strings.HasPrefix(last, "**you:** ") {
+			found := false
+			for _, l := range msg.Lines {
+				if l == last {
+					found = true
+					break
+				}
+			}
+			if !found {
+				trailing = last
+			}
+		}
+	}
+	m.Lines = append(m.Lines[:head], msg.Lines...)
+	m.Rendered = m.Rendered[:0]
+	for _, ln := range m.Lines {
+		m.Rendered = append(m.Rendered, renderLine(ln, m.Width))
+	}
+	if trailing != "" {
+		m.Lines = append(m.Lines, trailing)
+		m.Rendered = append(m.Rendered, renderLine(trailing, m.Width))
+	}
+	m.Scroll = 0
+	m.Working = msg.Working
+	if msg.Working {
+		m.TurnStart = time.Now()
+	} else {
+		m.Pending = ""
+		m.PendingThinking = ""
+	}
+	m.Status = msg.Status
+	m.Modal = msg.Modal
+	m.QModal = msg.QModal
+}
+
+// closeEmptyPickers closes optimistically opened pickers whose options never
+// loaded (fetch error, direct-connect/no-match short-circuit). Pickers with
+// options stay open so background turns never steal an active selection.
+func (m *Model) closeEmptyPickers() {
+	if m.PickingModel && len(m.ModelOptions) == 0 {
+		m.PickingModel = false
+	}
+	if m.Picking && len(m.Sessions) == 0 {
+		m.Picking = false
+	}
+}
+
+// Init loads authoritative history when attached, so `-c`/`-s` sessions
+// render their transcript (and a mid-turn spinner) instead of an empty
+// timeline. The SSE fan-in lives in the caller (tui_client.go), which also
+// sends RequestResyncMsg after every reconnect.
+func (m Model) Init() tea.Cmd {
+	if m.Client == nil || m.Session == nil {
+		return m.subscribeCmd()
+	}
+	return tea.Batch(m.subscribeCmd(), m.resyncCmd())
 }
 
 func (m Model) subscribeCmd() tea.Cmd {
@@ -482,7 +715,7 @@ func (m *Model) CyclePerm() {
 			return
 		}
 	}
-	m.Perm = "ask"
+	m.Perm = "bypass"
 }
 
 func (m *Model) pushSystem(s string) {
@@ -624,6 +857,15 @@ func (m *Model) ApplyCommand(cmd string) tea.Cmd {
 				return ModelsMsg{opts}
 			}
 		}
+	case "/variant", "/effort", "/variants":
+		// /variant — bare opens the picker on the current variant; with
+		// text, an exact variant applies directly, a substring filters
+		// the picker, unknown reports the choices.
+		arg := ""
+		if len(fields) > 1 {
+			arg = strings.Join(fields[1:], " ")
+		}
+		m.applyVariant(arg)
 	case "/compact":
 		m.compact()
 	case "/thinking":
@@ -668,14 +910,41 @@ func (m *Model) ApplyCommand(cmd string) tea.Cmd {
 				return TurnDoneMsg{"(redone)"}
 			}
 		}
-	case "/resume":
+	case "/resume", "/continue":
+		ws, cur := "", ""
+		if m.Session != nil {
+			ws = m.Session.WorkspaceDir
+			cur = m.Session.ID
+		}
+		if fields[0] == "/continue" {
+			// CLI parity (-c): attach the latest previous session in the
+			// same workspace without opening the picker.
+			m.pushSystem("continuing latest session…")
+			if m.Client == nil {
+				m.pushSystem("no daemon attached")
+				return nil
+			}
+			c := m.Client
+			return func() tea.Msg {
+				list, err := c.ListSessions(bg(), ws)
+				if err != nil {
+					return ErrMsg{err}
+				}
+				for _, s := range list {
+					if s.ID != cur {
+						return AttachedMsg{Session: s}
+					}
+				}
+				return TurnDoneMsg{"no previous sessions for this workspace"}
+			}
+		}
 		m.Picking = true
 		m.PickIdx = 0
 		m.pushSystem("pick a session (↑↓ + enter)")
 		if m.Client != nil {
 			c := m.Client
 			return func() tea.Msg {
-				list, err := c.ListSessions(bg(), "")
+				list, err := c.ListSessions(bg(), ws)
 				if err != nil {
 					return ErrMsg{err}
 				}
@@ -739,6 +1008,59 @@ func (m *Model) beginConnect(provider, ghurl string) tea.Cmd {
 func (m *Model) applyModel(id string) tea.Cmd {
 	m.pushSystem("model → " + id)
 	return connectModelCmd(m.Client, m.Session, id)
+}
+
+// variantIndex returns the cursor position of the current effort inside opts
+// (matched normalized, so "" hits "auto"), or 0 when absent. The picker
+// always opens on the live variant instead of a hard-coded top entry.
+func (m *Model) variantIndex(opts []string) int {
+	cur := llm.NormalizeEffort(m.Effort)
+	for i, v := range opts {
+		if llm.NormalizeEffort(v) == cur {
+			return i
+		}
+	}
+	return 0
+}
+
+// applyVariant sets the current reasoning-effort variant ("", low, medium,
+// high, xhigh, max; "" renders as auto). Bare arg opens the picker; an
+// exact variant applies directly; a substring filters the picker.
+func (m *Model) applyVariant(arg string) {
+	t := strings.ToLower(strings.TrimSpace(arg))
+	if t == "" {
+		m.VariantOptions = append([]string(nil), llm.EffortVariants...)
+		m.PickingVariant = true
+		m.PickIdx = m.variantIndex(m.VariantOptions)
+		m.pushSystem("pick a variant (↑↓ + enter) — current: " + llm.EffortLabel(m.Effort))
+		return
+	}
+	if llm.ValidEffort(t) {
+		m.Effort = llm.NormalizeEffort(t)
+		m.PickingVariant = false
+		m.pushSystem("variant → " + llm.EffortLabel(m.Effort))
+		return
+	}
+	var kept []string
+	for _, v := range llm.EffortVariants {
+		if strings.Contains(strings.ToLower(v), t) {
+			kept = append(kept, v)
+		}
+	}
+	if len(kept) == 1 {
+		m.Effort = llm.NormalizeEffort(kept[0])
+		m.PickingVariant = false
+		m.pushSystem("variant → " + llm.EffortLabel(m.Effort))
+		return
+	}
+	if len(kept) > 1 {
+		m.VariantOptions = kept
+		m.PickingVariant = true
+		m.PickIdx = m.variantIndex(kept)
+		m.pushSystem("pick a variant matching \"" + t + "\" (↑↓ + enter)")
+		return
+	}
+	m.pushSystem("unknown variant " + arg + " (want " + strings.Join(llm.EffortVariants, "|") + ")")
 }
 
 // connectModelCmd PATCHes the session and persists the router tier.
@@ -925,9 +1247,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateKey(msg)
 	case EventMsg:
 		return m.updateEvent(msg.Event)
+	case RequestResyncMsg:
+		if cmd := m.resyncCmd(); cmd != nil {
+			return m, cmd
+		}
+		return m, nil
+	case ResyncMsg:
+		m.applyResync(msg)
+		return m, nil
 	case TurnDoneMsg:
 		m.appendLine(msg.Text)
 		m.Status = ""
+		// A command that finished without loading picker options (direct
+		// single-match /model connect, no-match/filter reports) must not
+		// leave the optimistically opened picker on screen. Loaded pickers
+		// (options present) stay open: background turns must not steal them.
+		m.closeEmptyPickers()
 		return m, nil
 	case ModelsMsg:
 		m.ModelOptions = msg.Models
@@ -935,9 +1270,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.PickIdx = 0
 		return m, nil
 	case SessionsMsg:
-		m.Sessions = msg.Sessions
-		m.Picking = len(msg.Sessions) > 0
+		// Picker lists *previous* sessions: drop the current session so
+		// enter always attaches somewhere else. The daemon already scoped
+		// the list to this workspace via ?directory=.
+		cur := ""
+		if m.Session != nil {
+			cur = m.Session.ID
+		}
+		var kept []*sdk.Session
+		for _, s := range msg.Sessions {
+			if s == nil || s.ID == cur {
+				continue
+			}
+			kept = append(kept, s)
+		}
+		m.Sessions = kept
+		m.Picking = len(kept) > 0
 		m.PickIdx = 0
+		if len(kept) == 0 {
+			m.Picking = false
+			m.pushSystem("no previous sessions for this workspace")
+		}
 		return m, nil
 	case CommandsLoadedMsg:
 		seen := map[string]bool{}
@@ -997,11 +1350,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pushSystem("forked → " + msg.Session.ID)
 		}
 		return m, nil
+	case AttachedMsg:
+		if msg.Session != nil {
+			m.Session = msg.Session
+			if msg.Session.Agent != "" {
+				m.Agent = msg.Session.Agent
+			}
+			if msg.Session.PermissionMode != "" {
+				m.Perm = msg.Session.PermissionMode
+			}
+			m.pushSystem("attached → " + msg.Session.ID)
+			// Drop the previous session's live state; the resync below
+			// rebuilds the timeline (history + spinner + modals) for the
+			// newly attached session.
+			m.Pending = ""
+			m.PendingThinking = ""
+			m.Working = false
+			m.Status = ""
+			m.Modal = nil
+			m.QModal = nil
+			if cmd := m.resyncCmd(); cmd != nil {
+				return m, cmd
+			}
+		}
+		return m, nil
 	case ErrMsg:
 		if m.Status == "working…" {
 			m.appendLine("**error:** " + msg.Err.Error())
 		}
 		m.Status = "error: " + msg.Err.Error()
+		// A failed fetch must not leave an empty picker open either.
+		m.closeEmptyPickers()
 		return m, nil
 	}
 	return m, nil
@@ -1095,6 +1474,33 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+	// Variant picker navigation.
+	if m.PickingVariant {
+		switch msg.String() {
+		case "up", "k":
+			if m.PickIdx > 0 {
+				m.PickIdx--
+			}
+			return m, nil
+		case "down", "j":
+			if m.PickIdx+1 < len(m.VariantOptions) {
+				m.PickIdx++
+			}
+			return m, nil
+		case "enter":
+			if m.PickIdx < len(m.VariantOptions) {
+				m.Effort = llm.NormalizeEffort(m.VariantOptions[m.PickIdx])
+				m.PickingVariant = false
+				m.pushSystem("variant → " + llm.EffortLabel(m.Effort))
+				return m, nil
+			}
+			m.PickingVariant = false
+			return m, nil
+		case "esc":
+			m.PickingVariant = false
+			return m, nil
+		}
+	}
 	// Session picker navigation.
 	if m.Picking {
 		switch msg.String() {
@@ -1111,9 +1517,25 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.PickIdx < len(m.Sessions) {
 				m.Session = m.Sessions[m.PickIdx]
-				m.Agent = m.Session.Agent
-				m.Perm = m.Session.PermissionMode
+				if m.Session.Agent != "" {
+					m.Agent = m.Session.Agent
+				}
+				if m.Session.PermissionMode != "" {
+					m.Perm = m.Session.PermissionMode
+				}
 				m.pushSystem("attached → " + m.Session.ID)
+				m.Picking = false
+				// See AttachedMsg: rebuild the timeline for the new
+				// session instead of showing the previous one's rows.
+				m.Pending = ""
+				m.PendingThinking = ""
+				m.Working = false
+				m.Status = ""
+				m.Modal = nil
+				m.QModal = nil
+				if cmd := m.resyncCmd(); cmd != nil {
+					return m, cmd
+				}
 			}
 			m.Picking = false
 			return m, nil
@@ -1219,8 +1641,9 @@ func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.Client != nil && m.Session != nil {
 			id, t := m.Session.ID, text
 			c := m.Client
+			effort := m.Effort
 			return m, func() tea.Msg {
-				if err := c.Prompt(bg(), id, sdk.PromptInput{Text: t, Delivery: delivery}); err != nil {
+				if err := c.Prompt(bg(), id, sdk.PromptInput{Text: t, Delivery: delivery, Effort: effort}); err != nil {
 					return ErrMsg{err}
 				}
 				return nil
@@ -1457,11 +1880,26 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 		if err := jsonUnmarshal(e.Data, &d); err == nil {
 			if s := d["stage"]; s != "" {
 				m.Status = s
+				// A progress row for an apparently-idle session means we
+				// missed turn.started while disconnected: recover the
+				// spinner instead of looking stuck.
+				if !m.Working && !strings.HasPrefix(s, "queued #") {
+					m.Working = true
+					m.TurnStart = time.Now()
+				}
 			}
 		}
 	case "turn.delta":
 		var d map[string]string
 		if err := jsonUnmarshal(e.Data, &d); err == nil {
+			if d["delta"] != "" || d["thinking"] != "" {
+				// Same missed-started recovery as progress: a delta
+				// implies a live turn even without a prior started.
+				if !m.Working {
+					m.Working = true
+					m.TurnStart = time.Now()
+				}
+			}
 			// Cap the live buffer; the final text arrives via turn.completed.
 			if len([]rune(m.Pending+m.PendingThinking)) < 4000 {
 				m.Pending += d["delta"]
@@ -1481,6 +1919,11 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 			tool, _ := d["tool"].(string)
 			target, _ := d["target"].(string)
 			if tool != "" {
+				// Missed-started recovery (see progress/delta above).
+				if !m.Working {
+					m.Working = true
+					m.TurnStart = time.Now()
+				}
 				st := "tool: " + tool
 				if target != "" {
 					st += " " + truncate(target, 60)
@@ -1569,6 +2012,12 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 		}
 		m.QModal = qm
 		m.Status = "question: awaiting answer"
+		// A blocked turn is still in-flight: keep the spinner so the wait
+		// never looks like a stall.
+		if !m.Working {
+			m.Working = true
+			m.TurnStart = time.Now()
+		}
 	case "permission.resolved":
 		var d map[string]string
 		if err := jsonUnmarshal(e.Data, &d); err == nil {
@@ -1593,6 +2042,12 @@ func (m Model) updateEvent(e sdk.Event) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.Modal = modal
+		m.Status = "waiting approval: " + strings.TrimSpace(modal.Tool+" "+modal.Target)
+		// A blocked turn is still in-flight (see question.asked above).
+		if !m.Working {
+			m.Working = true
+			m.TurnStart = time.Now()
+		}
 	}
 	return m, nil
 }
@@ -1605,7 +2060,7 @@ func (m Model) View() string {
 	var sb strings.Builder
 	agentPill := agentStyle.Render(" " + strings.ToUpper(m.Agent) + " ")
 	permPill := permStyle(m.Perm).Render(" " + strings.ToUpper(m.Perm) + " ")
-	fmt.Fprintf(&sb, "%s %s  %s%s\n", agentPill, permPill, dimStyle.Render(sessID(m.Session)), ctxPill(m.CtxUsed, m.CtxMax))
+	fmt.Fprintf(&sb, "%s %s %s %s%s\n", agentPill, permPill, variantPill(m.Effort), dimStyle.Render(sessID(m.Session)), ctxPill(m.CtxUsed, m.CtxMax))
 	sb.WriteString(strings.Repeat("─", maxInt(20, m.Width)) + "\n")
 	lines := m.flatLines()
 	if m.Height > 0 {
@@ -1649,19 +2104,23 @@ func (m Model) View() string {
 		sb.WriteString(m.renderPending() + "\n")
 	}
 	if m.Modal != nil {
-		sb.WriteString(modalStyle.Render(m.renderModal()) + "\n")
+		sb.WriteString(permModalStyle.Render(m.renderModal()) + "\n")
 	}
 	if m.QModal != nil {
-		sb.WriteString(modalStyle.Render(m.renderQuestionModal()) + "\n")
+		sb.WriteString(questionModalStyle.Render(m.renderQuestionModal()) + "\n")
 	}
 	if m.Picking {
-		sb.WriteString(dimStyle.Render("(picker: choose session, enter to attach, esc to close)") + "\n")
+		sb.WriteString(dimStyle.Render("(picker: previous sessions in this workspace, enter to attach, esc to close)") + "\n")
 		for i, s := range m.Sessions {
 			mark := "  "
 			if i == m.PickIdx {
 				mark = "> "
 			}
-			sb.WriteString(dimStyle.Render(mark+s.ID+" · "+s.Agent) + "\n")
+			label := s.ID + " · " + s.Agent
+			if s.Title != "" {
+				label += " · " + truncate(s.Title, 40)
+			}
+			sb.WriteString(dimStyle.Render(mark+label) + "\n")
 		}
 	}
 	if m.PickingConnect {
@@ -1684,6 +2143,20 @@ func (m Model) View() string {
 			sb.WriteString(dimStyle.Render(mark+opt) + "\n")
 		}
 	}
+	if m.PickingVariant {
+		sb.WriteString(dimStyle.Render("(picker: choose variant "+strings.Join(llm.EffortVariants, "|")+", enter to select, esc to close)") + "\n")
+		for i, opt := range m.VariantOptions {
+			mark := "  "
+			if i == m.PickIdx {
+				mark = "> "
+			}
+			cur := ""
+			if llm.NormalizeEffort(opt) == llm.NormalizeEffort(m.Effort) {
+				cur = " ●"
+			}
+			sb.WriteString(dimStyle.Render(mark+opt+cur) + "\n")
+		}
+	}
 	if m.Completing && len(m.CompleteOptions) > 0 {
 		sb.WriteString(dimStyle.Render("(tab: complete · esc: dismiss)") + "\n")
 		for i, opt := range m.CompleteOptions {
@@ -1702,9 +2175,9 @@ func (m Model) View() string {
 	}
 	sb.WriteString(renderInputLine(m.Input, m.Cursor, m.Width) + "\n")
 	if m.Status != "" {
-		sb.WriteString(dimStyle.Render(m.Status) + "\n")
+		sb.WriteString(statusStyle(m.Status).Render(m.Status) + "\n")
 	}
-	sb.WriteString(dimStyle.Render("tab plan↔build · shift+tab approval · pgup/pgdn scroll · enter steers · ctrl+x queues · /resume /undo /compact") + "\n")
+	sb.WriteString(dimStyle.Render("tab plan↔build · shift+tab approval · pgup/pgdn scroll · enter steers · ctrl+x queues · /model /variant /resume /undo /compact") + "\n")
 	return sb.String()
 }
 
@@ -1759,11 +2232,11 @@ func renderInputLine(input string, cursor, width int) string {
 }
 
 // renderPending draws the live-streamed turn without markdown work:
-// thinking dimmed, text plain. The final turn.completed render replaces it.
+// thinking in purple, text plain. The final turn.completed render replaces it.
 func (m Model) renderPending() string {
 	var sb strings.Builder
 	if m.ShowThinking && m.PendingThinking != "" {
-		sb.WriteString(dimStyle.Render("… "+tailRunes(m.PendingThinking, 800)) + "\n")
+		sb.WriteString(thinkStyle.Render("… "+tailRunes(m.PendingThinking, 800)) + "\n")
 	}
 	sb.WriteString(tailRunes(m.Pending, 1500) + "▊")
 	return sb.String()
@@ -1859,7 +2332,7 @@ func (m Model) renderModal() string {
 	var parts []string
 	for i, o := range opts {
 		if i == m.Modal.Cursor {
-			parts = append(parts, "[ "+o+" ]")
+			parts = append(parts, selectedStyle.Render("[ "+o+" ]"))
 		} else {
 			parts = append(parts, "  "+o+"  ")
 		}
@@ -1883,10 +2356,12 @@ func (m Model) renderQuestionModal() string {
 	sb.WriteString(q.Question + "\n")
 	for i, o := range q.Options {
 		mark := "  "
+		label := fmt.Sprintf("%d. %s", i+1, o.Label)
 		if i == qm.Cursor {
 			mark = "> "
+			label = selectedStyle.Render(label)
 		}
-		fmt.Fprintf(&sb, "%s%d. %s", mark, i+1, o.Label)
+		fmt.Fprintf(&sb, "%s%s", mark, label)
 		if o.Description != "" {
 			sb.WriteString(" — " + o.Description)
 		}
@@ -1900,8 +2375,97 @@ var (
 	agentStyle = lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("62")).Foreground(lipgloss.Color("230"))
 	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	modalStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	ctxStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	// Approval modal: yellow border so a blocked turn scans apart.
+	permModalStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("220")).Padding(0, 1)
+	// Question modal: cyan border, distinct from approvals and errors.
+	questionModalStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("86")).Padding(0, 1)
+	ctxStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+
+	// Timeline group colors, derived from the daemon event log:
+	// turn.delta thinking + thinking…/summarizing… stages → purple;
+	// turn.tool names grouped like the headless ▸ log + web READ_TOOLS:
+	// reads → blue, edits → green, bash/exec → orange, web → teal,
+	// plans/questions → yellow, failures → red.
+	thinkStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("141")).Italic(true)
+	readToolStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	editToolStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
+	execToolStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
+	webToolStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
+	planToolStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	errToolStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
+	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Bold(true)
 )
+
+// toolGroup buckets a turn.tool name the way the logs group it: read-only
+// inspection (web READ_TOOLS parity), file mutation, command execution
+// (bash/task_output/subagent/mcp — the "command running" lane), web fetch,
+// and planning/question plumbing.
+func toolGroup(tool string) string {
+	switch strings.ToLower(strings.TrimSpace(tool)) {
+	case "read", "grep", "glob", "lsp", "kb_query", "skill":
+		return "read"
+	case "edit", "write", "patch", "memory_write":
+		return "edit"
+	case "bash", "task_output", "subagent", "mcp":
+		return "exec"
+	case "webfetch", "websearch":
+		return "web"
+	case "question", "todowrite":
+		return "plan"
+	default:
+		return "other"
+	}
+}
+
+// toolLineStyle maps one tool to its timeline color; errors always win red.
+func toolLineStyle(tool string, isErr bool) lipgloss.Style {
+	if isErr {
+		return errToolStyle
+	}
+	switch toolGroup(tool) {
+	case "read":
+		return readToolStyle
+	case "edit":
+		return editToolStyle
+	case "exec":
+		return execToolStyle
+	case "web":
+		return webToolStyle
+	case "plan":
+		return planToolStyle
+	default:
+		return dimStyle
+	}
+}
+
+// statusStyle colors the one-line status by lane: thinking purple, tool
+// steps by group, approvals yellow, questions cyan, failures red.
+func statusStyle(s string) lipgloss.Style {
+	lower := strings.ToLower(s)
+	switch {
+	case strings.Contains(lower, "error") || strings.Contains(lower, "failed") || strings.Contains(lower, "denied"):
+		return errToolStyle
+	case strings.HasPrefix(lower, "tool:"):
+		fields := strings.Fields(s)
+		tool := ""
+		if len(fields) >= 2 {
+			tool = fields[1]
+		}
+		return toolLineStyle(tool, false)
+	case strings.Contains(lower, "thinking") || strings.Contains(lower, "working") || strings.Contains(lower, "summarizing"):
+		return thinkStyle
+	case strings.Contains(lower, "approval") || strings.Contains(lower, "permission"):
+		return planToolStyle
+	case strings.Contains(lower, "question"):
+		return webToolStyle
+	case strings.Contains(lower, "queue") || strings.Contains(lower, "steer"):
+		return webToolStyle
+	case strings.Contains(lower, "background done") || strings.Contains(lower, "subagent"):
+		return execToolStyle
+	default:
+		return dimStyle
+	}
+}
 
 // ctxPill renders the live context gauge (" ctx ~12.3k/128k"), or "" when
 // no estimate has arrived yet (old daemons).
@@ -1913,6 +2477,12 @@ func ctxPill(used, max int) string {
 		return ctxStyle.Render(fmt.Sprintf("  ctx ~%s/%s", formatTokens(used), formatTokens(max)))
 	}
 	return ctxStyle.Render(fmt.Sprintf("  ctx ~%s", formatTokens(used)))
+}
+
+// variantPill renders the current reasoning-effort variant (" variant:xhigh",
+// auto when empty) so the header always shows what /variant selected.
+func variantPill(effort string) string {
+	return ctxStyle.Render(" variant:" + llm.EffortLabel(effort))
 }
 
 func permStyle(p string) lipgloss.Style {

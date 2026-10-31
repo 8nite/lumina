@@ -89,8 +89,15 @@ func (p *Anthropic) Chat(ctx context.Context, req Request) (<-chan Chunk, error)
 	}
 	body := map[string]interface{}{
 		"model": req.Model, "messages": msgs, "stream": true,
-		"max_tokens": maxOr(req.MaxTokens, 4096),
 	}
+	maxTokens := maxOr(req.MaxTokens, 4096)
+	if budget := EffortBudget(req.ReasoningEffort); budget > 0 {
+		if maxTokens < budget+1024 {
+			maxTokens = budget + 1024
+		}
+		body["thinking"] = map[string]interface{}{"type": "enabled", "budget_tokens": budget}
+	}
+	body["max_tokens"] = maxTokens
 	if system != "" {
 		body["system"] = system
 	}

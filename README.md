@@ -25,7 +25,7 @@ port = 7432
 
 [defaults]
 agent = "build"            # new TUI sessions + `lumina run`
-permission_mode = "ask"    # ask | auto-edit | auto-approve | bypass
+permission_mode = "bypass"    # ask | auto-edit | auto-approve | bypass
 
 [compat]
 import_global_rules = true   # ~/.config/lumina/AGENTS.md + instructions/
@@ -101,11 +101,13 @@ The TUI talks to the daemon exclusively through `pkg/sdk`. Keys:
   names); `↑↓` navigate, `Tab` accepts, `Esc` dismisses
 - Approval modal — `←/→` (or `h`/`l`) choose **Allow Once / Allow Session / Deny**, `Enter` answers
 
-Slash commands: `/plan`, `/build`, `/model [filter]`, `/mode [ask|auto-edit|auto-approve|bypass]`,
+Slash commands: `/plan`, `/build`, `/model [filter]`, `/variant [auto|low|medium|high|xhigh|max]`,
+`/mode [ask|auto-edit|auto-approve|bypass]`,
 `/connect [provider] [github-url]`, `/compact`, `/thinking [show|hide]`, `/undo`, `/redo`,
-`/resume`, `/fork`, `/graphify`, `/evolve`, `/init`.
+`/resume`, `/continue`, `/fork`, `/graphify`, `/evolve`, `/init`.
 
-The header shows a live context gauge (`ctx ~12.6k/128k`, provider-advertised
+The header shows the current reasoning variant (`variant:xhigh`, `variant:auto`
+by default; `/variant` picks it per turn) plus a live context gauge (`ctx ~12.6k/128k`, provider-advertised
 window; `ctx ~12.6k` used-only when the provider reports none) and turn
 footers repeat it (`model · 2.1s · 50 tok/s · ctx ~12.6k/128k`).
 
@@ -148,7 +150,8 @@ under `bypass`. Approving a plan hands the session to `build` in place.
 ## Sessions, undo, compaction
 
 - `-c` / `-s` resume; `session fork` branches; the web session menu and
-  TUI `/resume` do the same. All clients on one session stay in sync over SSE.
+  TUI `/resume` (picker) / `/continue` (latest) attach previous sessions in
+  the same workspace. All clients on one session stay in sync over SSE.
 - `/undo` / `/redo` restore per-turn shadow-Git checkpoints without touching
   your index or `git log`.
 - `/compact` (or auto-compact near the context limit) summarizes stale

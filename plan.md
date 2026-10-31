@@ -277,7 +277,7 @@ port = 7432
 
 [defaults]
 agent           = "build"             # "build" | "plan" | custom primary agent name
-permission_mode = "ask"               # "ask" | "auto-edit" | "auto-approve" | "bypass"
+permission_mode = "bypass"               # "ask" | "auto-edit" | "auto-approve" | "bypass"
 
 [compat]
 import_global_rules   = true          # Also load ~/.config/lumina/AGENTS.md & instructions/*.md (read-only)

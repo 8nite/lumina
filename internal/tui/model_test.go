@@ -646,6 +646,75 @@ func TestParseQuestionAnswer(t *testing.T) {
 	}
 }
 
+func TestVariantCommand(t *testing.T) {
+	m := testModel()
+	if m.Effort != "" {
+		t.Fatalf("default variant must be auto, got %q", m.Effort)
+	}
+	// Direct set, case-insensitive (xhigh is the requested example).
+	m.ApplyCommand("/variant XHIGH")
+	if m.Effort != "xhigh" {
+		t.Fatalf("variant=%q want xhigh", m.Effort)
+	}
+	if v := m.View(); !strings.Contains(v, "variant:xhigh") {
+		t.Fatalf("header missing variant pill:\n%s", v)
+	}
+	// /effort alias + auto reset.
+	m.ApplyCommand("/effort auto")
+	if m.Effort != "" {
+		t.Fatalf("auto must clear to %q, got %q", "", m.Effort)
+	}
+	// Bare command opens the picker with all six variants.
+	m.ApplyCommand("/variant")
+	if !m.PickingVariant || len(m.VariantOptions) != 6 {
+		t.Fatalf("picker=%v options=%v", m.PickingVariant, m.VariantOptions)
+	}
+	// Unknown names report the choices without changing state.
+	m.PickingVariant = false
+	m.ApplyCommand("/variant ultra")
+	if m.PickingVariant || m.Effort != "" {
+		t.Fatalf("unknown must not change state: effort=%q picking=%v", m.Effort, m.PickingVariant)
+	}
+	// Picker enter applies the highlighted variant.
+	m.ApplyCommand("/variant")
+	m.PickIdx = 4 // xhigh in auto/low/medium/high/xhigh/max order
+	next, _ := m.Update(key("", tea.KeyEnter))
+	m = next.(Model)
+	if m.Effort != "xhigh" || m.PickingVariant {
+		t.Fatalf("picker enter: effort=%q picking=%v", m.Effort, m.PickingVariant)
+	}
+}
+
+func TestVariantPromptCarriesEffort(t *testing.T) {
+	var gotEffort, gotText string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/sessions/s1/prompt" {
+			var body map[string]interface{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotText, _ = body["text"].(string)
+			gotEffort, _ = body["effort"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	m := New(sdk.New(srv.URL, ""), &sdk.Session{ID: "s1", Agent: "build", PermissionMode: "ask"})
+	m.ApplyCommand("/variant high")
+	m.Input = "hello"
+	next, cmd := m.Update(key("", tea.KeyEnter))
+	_ = next
+	if cmd == nil {
+		t.Fatal("expected prompt cmd")
+	}
+	if msg := cmd(); msg != nil {
+		t.Fatalf("prompt should succeed silently, got %#v", msg)
+	}
+	if gotText != "hello" || gotEffort != "high" {
+		t.Fatalf("prompt body: text=%q effort=%q", gotText, gotEffort)
+	}
+}
+
 func TestQuestionAskedEvent(t *testing.T) {
 	m := testModel()
 	next, _ := m.Update(ctxEvent("question.asked", "s1", map[string]interface{}{

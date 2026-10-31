@@ -52,6 +52,9 @@ func runTUIClient(c *sdk.Client, f tuiFlags) error {
 	// stream resumes instead of leaving the timeline stuck at working…
 	// (a turn still running server-side keeps Working until its real
 	// terminal event arrives, so disconnects stay silent by design).
+	// After every (re)connect the client requests a resync: transcript +
+	// running flag + pending prompts reconcile anything missed while the
+	// stream was down (same reload recovery as the web UI).
 	done := make(chan struct{})
 	go func() {
 		delay := time.Second
@@ -65,6 +68,9 @@ func runTUIClient(c *sdk.Client, f tuiFlags) error {
 				return
 			default:
 			}
+			// The stream dropped (or never connected): reconcile anything
+			// missed while down. Init() already covers startup.
+			p.Send(tui.RequestResyncMsg{})
 			time.Sleep(delay)
 			if delay < 15*time.Second {
 				delay *= 2

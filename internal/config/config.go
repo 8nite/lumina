@@ -116,7 +116,7 @@ type Config struct {
 func Defaults() *Config {
 	return &Config{
 		Server:   ServerConfig{Host: "127.0.0.1", Port: 7432},
-		Defaults: DefaultsConfig{Agent: "build", PermissionMode: "ask"},
+		Defaults: DefaultsConfig{Agent: "build", PermissionMode: "bypass"},
 		Compat:   CompatConfig{ImportGlobalRules: true, ImportGlobalSkills: true},
 		Permissions: map[string]string{
 			"edit":               "allow",

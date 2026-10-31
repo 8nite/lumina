@@ -102,8 +102,8 @@ func (p *Responses) Chat(ctx context.Context, req Request) (<-chan Chunk, error)
 	if instructions != "" {
 		body["instructions"] = instructions
 	}
-	if req.ReasoningEffort != "" {
-		body["reasoning"] = map[string]interface{}{"effort": req.ReasoningEffort}
+	if e := NormalizeEffort(req.ReasoningEffort); e != "" {
+		body["reasoning"] = map[string]interface{}{"effort": e}
 	}
 	if len(req.Tools) > 0 {
 		var tools []map[string]interface{}
@@ -118,6 +118,8 @@ func (p *Responses) Chat(ctx context.Context, req Request) (<-chan Chunk, error)
 	sid := newSessionID()
 	resp, err := postJSON(ctx, url, p.APIKey, body, map[string]string{
 		"x-lumina-session": sid,
+		// opencode zen routes on this header; harmless elsewhere.
+		"x-opencode-session": sid,
 	})
 	if err != nil {
 		return nil, err

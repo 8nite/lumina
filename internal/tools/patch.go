@@ -34,24 +34,46 @@ type patchChunk struct {
 	endOfFile     bool
 }
 
+// isPatchBegin accepts "*** Begin Patch" with or without trailing "***"
+// (docs and prompts use the ***-wrapped form; be liberal here).
+func isPatchBegin(line string) bool {
+	return line == "*** Begin Patch" || line == "*** Begin Patch ***"
+}
+
+// isPatchEnd accepts "*** End Patch" with or without trailing "***".
+func isPatchEnd(line string) bool {
+	return line == "*** End Patch" || line == "*** End Patch ***"
+}
+
+// stripPatchStars removes an optional trailing "***" from a file header
+// (models emit "*** Add File: a.txt ***" per docs; parser must not treat
+// the stars as part of the path).
+func stripPatchStars(p string) string {
+	p = strings.TrimSpace(p)
+	if strings.HasSuffix(p, "***") {
+		p = strings.TrimSpace(strings.TrimSuffix(p, "***"))
+	}
+	return p
+}
+
 func parsePatch(patchText string) ([]patchHunk, error) {
 	text := stripPatchHeredoc(strings.TrimSpace(patchText))
 	lines := strings.Split(text, "\n")
 	for i, l := range lines {
 		lines[i] = strings.TrimSuffix(l, "\r")
 	}
-	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "*** Begin Patch" {
-		return nil, fmt.Errorf("patch: first line must be '*** Begin Patch'")
+	if len(lines) == 0 || !isPatchBegin(strings.TrimSpace(lines[0])) {
+		return nil, fmt.Errorf("patch: first line must be '*** Begin Patch ***'")
 	}
 	end := -1
 	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.TrimSpace(lines[i]) == "*** End Patch" {
+		if isPatchEnd(strings.TrimSpace(lines[i])) {
 			end = i
 			break
 		}
 	}
 	if end <= 0 {
-		return nil, fmt.Errorf("patch: last line must be '*** End Patch'")
+		return nil, fmt.Errorf("patch: last line must be '*** End Patch ***'")
 	}
 	var hunks []patchHunk
 	i := 1
@@ -59,7 +81,7 @@ func parsePatch(patchText string) ([]patchHunk, error) {
 		header := strings.TrimSpace(lines[i])
 		switch {
 		case strings.HasPrefix(header, "*** Add File: "):
-			p := strings.TrimSpace(strings.TrimPrefix(header, "*** Add File: "))
+			p := stripPatchStars(strings.TrimPrefix(header, "*** Add File: "))
 			if p == "" {
 				return nil, fmt.Errorf("patch: line %d: Add File needs a path", i+1)
 			}
@@ -74,7 +96,7 @@ func parsePatch(patchText string) ([]patchHunk, error) {
 			}
 			hunks = append(hunks, patchHunk{typ: "add", path: p, contents: strings.Join(content, "\n")})
 		case strings.HasPrefix(header, "*** Delete File: "):
-			p := strings.TrimSpace(strings.TrimPrefix(header, "*** Delete File: "))
+			p := stripPatchStars(strings.TrimPrefix(header, "*** Delete File: "))
 			if p == "" {
 				return nil, fmt.Errorf("patch: line %d: Delete File needs a path", i+1)
 			}
@@ -87,7 +109,7 @@ func parsePatch(patchText string) ([]patchHunk, error) {
 			}
 			hunks = append(hunks, patchHunk{typ: "delete", path: p})
 		case strings.HasPrefix(header, "*** Update File: "):
-			p := strings.TrimSpace(strings.TrimPrefix(header, "*** Update File: "))
+			p := stripPatchStars(strings.TrimPrefix(header, "*** Update File: "))
 			if p == "" {
 				return nil, fmt.Errorf("patch: line %d: Update File needs a path", i+1)
 			}
@@ -97,7 +119,7 @@ func parsePatch(patchText string) ([]patchHunk, error) {
 				i++
 			}
 			if mv := strings.TrimSpace(lines[i]); mv == "*** Move to:" || strings.HasPrefix(mv, "*** Move to: ") {
-				move = strings.TrimSpace(strings.TrimPrefix(mv, "*** Move to:"))
+				move = stripPatchStars(strings.TrimPrefix(mv, "*** Move to:"))
 				if move == "" {
 					return nil, fmt.Errorf("patch: line %d: Move destination for '%s' must not be empty", i+1, p)
 				}
@@ -117,7 +139,7 @@ func parsePatch(patchText string) ([]patchHunk, error) {
 }
 
 func isPatchBoundary(line string) bool {
-	return line == "*** End Patch" ||
+	return isPatchEnd(line) ||
 		strings.HasPrefix(line, "*** Add File: ") ||
 		strings.HasPrefix(line, "*** Delete File: ") ||
 		strings.HasPrefix(line, "*** Update File: ")
@@ -395,11 +417,12 @@ func (r *Registry) doPatch(_ context.Context, sc SecCtx, args map[string]interfa
 			if p == "" {
 				continue
 			}
-			resolved := p
-			if !filepath.IsAbs(p) {
-				resolved = filepath.Join(sc.WorkspaceDir, p)
+			expanded := security.ExpandHome(p)
+			resolved := expanded
+			if !filepath.IsAbs(expanded) {
+				resolved = filepath.Join(sc.WorkspaceDir, expanded)
 			}
-			if !insideWorkspace(sc.WorkspaceDir, resolved) {
+			if !insideWorkspace(sc.WorkspaceDir, resolved) && !security.IsWhitelistedWrite(resolved) {
 				return Result{}, fmt.Errorf("patch: path escapes workspace: %s", p)
 			}
 			if security.IsCredentialPath(resolved) {
@@ -419,10 +442,11 @@ func (r *Registry) doPatch(_ context.Context, sc SecCtx, args map[string]interfa
 		return Result{}, fmt.Errorf("patch: %s", msg)
 	}
 	resolve := func(p string) string {
-		if filepath.IsAbs(p) {
-			return p
+		e := security.ExpandHome(p)
+		if filepath.IsAbs(e) {
+			return e
 		}
-		return filepath.Join(sc.WorkspaceDir, p)
+		return filepath.Join(sc.WorkspaceDir, e)
 	}
 	for _, h := range hunks {
 		switch h.typ {
@@ -484,7 +508,7 @@ func patchFirstPath(patchText string) string {
 		t := strings.TrimSpace(line)
 		for _, prefix := range []string{"*** Add File: ", "*** Update File: ", "*** Delete File: "} {
 			if strings.HasPrefix(t, prefix) {
-				if p := strings.TrimSpace(strings.TrimPrefix(t, prefix)); p != "" {
+				if p := stripPatchStars(strings.TrimPrefix(t, prefix)); p != "" {
 					return p
 				}
 			}

@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -187,6 +189,44 @@ func renderToolGuidance(specs []llm.ToolSpec) string {
 	return sb.String()
 }
 
+// skillsBlock renders the plan.md §6.1 advertisement: every discovered
+// skill's name + description ships in the system prompt; the full SKILL.md
+// body stays lazy behind the `skill` tool. Empty bundle renders "".
+func skillsBlock(bundle *rules.Bundle) string {
+	if bundle == nil || len(bundle.Skills) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("# Available skills (load via `skill` tool)\n")
+	for _, s := range bundle.Skills {
+		desc := strings.TrimSpace(s.Description)
+		if desc == "" {
+			desc = "no description"
+		}
+		sb.WriteString("- " + s.Name + ": " + desc + "\n")
+	}
+	return sb.String()
+}
+
+// withSkillList annotates the `skill` tool description with the available
+// skill names so the model can answer "what skills do you have" and pick
+// the right one without a prior round-trip.
+func withSkillList(specs []llm.ToolSpec, bundle *rules.Bundle) []llm.ToolSpec {
+	if bundle == nil || len(bundle.Skills) == 0 {
+		return specs
+	}
+	names := make([]string, 0, len(bundle.Skills))
+	for _, s := range bundle.Skills {
+		names = append(names, s.Name)
+	}
+	for i, sp := range specs {
+		if strings.ToLower(sp.Name) == "skill" {
+			specs[i].Description = sp.Description + " Available: " + strings.Join(names, ", ") + "."
+		}
+	}
+	return specs
+}
+
 // envBlock renders the opencode-parity environment block (builtins.ts):
 // today's date plus working directory, git presence, platform, and tmp
 // preference. Pure string surgery — zero LLM tokens.
@@ -291,7 +331,7 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 		return reply, nil
 	}
 	bundle := r.rulesFn(sess.WorkspaceDir)
-	specs := toolSpecs()
+	specs := withSkillList(toolSpecs(), bundle)
 	if r.tools != nil && r.tools.WebSearchDisabled {
 		specs = withoutTool(specs, "websearch")
 	}
@@ -317,6 +357,7 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 			"- agent: " + sess.Agent + " (plan=read-only except plan.md/.lumina/plans; build=full)\n" +
 			"- permission_mode: " + sess.PermissionMode + "\n\n" +
 			envBlock(sess.WorkspaceDir) + "\n\n" +
+			skillsBlock(bundle) + "\n" +
 			toolGuidanceBase + "\n" + renderToolGuidance(specs) + "\n" + vaultGuidance + "\n",
 	}}
 	for _, t := range turns {
@@ -378,9 +419,47 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 	// Images ride the first request only; follow-up rounds are text.
 	in.Images = nil
 	// Agentic loop: feed tool results back until the model stops calling
-	// tools (cap rounds so a confused model can't spin forever).
-	const maxRounds = 8
-	for round := 0; round < maxRounds && len(calls) > 0; round++ {
+	// tools. The soft cap is a progress checkpoint (tools stay on, the
+	// model restates done-vs-remaining and keeps going); only the hard
+	// cap ends the turn with a summary — so long tasks continue instead
+	// of dying 8 rounds in with work still queued.
+	const softCap, hardCap = 8, 40
+	// Loop guard: an identical tool round (same calls, same args) three
+	// times in a row means the model is stuck — e.g. re-running a green
+	// check whose empty output teaches nothing. task_output polling is
+	// exempt: re-polling one background task to completion is progress
+	// by design, not a loop.
+	prevRoundKey := ""
+	repeatStreak := 0
+	// Per-call repeat ledger: catches the slower burn the round guard
+	// misses — the same invocation re-executed across mixed rounds (e.g.
+	// re-reading one file or re-posting one todo status six times while
+	// alternating other calls). Keyed by toolCallKey, so task_output
+	// polls stay exempt here too.
+	seenCalls := map[string]int{}
+	for round := 0; round < hardCap && len(calls) > 0; round++ {
+		roundKey := roundCallKey(calls)
+		if roundKey != "" && roundKey == prevRoundKey {
+			repeatStreak++
+		} else {
+			repeatStreak = 1
+			prevRoundKey = roundKey
+		}
+		// Persist the model's in-between text before its tool turns so
+		// the transcript stays in true time order (this reasoning was
+		// previously kept only in memory — only the final reply was
+		// stored, forcing the UI to group all tools above one text).
+		if strings.TrimSpace(text2) != "" {
+			interim, rerr := r.store.resolveRefs(sessionID, text2)
+			if rerr != nil {
+				finishTurn()
+				return "", rerr
+			}
+			if _, rerr := r.store.AddTurn(sessionID, "", "assistant", interim); rerr != nil {
+				finishTurn()
+				return "", rerr
+			}
+		}
 		var feedback strings.Builder
 		for _, c := range calls {
 			if r.tools == nil {
@@ -391,20 +470,42 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 				WorkspaceDir: sess.WorkspaceDir, SessionID: sessionID,
 			}
 			r.progress(sessionID, "tool: "+c.Name)
+			label := toolLabel(c.Name, c.Args)
 			res, terr := r.callWithApproval(ctx, sessionID, sc, c.Name, c.Args)
+			if key := toolCallKey(c.Name, c.Args); key != "" {
+				seenCalls[key]++
+				// Third identical execution: name the call and tell the
+				// model to stop. Fires once per call per turn (== 3, not
+				// >=) so the nudge doesn't itself become transcript spam.
+				if seenCalls[key] == 3 {
+					fmt.Fprintf(&feedback, "Loop guard: identical `%s` call already ran 3 times this turn with no new result. Do NOT call it again with the same arguments — change approach (different args or tool) or give the final text answer now.\n\n", label)
+				}
+			}
 			if terr != nil {
-				_, _ = r.store.AddTurn(sessionID, "", "tool_error", fmt.Sprintf("%s: %v", c.Name, terr))
-				fmt.Fprintf(&feedback, "Tool %s error:\n%v\n\n", c.Name, terr)
+				_, _ = r.store.AddTurn(sessionID, "", "tool_error", label+": "+terr.Error())
+				fmt.Fprintf(&feedback, "Tool %s error:\n%v\n\n", label, terr)
 				continue
 			}
-			_, _ = r.store.AddTurn(sessionID, "", "tool", c.Name+": "+res.Output)
-			fmt.Fprintf(&feedback, "Tool %s result:\n%s\n\n", c.Name, res.Output)
+			stored := label
+			if res.Output != "" {
+				stored += "\n" + res.Output
+			}
+			_, _ = r.store.AddTurn(sessionID, "", "tool", stored)
+			fmt.Fprintf(&feedback, "Tool %s result:\n%s\n\n", label, res.Output)
 		}
 		if err := ctx.Err(); err != nil {
 			finishTurn()
 			return "", err
 		}
-		userMsg := "Tool results:\n" + feedback.String() + "Continue the task; call more tools if needed, else give the final answer."
+		userMsg := "Tool results:\n" + feedback.String()
+		if (round+1)%softCap == 0 {
+			userMsg += "Checkpoint: briefly note what is done vs remaining, then continue the task; call more tools if needed, else give the final answer."
+		} else {
+			userMsg += "Continue the task; call more tools if needed, else give the final answer."
+		}
+		if repeatStreak >= 3 && len(calls) > 0 {
+			userMsg += fmt.Sprintf(" Loop guard: this is the %d-th identical tool round in a row (%s) with no new result. Do NOT call the same tool with the same arguments again — change approach (different args or tool) or give the final text answer now.", repeatStreak, toolLabel(calls[0].Name, calls[0].Args))
+		}
 		if s := r.takeSteered(sessionID); s != "" {
 			// Steered input joins the active turn.
 			_, _ = r.store.AddTurn(sessionID, "", "user", s)
@@ -608,6 +709,58 @@ func (r *Runner) callWithApproval(ctx context.Context, sessionID string, sc tool
 	default:
 		return tools.Result{}, fmt.Errorf("tool %q target %q: denied by user (permission_mode=%s agent=%s)", name, target, sc.Permission, sc.Agent)
 	}
+}
+
+// toolLabel prefixes a transcript turn with its target (command/path/URL)
+// so repeats stay distinguishable after compaction drops the call args.
+// ponytail: the name still leads, so prefix-based parsing keeps working.
+func toolLabel(name string, args map[string]interface{}) string {
+	if len(args) == 0 {
+		return name
+	}
+	target := approvalTarget(name, args)
+	if target == "" || strings.EqualFold(target, name) {
+		return name
+	}
+	return name + ": " + target
+}
+
+// toolCallKey canonicalizes one invocation for loop detection: lowercase
+// name plus sorted args. task_output returns "" (exempt — polling one
+// background task to completion is progress, not a loop).
+func toolCallKey(name string, args map[string]interface{}) string {
+	if strings.ToLower(name) == "task_output" {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString(strings.ToLower(name))
+	sb.WriteString("|")
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		b, err := json.Marshal(args[k])
+		if err != nil {
+			fmt.Fprintf(&sb, "%s=%v;", k, args[k])
+			continue
+		}
+		sb.WriteString(k + "=" + string(b) + ";")
+	}
+	return sb.String()
+}
+
+// roundCallKey joins one round's calls; "" when the round carries no
+// detectable calls (e.g. only task_output polls).
+func roundCallKey(calls []llm.ToolCallRequest) string {
+	var parts []string
+	for _, c := range calls {
+		if k := toolCallKey(c.Name, c.Args); k != "" {
+			parts = append(parts, k)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // approvalTarget mirrors tools.toolTarget (unexported there) so the broker
@@ -837,8 +990,8 @@ func toolSpecs() []llm.ToolSpec {
 			Schema: obj(map[string]interface{}{"query": str, "budget": map[string]interface{}{"type": "integer"}}, "query")},
 		{Name: "memory_write", Description: "Append an atomic note to ./memory/<topic>.md",
 			Schema: obj(map[string]interface{}{"topic": str, "content": str}, "topic", "content")},
-		{Name: "mcp", Description: "Call a local MCP server tool (see .lumina/mcp.json)",
-			Schema: obj(map[string]interface{}{"server": str, "tool": str}, "server", "tool")},
+		{Name: "mcp", Description: "Call a local MCP server tool (see .lumina/mcp.json). Pass nested arguments as args object.",
+			Schema: obj(map[string]interface{}{"server": str, "tool": str, "args": map[string]interface{}{"type": "object"}}, "server", "tool")},
 		{Name: "webfetch", Description: "Fetch an HTTP(S) URL as markdown (default), text, or HTML. Read-only; large results truncate past the cap. Use for direct URLs or public JSON APIs.",
 			Schema: obj(map[string]interface{}{"url": str, "format": str}, "url")},
 		{Name: "websearch", Description: fmt.Sprintf("Search the web for current info beyond knowledge cutoff (needs a provider key). The current year is %d. Use this year when searching for recent information.", time.Now().Year()),
@@ -932,13 +1085,16 @@ func (r *Runner) runSubagentText(ctx context.Context, sc tools.SecCtx, req tools
 	if len(description) > 2000 {
 		description = description[:2000] + "…[truncated]"
 	}
-	specs := subagentSpecs(def.Name)
+	specs := withSkillList(subagentSpecs(def.Name), bundle)
 	system := "You are the " + def.Name + " subagent. " + def.Body
 	if description != "" {
 		system += "\n\nTask context: " + description
 	}
 	system += "\n\nScope: use only the provided tools; you cannot launch subagents. When done, summarize findings with file references."
 	system += "\n\n" + toolGuidanceBase + "\n" + renderToolGuidance(specs)
+	if sb := skillsBlock(bundle); sb != "" {
+		system += "\n\n" + sb
+	}
 	r.progress(sc.SessionID, "subagent: "+def.Name)
 	childSc := sc
 	childSc.SubagentDepth = sc.SubagentDepth + 1
@@ -1043,7 +1199,7 @@ func (r *Runner) runChildLoop(ctx context.Context, sc tools.SecCtx, model, syste
 	if err != nil {
 		return "", err
 	}
-	const maxRounds = 8
+	const maxRounds = 32
 	for round := 0; round < maxRounds && len(calls) > 0; round++ {
 		var feedback strings.Builder
 		for _, c := range calls {

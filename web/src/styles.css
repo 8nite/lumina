@@ -2,25 +2,146 @@
 @tailwind components;
 @tailwind utilities;
 
-html {
-  background-color: #0a0a0b;
+/* v2-style design tokens (copied from opencode v2 web shell).
+   Light default like opencode (#fafafa deep); dark via [data-color-scheme]. */
+:root {
+  --v2-bg-deep: #fafafa;
+  --v2-bg-base: #ffffff;
+  --v2-bg-layer-01: #f4f4f5;
+  --v2-bg-layer-02: rgba(0, 0, 0, 0.05);
+  --v2-bg-layer-02-solid: #ececee;
+  --v2-text-base: #18181b;
+  --v2-text-muted: #52525b;
+  --v2-text-faint: #63636b;
+  --v2-border-base: rgba(0, 0, 0, 0.09);
+  --v2-overlay-hover: rgba(0, 0, 0, 0.05);
+  --v2-icon-muted: #71717a;
+  --v2-elevation-raised: 0 1px 2px rgba(0, 0, 0, 0.06), 0 4px 16px rgba(0, 0, 0, 0.06);
+  --v2-elevation-floating: 0 8px 32px rgba(0, 0, 0, 0.16), 0 2px 8px rgba(0, 0, 0, 0.1);
+  /* ponytail: categorical palette — per-tool / per-level colors. Light = 600s. */
+  --c-read: #0284c7;
+  --c-search: #0d9488;
+  --c-shell: #ea580c;
+  --c-edit: #16a34a;
+  --c-agent: #7c3aed;
+  --c-mem: #db2777;
+  --c-misc: #64748b;
+  --c-warn: #ca8a04;
+  --user-bubble: #e9f1fd;
+  --user-border: rgba(2, 132, 199, 0.25);
+  --scrollbar-size: 8px;
+  color-scheme: light;
+}
+
+[data-color-scheme='dark'] {
+  --v2-bg-deep: #101013;
+  --v2-bg-base: #17171a;
+  --v2-bg-layer-01: #1e1e21;
+  --v2-bg-layer-02: rgba(255, 255, 255, 0.06);
+  --v2-bg-layer-02-solid: #1e1e21;
+  --v2-text-base: #f4f4f5;
+  --v2-text-muted: #d4d4d8;
+  --v2-text-faint: #a1a1aa;
+  --v2-border-base: rgba(255, 255, 255, 0.09);
+  --v2-overlay-hover: rgba(255, 255, 255, 0.06);
+  --v2-icon-muted: #d4d4d8;
+  --v2-elevation-raised: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.35);
+  --v2-elevation-floating: 0 8px 32px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.4);
+  /* dark = 300/400s for contrast on near-black */
+  --c-read: #38bdf8;
+  --c-search: #2dd4bf;
+  --c-shell: #fb923c;
+  --c-edit: #4ade80;
+  --c-agent: #a78bfa;
+  --c-mem: #f472b6;
+  --c-misc: #94a3b8;
+  --c-warn: #facc15;
+  --user-bubble: #16283d;
+  --user-border: rgba(56, 189, 248, 0.3);
   color-scheme: dark;
 }
 
-body {
-  font-family: system-ui, -apple-system, sans-serif;
-  background-color: #0a0a0b;
+html {
+  background-color: var(--v2-bg-deep);
 }
 
-/* Slim dark scrollbars to match the workspace chrome */
+body {
+  font-family: Inter, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 13px;
+  font-weight: 440;
+  letter-spacing: -0.04px;
+  line-height: 20px;
+  background-color: var(--v2-bg-deep);
+  color: var(--v2-text-base);
+}
+
+code,
+pre,
+.font-mono {
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* v2 shell scrollbar: shared 8px thumb */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
+  background: var(--v2-text-faint);
+  opacity: 0.4;
   border-radius: 4px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* v2 working shimmer (TextShimmer): gradient sweep across the status text. */
+.v2-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--v2-text-faint) 35%,
+    var(--v2-text-base) 50%,
+    var(--v2-text-faint) 65%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: v2-shimmer 1.6s linear infinite;
+}
+@keyframes v2-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .v2-shimmer {
+    animation: none;
+  }
+}
+.v2-panel {
+  background: var(--v2-bg-base);
+  border-radius: 10px;
+  box-shadow: var(--v2-elevation-raised);
+  border: 1px solid transparent;
+}
+.v2-row {
+  border-radius: 6px;
+  transition: background-color 120ms ease-in-out, color 120ms ease-in-out;
+}
+.v2-row:hover {
+  background: var(--v2-overlay-hover);
+}
+.v2-search {
+  background: var(--v2-bg-layer-02);
+  border-radius: 6px;
+}
+.v2-section-label {
+  color: var(--v2-text-muted);
+  font-weight: 440;
+  font-size: 12px;
+}
+.v2-title {
+  color: var(--v2-text-base);
+  font-weight: 530;
 }

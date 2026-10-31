@@ -3,15 +3,20 @@ PKG := github.com/8nite/lumina
 GOFLAGS := CGO_ENABLED=0
 PREFIX ?= $(HOME)/.local
 
-.PHONY: build dev test lint openapi-gen web-build clean install
+.PHONY: build dev test lint openapi-gen web-build clean install stop
 
 build: web-build
 	$(GOFLAGS) go build -o bin/$(BINARY) ./cmd/lumina
 
+stop:
+	@-pkill -f "lumina serve" 2>/dev/null && echo "stopped running 'lumina serve'" || echo "no running 'lumina serve' found"
+
 install: build
+	@$(MAKE) stop
 	install -d $(PREFIX)/bin
 	install -m 0755 bin/$(BINARY) $(PREFIX)/bin/$(BINARY)
 	@echo "installed to $(PREFIX)/bin/$(BINARY) (ensure it is on PATH)"
+	@echo "shut down the previous lumina server; restart with: lumina serve (or just run lumina)"
 
 dev:
 	$(GOFLAGS) go run ./cmd/lumina serve

@@ -111,9 +111,15 @@ func (p *Ollama) Chat(ctx context.Context, req Request) (<-chan Chunk, error) {
 			}
 		}
 	}
-	resp, err := postJSON(ctx, url, "", map[string]interface{}{
+	body := map[string]interface{}{
 		"model": req.Model, "messages": msgs, "stream": true,
-	}, nil)
+	}
+	// Ollama has no effort ladder, only thinking on/off: any explicit
+	// variant enables it, auto ("") leaves the model default.
+	if NormalizeEffort(req.ReasoningEffort) != "" {
+		body["think"] = true
+	}
+	resp, err := postJSON(ctx, url, "", body, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -60,7 +60,7 @@ func TestPatchRejects(t *testing.T) {
 		"delete body":   "*** Begin Patch\n*** Delete File: a.txt\nbody\n*** End Patch",
 		"empty update":  "*** Begin Patch\n*** Update File: a.txt\n*** End Patch",
 		"bad context":   "*** Begin Patch\n*** Update File: a.txt\n@@\n-zzz-no-match\n+new\n*** End Patch",
-		"escape":        "*** Begin Patch\n*** Add File: ../evil.txt\n+x\n*** End Patch",
+		"escape":        "*** Begin Patch\n*** Add File: /var/empty/lumina-evil.txt\n+x\n*** End Patch",
 		"credential":    "*** Begin Patch\n*** Add File: .env\n+x\n*** End Patch",
 		"missing field": "*** Begin Patch\n*** End Patch",
 	} {

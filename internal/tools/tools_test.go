@@ -70,12 +70,61 @@ func TestFileAliasEscapeBlocked(t *testing.T) {
 	ws := t.TempDir()
 	r := NewRegistry()
 	ctx := testCtx(ws)
+	// Non-whitelisted absolute escapes must always deny (workspace fence).
+	// Note: ../escape.txt would land under /tmp (whitelisted for tmp),
+	// so escape tests must use a path outside home/tmp/system.
+	escapeAbs := "/var/empty/lumina-escape-test.txt"
 	for _, alias := range []string{"path", "file"} {
 		for _, tool := range []string{"read", "write", "edit"} {
-			args := map[string]interface{}{alias: "../escape.txt", "content": "x", "old_string": "x", "new_string": "y"}
+			args := map[string]interface{}{alias: escapeAbs, "content": "x", "old_string": "x", "new_string": "y"}
 			if _, err := r.Call(context.Background(), ctx, tool, args); err == nil {
 				t.Fatalf("expected escape deny for %s via %s", tool, alias)
+			} else if !strings.Contains(err.Error(), "escapes workspace") && !strings.Contains(err.Error(), "deny") && !strings.Contains(err.Error(), "ask") {
+				// Any denial (fence or broker) is acceptable; allow must not happen.
+				t.Fatalf("expected fence deny for %s via %s, got %v", tool, alias, err)
 			}
+		}
+	}
+}
+
+func TestWhitelistAllowsTmpReadsWritesIncludingDotfiles(t *testing.T) {
+	ws := t.TempDir()
+	r := NewRegistry()
+	ctx := testCtx(ws)
+	// Normal tmp file: write then read must pass (whitelisted).
+	tmpFile := filepath.Join(os.TempDir(), "lumina-whitelist-test.txt")
+	_ = os.Remove(tmpFile)
+	if _, err := r.Call(context.Background(), ctx, "write", map[string]interface{}{"path": tmpFile, "content": "hello"}); err != nil {
+		t.Fatalf("whitelisted /tmp write must pass: %v", err)
+	}
+	res, err := r.Call(context.Background(), ctx, "read", map[string]interface{}{"path": tmpFile})
+	if err != nil || !strings.Contains(res.Output, "hello") {
+		t.Fatalf("whitelisted /tmp read must pass: %q err=%v", res.Output, err)
+	}
+	_ = os.Remove(tmpFile)
+	// Per explicit user override: external dotfiles incl. secrets ARE allowed.
+	// Workspace-internal secrets stay denied (see TestCredentialDeny).
+	secretTmp := filepath.Join(os.TempDir(), "lumina-whitelist-test.env")
+	_ = os.WriteFile(secretTmp, []byte("x"), 0o644)
+	defer os.Remove(secretTmp)
+	if _, err := r.Call(context.Background(), ctx, "read", map[string]interface{}{"path": secretTmp}); err != nil {
+		t.Fatalf("external .env in /tmp must allow per override, got %v", err)
+	}
+	// Workspace-internal .env must still deny.
+	if _, err := r.Call(context.Background(), testCtx(ws), "read", map[string]interface{}{"path": ".env"}); err == nil {
+		// .env may not exist; ensure fence denies when it does exist.
+		_ = os.WriteFile(filepath.Join(ws, ".env"), []byte("s"), 0o644)
+		if _, err2 := r.Call(context.Background(), testCtx(ws), "read", map[string]interface{}{"path": ".env"}); err2 == nil {
+			t.Fatalf("workspace .env must still deny")
+		}
+	}
+	// System read-only: /etc/hosts readable, but writes denied at fence.
+	if _, err := os.Stat("/etc/hosts"); err == nil {
+		if _, err := r.Call(context.Background(), ctx, "read", map[string]interface{}{"path": "/etc/hosts"}); err != nil {
+			t.Fatalf("/etc/hosts read must pass: %v", err)
+		}
+		if _, err := r.Call(context.Background(), ctx, "write", map[string]interface{}{"path": "/etc/lumina-test", "content": "x"}); err == nil {
+			t.Fatalf("/etc write must deny (read-only system)")
 		}
 	}
 }

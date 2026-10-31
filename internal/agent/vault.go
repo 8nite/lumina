@@ -11,8 +11,9 @@ import (
 // Secret vault: user-side transparency with opaque LLM-side stand-ins.
 //
 // Detection covers labeled secrets (api_key=, password:, token:, user_id=,
-// bearer) plus bare shapes (sk-…, AKIA…, PIN/OTP/ID numbers like 123456,
-// segmented codes like 1234-12345), each minted a stable per-session
+// private_key=, SIN/SSN, bearer) plus bare shapes (sk-…, AKIA…, PEM
+// private-key blocks, PIN/OTP/ID numbers like 123456, segmented codes like
+// 1234-12345, SIN 123-456-789 / SSN 123-45-6789), each minted a stable per-session
 // reference like {placeholder_abc} — lowercase letters only, so a ref can
 // never be mistaken for (part of) a numeric code. Outbound text (history,
 // tool feedback, steered input, subagent tasks) is substituted before it
@@ -61,12 +62,21 @@ type vaultPattern struct {
 var vaultPatterns = []vaultPattern{
 	{re: regexp.MustCompile(`(?i)(api[_-]?key\s*[:=]\s*)['"]?([^\s'"]+)`), labelGroup: 1, valueGroup: 2},
 	{re: regexp.MustCompile(`(?i)(secret\s*[:=]\s*)['"]?([^\s'"]+)`), labelGroup: 1, valueGroup: 2},
+	{re: regexp.MustCompile(`(?i)\b((?:private[_-]?key)\s*[:=]\s*)['"]?([^\s'"]+)`), labelGroup: 1, valueGroup: 2},
 	{re: regexp.MustCompile(`(?i)\b((?:password|passwd|pwd|pass|passphrase)\s*[:=]\s*)['"]?([^\s'"]+)`), labelGroup: 1, valueGroup: 2},
 	{re: regexp.MustCompile(`(?i)\b((?:(?:access|refresh|auth|id|api|session)_token|token|otp|pin|passcode|2fa|verification_code|auth_code)\s*[:=]\s*)['"]?([^\s'"]+)`), labelGroup: 1, valueGroup: 2},
 	{re: regexp.MustCompile(`(?i)\b((?:(?:client|user|account|session|request|key|token)_id|id|uuid|guid)\s*[:=]\s*)['"]?([^\s'"]+)`), labelGroup: 1, valueGroup: 2},
+	// Labeled SIN/SSN (CA 3-3-3, US 3-2-4, spaced/dashed/compact): one ref
+	// per number, label kept. Bare formatted numbers are already caught by
+	// the generic digit patterns below; this keeps "SIN: 123 456 789" from
+	// splitting across refs.
+	{re: regexp.MustCompile(`(?i)\b((?:sin|ssn|social[_ \-]?security(?:[_ \-]?number)?|social[_ \-]?insurance(?:[_ \-]?number)?)\s*[:=]?\s*)(\d{3}[- ]?\d{3}[- ]?\d{3}|\d{3}[- ]\d{2}[- ]\d{4})`), labelGroup: 1, valueGroup: 2, trailWordCheck: true, skipDates: true},
 	{re: regexp.MustCompile(`(sk-[A-Za-z0-9\-_]{8,})`), valueGroup: 1},
 	{re: regexp.MustCompile(`(AKIA[0-9A-Z]{16})`), valueGroup: 1},
 	{re: regexp.MustCompile(`(?i)(bearer\s+)([A-Za-z0-9\-._~+/]+-=*)`), labelGroup: 1, valueGroup: 2},
+	// PEM private-key blocks (RSA/EC/OPENSSH/PGP): one ref per block.
+	// (?s) lets . span newlines; non-greedy stops at the first END marker.
+	{re: regexp.MustCompile(`(?s)(-----BEGIN [^-]*PRIVATE KEY[^-]*-----.*?-----END [^-]*PRIVATE KEY[^-]*-----)`), valueGroup: 1},
 	// Bare PIN/OTP/ID-shaped numbers: 4+ digits not touching a word char,
 	// so versions (1.3.10), words with digits (abc1234), and short counts
 	// (port 80) stay visible while 123456 does not.

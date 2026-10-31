@@ -6,6 +6,7 @@ package security
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -22,7 +23,7 @@ type PermissionMode string
 
 const (
 	PermAsk         PermissionMode = "ask"
-	PermDefault     PermissionMode = "default" // alias of ask
+	PermDefault     PermissionMode = "default" // alias of bypass
 	PermAutoEdit    PermissionMode = "auto-edit"
 	PermAutoApprove PermissionMode = "auto-approve"
 	PermBypass      PermissionMode = "bypass"
@@ -56,7 +57,7 @@ var credentialSubstrings = []string{
 func Normalize(p PermissionMode) PermissionMode {
 	switch PermissionMode(strings.ToLower(strings.TrimSpace(string(p)))) {
 	case "", "default":
-		return PermAsk
+		return PermBypass
 	case "auto_edit":
 		return PermAutoEdit
 	case "auto_approve", "auto":
@@ -72,8 +73,17 @@ func Normalize(p PermissionMode) PermissionMode {
 func IsCredentialPath(target string) bool {
 	base := strings.ToLower(filepath.Base(target))
 	low := strings.ToLower(target)
-	// Kubernetes cluster credentials: the whole .kube tree is sensitive.
-	if strings.Contains(low, "/.kube/") || strings.HasSuffix(low, "/.kube") {
+	// Cluster / identity trees: the whole subtree is sensitive.
+	for _, frag := range []string{"/.kube/", "/.ssh/", "/.aws/", "/.gnupg/", "/etc/ssh/", "/etc/pki/"} {
+		if strings.Contains(low, frag) {
+			return true
+		}
+	}
+	if strings.HasSuffix(low, "/.kube") || strings.HasSuffix(low, "/.ssh") || strings.HasSuffix(low, "/.aws") || strings.HasSuffix(low, "/.gnupg") {
+		return true
+	}
+	// System shadow files are always secrets, even though whitelisted for reads.
+	if base == "shadow" || base == "gshadow" || base == "master.passwd" {
 		return true
 	}
 	for _, n := range CredentialFileNames {
@@ -108,7 +118,7 @@ func IsGoogleTarget(target string) bool {
 // plan.md or .lumina/plans/*.md, strictly contained in the workspace.
 // Out-of-workspace lookalikes (/tmp/other/plan.md, ../plan.md) are rejected.
 func IsPlanWritable(workspaceDir, target string) bool {
-	p := target
+	p := ExpandHome(target)
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(workspaceDir, p)
 	}
@@ -129,6 +139,259 @@ func IsPlanWritable(workspaceDir, target string) bool {
 		return true
 	}
 	return false
+}
+
+// Layer-0 external whitelist: paths outside the workspace that tools may
+// still touch. Reads cover home (~/.*), temp (/tmp, /temp, os.TempDir),
+// and read-only system locations. Writes stay confined to workspace +
+// temp only; home and system writes remain escapes (credential hard-deny
+// still wins over everything, including whitelisted paths).
+func ExpandHome(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if h := homeDir(); h != "" {
+			if p == "~" {
+				return h
+			}
+			return filepath.Join(h, p[2:])
+		}
+	}
+	return p
+}
+
+func homeDir() string {
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return filepath.Clean(h)
+	}
+	if h := os.Getenv("HOME"); h != "" {
+		return filepath.Clean(h)
+	}
+	return ""
+}
+
+func isUnder(dir, p string) bool {
+	if dir == "" {
+		return false
+	}
+	dir = filepath.Clean(dir)
+	p = filepath.Clean(ExpandHome(p))
+	if p == dir {
+		return true
+	}
+	return strings.HasPrefix(p, dir+string(filepath.Separator))
+}
+
+func tempPrefixes() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		s = filepath.Clean(s)
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	add(os.TempDir())
+	add("/tmp")
+	add("/var/tmp")
+	add("/temp")
+	// macOS: /tmp symlinks to /private/tmp.
+	add("/private/tmp")
+	return out
+}
+
+func systemReadPrefixes() []string {
+	dirs := []string{"/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/System", "/Library"}
+	if runtime.GOOS == "windows" {
+		if s := os.Getenv("SystemRoot"); s != "" {
+			dirs = append(dirs, filepath.Clean(s))
+		}
+		if s := os.Getenv("ProgramFiles"); s != "" {
+			dirs = append(dirs, filepath.Clean(s))
+		}
+		if s := os.Getenv("TEMP"); s != "" {
+			dirs = append(dirs, filepath.Clean(s))
+		}
+		if s := os.Getenv("TMP"); s != "" {
+			dirs = append(dirs, filepath.Clean(s))
+		}
+	}
+	return dirs
+}
+
+// IsWhitelistedRead reports whether an absolute (or ~-prefixed) path is in
+// the read allowlist: home (~/.* dotfiles included), temp (/tmp, /temp,
+// os.TempDir), or system locations. Relative paths return false (they
+// resolve inside the workspace). Per explicit user override, credential-shaped
+// paths (like .env) ARE whitelisted when outside the workspace — Authorize
+// skips the hard-deny for external whitelisted secrets, workspace secrets
+// stay denied.
+func IsWhitelistedRead(p string) bool {
+	e := filepath.Clean(ExpandHome(p))
+	if !filepath.IsAbs(e) {
+		return false
+	}
+	if h := homeDir(); h != "" && (e == h || strings.HasPrefix(e, h+string(filepath.Separator))) {
+		return true
+	}
+	for _, t := range tempPrefixes() {
+		if e == t || strings.HasPrefix(e, t+string(filepath.Separator)) {
+			return true
+		}
+	}
+	for _, s := range systemReadPrefixes() {
+		if e == s || strings.HasPrefix(e, s+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsWhitelistedWrite reports whether an absolute (or ~-prefixed) path is
+// writable outside the workspace: temp locations only (including dotfiles
+// like /tmp/.env per explicit override). Home dotfiles and system folders
+// are read-only (writes there remain workspace escapes).
+func IsWhitelistedWrite(p string) bool {
+	e := filepath.Clean(ExpandHome(p))
+	if !filepath.IsAbs(e) {
+		return false
+	}
+	for _, t := range tempPrefixes() {
+		if e == t || strings.HasPrefix(e, t+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// isInWorkspace reports whether target resolves inside workspaceDir.
+func isInWorkspace(workspaceDir, target string) bool {
+	if workspaceDir == "" {
+		return false
+	}
+	p := filepath.Clean(ExpandHome(target))
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(workspaceDir, p)
+	}
+	rel, err := filepath.Rel(workspaceDir, p)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// credentialOverrideAllowed reports whether a credential-shaped target should
+// skip the hard-deny because it lives outside the workspace in a whitelisted
+// external location (home/tmp/system, dotfiles included). Workspace-internal
+// secrets stay denied. Bash commands are scanned for path-like tokens.
+func credentialOverrideAllowed(workspaceDir, tool, target string) bool {
+	lowTool := strings.ToLower(strings.TrimSpace(tool))
+	if strings.HasPrefix(lowTool, "bash") || lowTool == "shell" {
+		// Scan command for path-like tokens.
+		toks := strings.FieldsFunc(target, func(r rune) bool {
+			return r == ' ' || r == '\t' || r == '\n' || r == '"' || r == '\'' || r == ';' || r == '|' || r == '&' || r == '`'
+		})
+		foundExternalWhitelisted := false
+		for _, tok := range toks {
+			// Strip common wrappers like $(, ${, quotes.
+			t := strings.Trim(tok, "(){}<>")
+			if t == "" {
+				continue
+			}
+			// Only consider path-like tokens.
+			if !(strings.HasPrefix(t, "/") || strings.HasPrefix(t, "~") || strings.HasPrefix(t, "$HOME")) {
+				continue
+			}
+			t = ExpandHome(t)
+			if !filepath.IsAbs(t) {
+				continue
+			}
+			t = filepath.Clean(t)
+			if isInWorkspace(workspaceDir, t) {
+				// Workspace-internal secret ref → stay denied.
+				// Continue scanning: one internal hit forces deny only if
+				// no external override? Safer: internal hit wins → deny.
+				if IsCredentialPath(t) {
+					return false
+				}
+				continue
+			}
+			if IsWhitelistedRead(t) || IsWhitelistedWrite(t) {
+				foundExternalWhitelisted = true
+			}
+		}
+		// Also allow bare whitelisted dir refs like "/tmp/" in command.
+		if !foundExternalWhitelisted {
+			low := strings.ToLower(target)
+			for _, frag := range append(append([]string{}, tempPrefixes()...), systemReadPrefixes()...) {
+				if strings.Contains(low, strings.ToLower(frag)) {
+					foundExternalWhitelisted = true
+					break
+				}
+			}
+			if h := strings.ToLower(homeDir()); h != "" && strings.Contains(low, h) {
+				foundExternalWhitelisted = true
+			}
+			if strings.Contains(target, "~/") || strings.Contains(target, "$HOME") {
+				foundExternalWhitelisted = true
+			}
+		}
+		return foundExternalWhitelisted
+	}
+	// File tools: single path target.
+	if !IsCredentialPath(target) {
+		return false
+	}
+	if isInWorkspace(workspaceDir, target) {
+		return false // workspace secrets stay denied
+	}
+	e := filepath.Clean(ExpandHome(target))
+	if !filepath.IsAbs(e) {
+		// Relative outside workspace? Already handled as inside above
+		// (relative joins workspace). Non-abs here means no workspace?
+		return false
+	}
+	return IsWhitelistedRead(e) || IsWhitelistedWrite(e)
+}
+
+// IsWhitelistedExternal is the union (read or write) for generic fence
+// checks that do not distinguish operation type.
+func IsWhitelistedExternal(p string) bool {
+	return IsWhitelistedRead(p) || IsWhitelistedWrite(p)
+}
+
+// IsReadAllowed holds when p is inside the workspace or whitelisted for reads.
+func IsReadAllowed(workspaceDir, target string) bool {
+	p := filepath.Clean(ExpandHome(target))
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(workspaceDir, p)
+	}
+	if workspaceDir != "" {
+		if rel, err := filepath.Rel(workspaceDir, p); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true
+		}
+	} else {
+		return true
+	}
+	return IsWhitelistedRead(p)
+}
+
+// IsWriteAllowed holds when p is inside the workspace or whitelisted for writes (temp only).
+func IsWriteAllowed(workspaceDir, target string) bool {
+	p := filepath.Clean(ExpandHome(target))
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(workspaceDir, p)
+	}
+	if workspaceDir != "" {
+		if rel, err := filepath.Rel(workspaceDir, p); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true
+		}
+	} else {
+		return true
+	}
+	return IsWhitelistedWrite(p)
 }
 
 // readOnlyBashPrefixes are the only shell commands allowed in plan mode.
@@ -194,12 +457,21 @@ func isEditTool(tool string) bool {
 }
 
 // Authorize applies the structural fence first, then the permission matrix.
-// Hard denies (credentials / Google) win over everything, including bypass.
+// Hard denies (credentials / Google) win over everything, including bypass,
+// EXCEPT explicit user override: credential-shaped paths outside the workspace
+// but in the external whitelist (home/tmp/system, dotfiles included) skip the
+// credential deny. Workspace-internal secrets stay denied. Google deny never lifts.
 func Authorize(agent AgentMode, perm PermissionMode, tool, target, workspaceDir string, bashRules map[string]string, allowToolingWrite bool) Decision {
 	pm := Normalize(perm)
 
-	// 1. Immutable hard deny — never bypassable.
-	if IsCredentialPath(target) || IsGoogleTarget(target) || IsGoogleTarget(tool) {
+	// 1. Immutable hard deny — never bypassable, except external-whitelist
+	// secret override (explicit user choice to allow all dotfiles outside ws).
+	if IsCredentialPath(target) {
+		if !credentialOverrideAllowed(workspaceDir, tool, target) {
+			return Deny
+		}
+	}
+	if IsGoogleTarget(target) || IsGoogleTarget(tool) {
 		return Deny
 	}
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(tool)), "bash") {

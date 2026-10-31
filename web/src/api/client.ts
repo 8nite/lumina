@@ -6,12 +6,23 @@ export interface Session {
   permission_mode: string;
   model?: string;
   title?: string;
+  running?: boolean;
 }
 
 export interface DaemonEvent {
   type: string;
   session_id?: string;
   data?: unknown;
+}
+
+export interface SessionState {
+  session: Session;
+  running: boolean;
+  permission?: { request_id: string; tool: string; target: string } | null;
+  question?: {
+    request_id: string;
+    questions: { question: string; header?: string; options?: { label: string; description?: string }[]; multiple?: boolean }[];
+  } | null;
 }
 
 // Base URL switching ("See Servers"): relative = same origin.
@@ -57,7 +68,19 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
     headers: { 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) throw new Error(`${method} ${path}: ${res.status}`);
+  if (!res.ok) {
+    // Keep the daemon's reason (e.g. 409 "turn in flight on another
+    // daemon") so alerts name the cause instead of a bare status code.
+    let detail = '';
+    try {
+      const text = await res.text();
+      const err = JSON.parse(text) as { error?: string };
+      detail = (err.error || text).slice(0, 300);
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(`${method} ${path}: ${res.status}${detail ? ' ' + detail : ''}`);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -85,7 +108,9 @@ export function fileToAttachment(file: File): Promise<PromptAttachment> {
 
 export const api = {
   sessions: () => req<Session[]>('GET', '/api/v1/sessions'),
-  createSession: (workspace_dir: string, agent = 'build', permission_mode = 'ask') =>
+  session: (id: string) => req<Session>('GET', `/api/v1/sessions/${id}`),
+  sessionState: (id: string) => req<SessionState>('GET', `/api/v1/sessions/${id}/state`),
+  createSession: (workspace_dir: string, agent = 'build', permission_mode = 'bypass') =>
     req<Session>('POST', '/api/v1/sessions', { workspace_dir, agent, permission_mode }),
   patchSession: (id: string, patch: Partial<Session>) =>
     req<Session>('PATCH', `/api/v1/sessions/${id}`, patch),
@@ -103,7 +128,7 @@ export const api = {
   dismissQuestion: (reqId: string) =>
     req<{ status: string }>('POST', `/api/v1/questions/${reqId}`, { dismissed: true }),
   export: (id: string) =>
-    req<{ transcript: { id: string; role: string; text: string }[] }>(`GET`, `/api/v1/sessions/${id}/export`),
+    req<{ transcript: { id: string; role: string; text: string; created_at?: string }[] }>(`GET`, `/api/v1/sessions/${id}/export`),
   routerState: () => req<{ router: Record<string, string> }>('GET', '/api/v1/router'),
   setRouter: (role: string, model: string) =>
     req<{ status: string }>('PUT', '/api/v1/router', { [role]: model }),
@@ -132,9 +157,12 @@ export const api = {
 // SSE subscription over fetch (EventSource cannot send auth headers).
 // Auto-reconnects with backoff so a dropped connection resumes the live
 // stream instead of leaving the UI stuck at working… forever.
-export function subscribe(onEvent: (e: DaemonEvent) => void): () => void {
+// onConnect fires after every (re)connect so the caller can resync missed
+// state (transcript + running flag + pending prompts) via sessionState.
+export function subscribe(onEvent: (e: DaemonEvent) => void, onConnect?: () => void): () => void {
   let dead = false;
   let delayMs = 1000;
+  let connects = 0;
   const ctrls = new Set<AbortController>();
   const run = async () => {
     while (!dead) {
@@ -146,6 +174,12 @@ export function subscribe(onEvent: (e: DaemonEvent) => void): () => void {
           signal: ctrl.signal,
         });
         if (!res.body) throw new Error('no body');
+        connects++;
+        try {
+          onConnect?.();
+        } catch {
+          /* resync failures retry on next event */
+        }
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         let buf = '';

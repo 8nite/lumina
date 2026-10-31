@@ -38,6 +38,11 @@ type Session struct {
 	Title          string `json:"title,omitempty"`
 	CreatedAt      string `json:"created_at"`
 	UpdatedAt      string `json:"updated_at"`
+	// Running reports whether the daemon holds an in-flight turn for this
+	// session. The web UI uses it after a (re)load or SSE reconnect to
+	// recover the working spinner when it missed turn.started, and to
+	// refetch the transcript when it missed turn.completed.
+	Running bool `json:"running,omitempty"`
 }
 
 // Event is one SSE message on /api/v1/events.
@@ -106,11 +111,20 @@ type Options struct {
 	AuthToken string // empty = no auth required (loopback trust)
 }
 
+// claimStaleAfter bounds cross-daemon turn-claim takeover: a claim older
+// than this is dead (turn ctx caps at 10min), so a surviving daemon may
+// take the slot over. A var (not const) so tests can shrink the window.
+var claimStaleAfter = 12 * time.Minute
+
 // Server is the Lumina daemon.
 type Server struct {
 	mux      *http.ServeMux
 	broker   *Broker
 	opts     Options
+	// ID identifies this daemon process in cross-process turn claims
+	// (Store.ClaimTurn): host/pid plus random suffix, so two daemons on
+	// one DB file can tell each other's slots apart.
+	ID       string
 	mu       sync.Mutex
 	sessions map[string]*Session
 	// running tracks sessions with an in-flight turn (steer/queue gate).
@@ -128,6 +142,10 @@ type Server struct {
 	qMu      sync.Mutex
 	qPending map[string]chan questionResult
 	qMeta    map[string]map[string]string
+	// qQuestions retains the question payload per pending request so a
+	// reloaded web UI can re-render the modal via GET .../state instead
+	// of staying stuck at working… with no way to answer.
+	qQuestions map[string][]tools.Question
 	// Exec runs one assistant turn (wired by cmd/serve to the agent
 	// Runner). Nil keeps the route as accept-and-broadcast (tests/embeds).
 	Exec func(ctx context.Context, sessionID string, in agent.TurnInput) (string, error)
@@ -162,14 +180,24 @@ type Server struct {
 	ListProviderModels func(ctx context.Context, provider string) ([]llm.ModelMeta, error)
 	// CopilotTokenURL resolves the exchange endpoint for device auth.
 	CopilotTokenURL func(provider string) string
+	// cancels holds one in-flight turn context per session so POST
+	// .../stop can abort it (LLM stream + tools + approval waits all
+	// honor ctx). Guarded by mu alongside running.
+	cancels map[string]context.CancelFunc
+	// ClearInbox drops steered + queued prompts for a session (stop
+	// semantics: the cancelled turn must not chain into queued work).
+	// Wired to Runner.Clear in cmd/serve; nil = nothing to clear.
+	ClearInbox func(sessionID string)
 }
 
 // New creates a daemon with all /api/v1 routes registered.
 func New(o Options) *Server {
+	host, _ := os.Hostname()
 	s := &Server{
 		mux:         http.NewServeMux(),
 		broker:      NewBroker(),
 		opts:        o,
+		ID:          fmt.Sprintf("%s/%d/%s", host, os.Getpid(), uuid.NewString()[:8]),
 		sessions:    map[string]*Session{},
 		running:     map[string]bool{},
 		permReqs:    map[string]map[string]string{},
@@ -177,6 +205,7 @@ func New(o Options) *Server {
 		permMeta:    map[string]map[string]string{},
 		qPending:    map[string]chan questionResult{},
 		qMeta:       map[string]map[string]string{},
+		qQuestions:  map[string][]tools.Question{},
 		RouterState: map[string]string{},
 		Redo:        map[string]string{},
 	}
@@ -210,17 +239,27 @@ func (s *Server) turnEndStats(sessionID string) (agent.TurnStats, bool) {
 	return st, ok
 }
 
+// isRunning reports whether a session holds an in-flight turn.
+func (s *Server) isRunning(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running[id]
+}
+
 // GetSession returns one session by id (memory first, store fallback).
 func (s *Server) GetSession(id string) (*Session, bool) {
 	s.mu.Lock()
 	sess, ok := s.sessions[id]
+	running := s.running[id]
 	s.mu.Unlock()
 	if ok {
+		sess.Running = running
 		return sess, true
 	}
 	if s.Store != nil {
 		if st, err := s.Store.GetSession(id); err == nil {
 			api := toAPI(st)
+			api.Running = running
 			s.mu.Lock()
 			s.sessions[id] = api
 			s.mu.Unlock()
@@ -308,10 +347,11 @@ func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 		"paths": map[string]interface{}{
 			"/api/v1/events":                 map[string]string{"get": "SSE: turn.started/progress/context/delta/tool/completed/failed, permission.asked/resolved, question.asked/resolved, session.*, config.updated"},
 			"/api/v1/sessions":               map[string]string{"get": "list (?directory=, ?latest=1)", "post": "create"},
-			"/api/v1/sessions/{id}":          map[string]string{"get": "fetch", "patch": "update agent/permission/model/title"},
+			"/api/v1/sessions/{id}":          map[string]string{"get": "fetch (includes running)", "patch": "update agent/permission/model/title"},
+			"/api/v1/sessions/{id}/state":    map[string]string{"get": "resync: session + running + pending permission/question for reload/reconnect"},
 			"/api/v1/sessions/{id}/fork":     map[string]string{"post": "fork at turn"},
 			"/api/v1/sessions/{id}/export":   map[string]string{"get": "transcript export (?sanitize=1)"},
-			"/api/v1/sessions/{id}/prompt":   map[string]string{"post": "submit turn"},
+			"/api/v1/sessions/{id}/prompt":   map[string]string{"post": "submit turn (409 when another daemon holds the turn)"},
 			"/api/v1/sessions/{id}/revert":   map[string]string{"post": "shadow-git undo"},
 			"/api/v1/sessions/{id}/unrevert": map[string]string{"post": "shadow-git redo"},
 			"/api/v1/permissions/{reqId}":    map[string]string{"post": "allow_once/session/always or deny"},
@@ -365,6 +405,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 // listSessions reads the store when attached (restart-safe), else memory.
 func (s *Server) listSessions(directory string) []*Session {
+	s.mu.Lock()
+	running := map[string]bool{}
+	for k, v := range s.running {
+		running[k] = v
+	}
+	s.mu.Unlock()
 	if s.Store != nil {
 		list, err := s.Store.ListSessions(directory)
 		if err != nil {
@@ -372,7 +418,9 @@ func (s *Server) listSessions(directory string) []*Session {
 		}
 		out := make([]*Session, 0, len(list))
 		for _, st := range list {
-			out = append(out, toAPI(st))
+			api := toAPI(st)
+			api.Running = running[api.ID]
+			out = append(out, api)
 		}
 		return out
 	}
@@ -383,8 +431,12 @@ func (s *Server) listSessions(directory string) []*Session {
 		if directory != "" && sess.WorkspaceDir != directory {
 			continue
 		}
+		sess.Running = s.running[sess.ID]
 		out = append(out, sess)
 	}
+	// Match the SQLite path (ORDER BY updated_at DESC) so /continue picks
+	// the latest previous session even without a store attached.
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt > out[j].UpdatedAt })
 	return out
 }
 
@@ -427,7 +479,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		pm := req.PermissionMode
 		if pm == "" {
-			pm = "ask"
+			pm = "bypass"
 		}
 		sess := &Session{
 			ID: uuid.NewString()[:8], WorkspaceDir: req.WorkspaceDir,
@@ -490,13 +542,17 @@ func (s *Server) handleSessionSub(w http.ResponseWriter, r *http.Request) {
 			if s.Store != nil {
 				_, _ = s.Store.UpdateSession(id, &sess.Agent, &sess.PermissionMode, &sess.Model, &sess.Title)
 			}
+			sess.Running = s.isRunning(id)
 			s.broker.Publish(Event{Type: "session.updated", SessionID: id, Data: sess})
 			writeJSON(w, 200, sess)
 		case http.MethodGet:
+			sess.Running = s.isRunning(id)
 			writeJSON(w, 200, sess)
 		default:
 			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 		}
+	case "state":
+		s.handleSessionState(w, r, sess)
 	case "fork":
 		if r.Method != http.MethodPost {
 			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
@@ -570,7 +626,11 @@ func (s *Server) handleSessionSub(w http.ResponseWriter, r *http.Request) {
 			}
 			images = append(images, llm.ImageAttachment{Name: im.Name, MediaType: im.MediaType, Data: im.Data})
 		}
-		in := agent.TurnInput{Text: req.Text, Images: images, Effort: req.Effort}
+		if !llm.ValidEffort(req.Effort) {
+			writeJSON(w, 400, map[string]string{"error": "invalid effort (want auto|low|medium|high|xhigh|max): " + req.Effort})
+			return
+		}
+		in := agent.TurnInput{Text: req.Text, Images: images, Effort: llm.NormalizeEffort(req.Effort)}
 		delivery := req.Delivery
 		if delivery == "" {
 			delivery = "steer"
@@ -585,6 +645,22 @@ func (s *Server) handleSessionSub(w http.ResponseWriter, r *http.Request) {
 			s.running[id] = true
 		}
 		s.mu.Unlock()
+		if !busy && s.Exec != nil && s.Store != nil {
+			// Cross-process gate: a second daemon on this DB file holds
+			// its running flag in its own memory, so claim the shared
+			// slot or fail safe (409) instead of double-driving one
+			// session into an interleaved transcript.
+			if !s.Store.ClaimTurn(id, s.ID, claimStaleAfter) {
+				s.mu.Lock()
+				delete(s.running, id)
+				s.mu.Unlock()
+				owner, since := s.Store.TurnOwner(id)
+				writeJSON(w, http.StatusConflict, map[string]string{
+					"error": fmt.Sprintf("turn in flight on another daemon (owner %s since %s)", owner, time.Unix(0, since).UTC().Format(time.RFC3339)),
+				})
+				return
+			}
+		}
 		if busy {
 			switch {
 			case delivery == "queue" && s.QueuePrompt != nil:
@@ -669,6 +745,11 @@ func (s *Server) runTurns(id string, in agent.TurnInput) {
 		s.mu.Lock()
 		delete(s.running, id)
 		s.mu.Unlock()
+		// Free the cross-process slot (owner-guarded: never steal a
+		// take-over holder's live claim on a delayed completion).
+		if s.Store != nil {
+			s.Store.ReleaseTurn(id, s.ID)
+		}
 	}()
 	for {
 		s.runTurn(id, in)
@@ -791,6 +872,7 @@ func (s *Server) handleQuestions(w http.ResponseWriter, r *http.Request) {
 	ch := s.qPending[reqID]
 	delete(s.qPending, reqID)
 	delete(s.qMeta, reqID)
+	delete(s.qQuestions, reqID)
 	s.qMu.Unlock()
 	if ch != nil {
 		select {
@@ -811,6 +893,7 @@ func (s *Server) RequestQuestion(ctx context.Context, sessionID string, question
 	s.qMu.Lock()
 	s.qPending[reqID] = ch
 	s.qMeta[reqID] = map[string]string{"session_id": sessionID}
+	s.qQuestions[reqID] = append([]tools.Question(nil), questions...)
 	s.qMu.Unlock()
 	s.broker.Publish(Event{Type: "question.asked", SessionID: sessionID, Data: map[string]interface{}{
 		"request_id": reqID, "questions": questions,
@@ -825,9 +908,55 @@ func (s *Server) RequestQuestion(ctx context.Context, sessionID string, question
 		s.qMu.Lock()
 		delete(s.qPending, reqID)
 		delete(s.qMeta, reqID)
+		delete(s.qQuestions, reqID)
 		s.qMu.Unlock()
 		return nil, ctx.Err()
 	}
+}
+
+// pendingForSession returns the live permission/question prompts blocking a
+// session, if any. A reloaded web UI calls GET .../state to re-render modals
+// it missed while disconnected; without this a turn waiting on approval
+// looks like a stuck working… spinner with no way to unblock it.
+func (s *Server) pendingForSession(sessionID string) (map[string]string, map[string]interface{}) {
+	var perm map[string]string
+	var ques map[string]interface{}
+	s.permMu.Lock()
+	for id, meta := range s.permMeta {
+		if meta["session_id"] == sessionID {
+			if _, ok := s.permPending[id]; ok {
+				perm = map[string]string{"request_id": id, "tool": meta["tool"], "target": meta["target"]}
+				break
+			}
+		}
+	}
+	s.permMu.Unlock()
+	s.qMu.Lock()
+	for id, meta := range s.qMeta {
+		if meta["session_id"] == sessionID {
+			if _, ok := s.qPending[id]; ok {
+				ques = map[string]interface{}{"request_id": id, "questions": s.qQuestions[id]}
+				break
+			}
+		}
+	}
+	s.qMu.Unlock()
+	return perm, ques
+}
+
+// handleSessionState serves GET /api/v1/sessions/{id}/state: one atomic
+// resync payload for a (re)loaded client that missed SSE while away.
+func (s *Server) handleSessionState(w http.ResponseWriter, r *http.Request, sess *Session) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	sess.Running = s.isRunning(sess.ID)
+	perm, ques := s.pendingForSession(sess.ID)
+	writeJSON(w, 200, map[string]interface{}{
+		"session": sess, "running": sess.Running,
+		"permission": perm, "question": ques,
+	})
 }
 
 // handleFiles returns a bounded workspace file tree (?directory=).

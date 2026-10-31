@@ -23,7 +23,7 @@ func TestDefaultsWhenMissing(t *testing.T) {
 	if c.Server.Port != 7432 || c.Server.Host != "127.0.0.1" {
 		t.Fatalf("bad server defaults: %+v", c.Server)
 	}
-	if c.Defaults.PermissionMode != "ask" {
+	if c.Defaults.PermissionMode != "bypass" {
 		t.Fatalf("bad permission default: %q", c.Defaults.PermissionMode)
 	}
 	if !c.KB.StandingOps || c.KB.IdleDebounceMinutes != 15 {

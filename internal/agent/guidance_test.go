@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/8nite/lumina/internal/llm"
+	"github.com/8nite/lumina/internal/rules"
 )
 
 func specNames(names ...string) []llm.ToolSpec {
@@ -38,6 +39,48 @@ func TestEnvBlock(t *testing.T) {
 	for _, want := range []string{"Today's date:", "<env>", "Working directory: " + ws, "Platform: "} {
 		if !strings.Contains(b, want) {
 			t.Fatalf("env block missing %q: %q", want, b)
+		}
+	}
+}
+
+func TestSkillsBlockAdvertisesNames(t *testing.T) {
+	b := &rules.Bundle{Skills: []rules.SkillMeta{
+		{Name: "agent-browser", Description: "Browser automation CLI"},
+		{Name: "graphify", Description: ""},
+	}}
+	got := skillsBlock(b)
+	for _, want := range []string{"agent-browser", "Browser automation CLI", "graphify"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("skills block missing %q: %q", want, got)
+		}
+	}
+	if skillsBlock(nil) != "" {
+		t.Fatal("nil bundle must render empty skills block")
+	}
+	if skillsBlock(&rules.Bundle{}) != "" {
+		t.Fatal("empty bundle must render empty skills block")
+	}
+}
+
+func TestWithSkillListAnnotatesSkillTool(t *testing.T) {
+	b := &rules.Bundle{Skills: []rules.SkillMeta{
+		{Name: "agent-browser", Description: "Browser automation CLI"},
+	}}
+	specs := withSkillList(toolSpecs(), b)
+	found := false
+	for _, sp := range specs {
+		if sp.Name == "skill" && strings.Contains(sp.Description, "agent-browser") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("skill tool description must list available skills")
+	}
+	// Nil bundle leaves specs untouched.
+	plain := withSkillList(toolSpecs(), nil)
+	for _, sp := range plain {
+		if sp.Name == "skill" && strings.Contains(sp.Description, "Available:") {
+			t.Fatal("nil bundle must not annotate skill tool")
 		}
 	}
 }

@@ -80,6 +80,65 @@ type Request struct {
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
+// EffortVariants lists the selectable reasoning-effort variants in UI order.
+// "" (auto) is the provider default; the rest map per provider.
+var EffortVariants = []string{"auto", "low", "medium", "high", "xhigh", "max"}
+
+// NormalizeEffort lowercases/trims a variant, mapping "" and "auto" to ""
+// (provider default). Unknown values normalize to "" so callers can detect
+// them via ValidEffort before sending.
+func NormalizeEffort(s string) string {
+	t := strings.ToLower(strings.TrimSpace(s))
+	if t == "" || t == "auto" {
+		return ""
+	}
+	switch t {
+	case "low", "medium", "high", "xhigh", "max":
+		return t
+	default:
+		return ""
+	}
+}
+
+// ValidEffort reports whether s is a supported variant name ("" and "auto"
+// count as the provider default).
+func ValidEffort(s string) bool {
+	t := strings.ToLower(strings.TrimSpace(s))
+	switch t {
+	case "", "auto", "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
+}
+
+// EffortLabel renders "" as "auto" for pills and pickers.
+func EffortLabel(s string) string {
+	if NormalizeEffort(s) == "" {
+		return "auto"
+	}
+	return NormalizeEffort(s)
+}
+
+// EffortBudget maps a variant to an Anthropic thinking budget in tokens.
+// ponytail: coarse ladder; Anthropic requires budget >= 1024.
+func EffortBudget(effort string) int {
+	switch NormalizeEffort(effort) {
+	case "low":
+		return 1024
+	case "medium":
+		return 4096
+	case "high":
+		return 10000
+	case "xhigh":
+		return 20000
+	case "max":
+		return 32000
+	default:
+		return 0
+	}
+}
+
 // Provider streams a completion.
 type Provider interface {
 	Chat(ctx context.Context, req Request) (<-chan Chunk, error)

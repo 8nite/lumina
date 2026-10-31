@@ -80,6 +80,8 @@ func listOpenAIModels(ctx context.Context, url, key string, headers map[string]s
 	if req.Header.Get("x-lumina-session") == "" {
 		sid := newSessionID()
 		req.Header.Set("x-lumina-session", sid)
+		// opencode zen routes on this header; harmless elsewhere.
+		req.Header.Set("x-opencode-session", sid)
 	}
 	resp, err := newClient().Do(req)
 	if err != nil {
@@ -140,8 +142,8 @@ func (p *OpenAICompat) Chat(ctx context.Context, req Request) (<-chan Chunk, err
 	if req.MaxTokens > 0 {
 		body["max_tokens"] = req.MaxTokens
 	}
-	if req.ReasoningEffort != "" {
-		body["reasoning_effort"] = req.ReasoningEffort
+	if e := NormalizeEffort(req.ReasoningEffort); e != "" {
+		body["reasoning_effort"] = e
 	}
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]interface{}, 0, len(req.Tools))
@@ -163,7 +165,10 @@ func (p *OpenAICompat) Chat(ctx context.Context, req Request) (<-chan Chunk, err
 		headers[k] = v
 	}
 	if _, ok := headers["x-lumina-session"]; !ok {
-		headers["x-lumina-session"] = newSessionID()
+		sid := newSessionID()
+		headers["x-lumina-session"] = sid
+		// opencode zen routes on this header; harmless elsewhere.
+		headers["x-opencode-session"] = sid
 	}
 	resp, err := postJSON(ctx, url, p.APIKey, body, headers)
 	if err != nil {

@@ -225,11 +225,22 @@ func (r *Registry) Call(ctx context.Context, sc SecCtx, name string, args map[st
 			if !ok || p == "" || !isEditName(name) {
 				continue
 			}
-			resolved := p
-			if !filepath.IsAbs(p) {
-				resolved = filepath.Join(sc.WorkspaceDir, p)
+			expanded := security.ExpandHome(p)
+			resolved := expanded
+			if !filepath.IsAbs(expanded) {
+				resolved = filepath.Join(sc.WorkspaceDir, expanded)
 			}
-			if !insideWorkspace(sc.WorkspaceDir, resolved) && !security.IsPlanWritable(sc.WorkspaceDir, p) {
+			// Layer 0: workspace containment with external whitelist.
+			// Reads may touch home/tmp/system; writes stay workspace+tmp.
+			// Plan-mode plan.md scope is enforced in Authorize/doPatch.
+			allowed := false
+			switch strings.ToLower(name) {
+			case "read":
+				allowed = insideWorkspace(sc.WorkspaceDir, resolved) || security.IsWhitelistedRead(resolved)
+			default:
+				allowed = insideWorkspace(sc.WorkspaceDir, resolved) || security.IsWhitelistedWrite(resolved)
+			}
+			if !allowed && !security.IsPlanWritable(sc.WorkspaceDir, p) {
 				return Result{}, fmt.Errorf("tool %q: path escapes workspace", name)
 			}
 		}
@@ -311,11 +322,20 @@ func toolTarget(name string, args map[string]interface{}) string {
 }
 
 func insideWorkspace(root, p string) bool {
+	p = security.ExpandHome(p)
 	rel, err := filepath.Rel(root, filepath.Clean(p))
 	if err != nil {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func isReadAllowed(root, p string) bool {
+	return security.IsReadAllowed(root, p)
+}
+
+func isWriteAllowed(root, p string) bool {
+	return security.IsWriteAllowed(root, p)
 }
 
 func strArg(args map[string]interface{}, keys ...string) string {
@@ -328,6 +348,7 @@ func strArg(args map[string]interface{}, keys ...string) string {
 }
 
 func resolvePath(sc SecCtx, p string) string {
+	p = security.ExpandHome(p)
 	if filepath.IsAbs(p) || sc.WorkspaceDir == "" {
 		return p
 	}
@@ -354,6 +375,8 @@ func (r *Registry) doRead(_ context.Context, sc SecCtx, args map[string]interfac
 		limit = 2000
 	}
 	// Directory: one entry per line, paginated like text.
+	// Workspace-internal credential entries are filtered; external whitelisted
+	// dirs (home/tmp/system) list all dotfiles per explicit user override.
 	if st.IsDir() {
 		entries, err := os.ReadDir(p)
 		if err != nil {
@@ -361,6 +384,10 @@ func (r *Registry) doRead(_ context.Context, sc SecCtx, args map[string]interfac
 		}
 		var names []string
 		for _, e := range entries {
+			full := filepath.Join(p, e.Name())
+			if security.IsCredentialPath(full) && insideWorkspace(sc.WorkspaceDir, full) {
+				continue
+			}
 			names = append(names, e.Name())
 		}
 		sort.Strings(names)
@@ -446,14 +473,16 @@ func (r *Registry) doBash(ctx context.Context, sc SecCtx, args map[string]interf
 	if cmdStr == "" {
 		return Result{}, fmt.Errorf("bash: missing command")
 	}
-	// workdir runs the command in a subdirectory of the workspace.
+	// workdir runs the command in the workspace or a whitelisted external
+	// dir (home/tmp/system for inspection; temp for scratch).
 	dir := sc.WorkspaceDir
 	if w := strArg(args, "workdir", "work_dir", "cwd"); w != "" {
-		resolved := w
-		if !filepath.IsAbs(w) {
-			resolved = filepath.Join(sc.WorkspaceDir, w)
+		expanded := security.ExpandHome(w)
+		resolved := expanded
+		if !filepath.IsAbs(expanded) {
+			resolved = filepath.Join(sc.WorkspaceDir, expanded)
 		}
-		if !insideWorkspace(sc.WorkspaceDir, resolved) {
+		if !insideWorkspace(sc.WorkspaceDir, resolved) && !security.IsWhitelistedRead(resolved) {
 			return Result{}, fmt.Errorf("bash: workdir escapes workspace")
 		}
 		if st, err := os.Stat(resolved); err != nil || !st.IsDir() {
@@ -513,6 +542,9 @@ func (r *Registry) doGrep(_ context.Context, sc SecCtx, args map[string]interfac
 	root := sc.WorkspaceDir
 	if p := strArg(args, "path"); p != "" {
 		root = resolvePath(sc, p)
+		if sc.WorkspaceDir != "" && !insideWorkspace(sc.WorkspaceDir, root) && !security.IsWhitelistedRead(root) {
+			return Result{}, fmt.Errorf("grep: path escapes workspace")
+		}
 	}
 	if pattern == "" || root == "" {
 		return Result{}, fmt.Errorf("grep: missing pattern/path")
@@ -556,8 +588,8 @@ func (r *Registry) doGrep(_ context.Context, sc SecCtx, args map[string]interfac
 		if strings.Contains(p, "/.git/") || strings.Contains(p, "/node_modules/") {
 			return nil
 		}
-		if security.IsCredentialPath(p) {
-			return nil // never index secret-shaped files
+		if security.IsCredentialPath(p) && insideWorkspace(sc.WorkspaceDir, p) {
+			return nil // workspace secrets never indexed; external whitelist allows dotfiles
 		}
 		if info.Size() > 1<<20 {
 			return nil
@@ -613,7 +645,7 @@ func (r *Registry) doGlob(_ context.Context, sc SecCtx, args map[string]interfac
 	root := sc.WorkspaceDir
 	if p := strArg(args, "path"); p != "" {
 		root = resolvePath(sc, p)
-		if !insideWorkspace(sc.WorkspaceDir, root) {
+		if !insideWorkspace(sc.WorkspaceDir, root) && !security.IsWhitelistedRead(root) {
 			return Result{}, fmt.Errorf("glob: path escapes workspace")
 		}
 	}
@@ -644,6 +676,9 @@ func (r *Registry) doGlob(_ context.Context, sc SecCtx, args map[string]interfac
 				}
 				return nil
 			}
+			if security.IsCredentialPath(p) && insideWorkspace(sc.WorkspaceDir, p) {
+				return nil // workspace secrets hidden; external whitelist lists all dotfiles
+			}
 			if re.MatchString(filepath.ToSlash(rp)) {
 				rel = append(rel, rp)
 			}
@@ -652,6 +687,9 @@ func (r *Registry) doGlob(_ context.Context, sc SecCtx, args map[string]interfac
 	} else {
 		matches, _ := filepath.Glob(filepath.Join(root, pattern))
 		for _, m := range matches {
+			if security.IsCredentialPath(m) && insideWorkspace(sc.WorkspaceDir, m) {
+				continue
+			}
 			rp, _ := filepath.Rel(root, m)
 			rel = append(rel, rp)
 		}
@@ -1289,7 +1327,7 @@ func (r *Registry) doWebSearch(_ context.Context, _ SecCtx, args map[string]inte
 		return Result{}, fmt.Errorf("websearch: unknown provider %q", r.WebSearchProvider)
 	}
 	if len(order) == 0 {
-		return Result{}, fmt.Errorf("websearch: no provider available (set TAVILY_API_KEY, EXA_API_KEY, FIRECRAWL_API_KEY, PARALLEL_API_KEY, or TINYFISH_API_KEY; pick with [websearch] provider)")
+		return Result{}, fmt.Errorf("websearch: no provider available (set TAVILY_API_KEY, EXA_API_KEY, FIRECRAWL_API_KEY, PARALLEL_API_KEY, or TINYFISH_API_KEY; pick with [websearch] provider) — fallback: use webfetch on a direct URL or public JSON API (no key needed)")
 	}
 	var lastErr error
 	for _, p := range order {

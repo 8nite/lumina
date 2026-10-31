@@ -20,20 +20,21 @@ export function ServersModal(props: { active: string; onPick: (url: string) => v
   return (
     <div className="fixed inset-0 z-30 flex items-start justify-center bg-black/60 pt-32" onClick={props.onClose}>
       <div
-        className="w-full max-w-lg rounded-xl border border-white/10 bg-[#141416] p-5 shadow-2xl"
+        className="w-full max-w-lg rounded-[12px] bg-[var(--v2-bg-base)] p-5 shadow-[var(--v2-elevation-floating)]"
+        style={{ border: '1px solid var(--v2-border-base)' }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-1 flex items-center justify-between">
-          <h2 className="text-sm text-zinc-100">Servers</h2>
-          <button className="text-zinc-500 hover:text-zinc-300" onClick={props.onClose}>
+          <h2 className="v2-title text-[13px]">Servers</h2>
+          <button className="text-[var(--v2-text-muted)] hover:text-[var(--v2-text-base)]" onClick={props.onClose}>
             ✕
           </button>
         </div>
-        <p className="mb-3 text-xs text-zinc-400">Switch which Lumina server this app connects to.</p>
-        <div className="mb-2 flex items-center gap-2 rounded-md border border-white/10 bg-white/[0.02] px-2">
-          <span className="text-zinc-500">🔍</span>
+        <p className="mb-3 text-[12px] text-[var(--v2-text-muted)]">Switch which Lumina server this app connects to.</p>
+        <div className="v2-search mb-2 flex items-center gap-2 px-2">
+          <span className="text-[var(--v2-text-faint)]">🔍</span>
           <input
-            className="w-full bg-transparent py-2 text-sm outline-none placeholder:text-zinc-600"
+            className="w-full bg-transparent py-2 text-[13px] outline-none placeholder:text-[var(--v2-text-faint)]"
             placeholder="Search servers"
             value={q}
             onChange={(e) => setQ(e.target.value)}
@@ -44,27 +45,27 @@ export function ServersModal(props: { active: string; onPick: (url: string) => v
             <button
               key={u}
               onClick={() => { props.onPick(u); props.onClose(); }}
-              className="flex w-full items-center gap-2 rounded-md border border-white/10 bg-white/[0.03] px-3 py-2 text-left text-sm hover:bg-white/[0.06]"
+              className="v2-row flex w-full items-center gap-2 border border-[var(--v2-border-base)] px-3 py-2 text-left text-[13px]"
             >
               <span className="inline-block h-1.5 w-1.5 rounded-full bg-green-500" />
-              <span className="text-zinc-100">{u.replace(/^https?:\/\//, '')}</span>
-              <span className="text-zinc-500">local</span>
+              <span className="text-[var(--v2-text-base)]">{u.replace(/^https?:\/\//, '')}</span>
+              <span className="text-[var(--v2-text-muted)]">local</span>
               <span className="flex-1" />
-              {props.active === u && <span className="text-zinc-300">✓</span>}
+              {props.active === u && <span>✓</span>}
             </button>
           ))}
-          {shown.length === 0 && <div className="text-xs text-zinc-600">No saved servers match.</div>}
+          {shown.length === 0 && <div className="text-[12px] text-[var(--v2-text-faint)]">No saved servers match.</div>}
         </div>
-        <div className="text-xs text-zinc-400">Add a server</div>
+        <div className="text-[12px] text-[var(--v2-text-muted)]">Add a server</div>
         <div className="mt-1 flex gap-2">
           <input
-            className="flex-1 rounded-md border border-white/10 bg-transparent px-3 py-2 text-sm outline-none placeholder:text-zinc-600"
+            className="flex-1 rounded-[6px] border border-[var(--v2-border-base)] bg-transparent px-3 py-2 text-[13px] outline-none placeholder:text-[var(--v2-text-faint)]"
             placeholder="http://localhost:7432"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && add()}
           />
-          <button onClick={add} className="rounded-md border border-white/10 px-3 text-sm text-zinc-200 hover:bg-white/5">
+          <button onClick={add} className="v2-row rounded-[6px] border border-[var(--v2-border-base)] px-3 text-[13px]">
             + Add
           </button>
         </div>

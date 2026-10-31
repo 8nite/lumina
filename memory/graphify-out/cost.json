@@ -48,6 +48,55 @@
       "output_tokens": 0,
       "files": 1,
       "note": "host-agent inline refresh of long-session-fixes.md (no-key flow)"
+    },
+    {
+      "date": "2026-10-30T13:18:56.297936+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of prompts-parity.md (no-key flow)"
+    },
+    {
+      "date": "2026-10-30T15:21:07.249015+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 3,
+      "note": "host-agent inline refresh of config-defaults-fix.md + lumina-live.md routing headers (no-key flow)"
+    },
+    {
+      "date": "2026-10-30T22:42:45.975964+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of browser-skills.md + MEMORY.md index (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T14:28:56.660797+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of browser-skills.md (ad-fix + global/keyless-fallback nodes) + lumina-live.md coverage re-verify (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T14:48:25.187901+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of vault-placeholders.md + MEMORY.md index (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T15:30:38.747616+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 4,
+      "note": "host-agent inline refresh of resync-variants.md + MEMORY.md index + lumina-live.md date + vault-placeholders.md re-stamp (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T15:39:24.524129+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of loops-and-claims.md + MEMORY.md index (no-key flow)"
     }
   ],
   "total_input_tokens": 0,

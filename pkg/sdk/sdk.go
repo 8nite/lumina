@@ -39,6 +39,84 @@ type Session struct {
 	PermissionMode string `json:"permission_mode"`
 	Model          string `json:"model,omitempty"`
 	Title          string `json:"title,omitempty"`
+	Running        bool   `json:"running,omitempty"`
+}
+
+// GetSession fetches one session (includes the running flag so a client
+// that missed turn.started can recover its working indicator).
+func (c *Client) GetSession(ctx context.Context, id string) (*Session, error) {
+	resp, err := c.req(ctx, http.MethodGet, "/api/v1/sessions/"+id, nil)
+	if err != nil {
+		return nil, err
+	}
+	var s Session
+	return &s, decode(resp, &s)
+}
+
+// PendingPermission is one approval prompt blocking a session.
+type PendingPermission struct {
+	RequestID string `json:"request_id"`
+	Tool      string `json:"tool"`
+	Target    string `json:"target"`
+}
+
+// PendingQuestion is one question prompt blocking a session.
+type PendingQuestion struct {
+	RequestID string `json:"request_id"`
+	Questions []struct {
+		Question string `json:"question"`
+		Header   string `json:"header,omitempty"`
+		Options  []struct {
+			Label       string `json:"label"`
+			Description string `json:"description,omitempty"`
+		} `json:"options,omitempty"`
+		Multiple bool `json:"multiple,omitempty"`
+	} `json:"questions"`
+}
+
+// SessionState is the atomic resync payload for a (re)loaded client that
+// missed SSE while away: running flag + pending prompts. Pair it with
+// ExportTranscript for the full timeline.
+type SessionState struct {
+	Session    Session            `json:"session"`
+	Running    bool               `json:"running"`
+	Permission *PendingPermission `json:"permission"`
+	Question   *PendingQuestion   `json:"question"`
+}
+
+// SessionState fetches the resync payload for one session.
+func (c *Client) SessionState(ctx context.Context, id string) (*SessionState, error) {
+	resp, err := c.req(ctx, http.MethodGet, "/api/v1/sessions/"+id+"/state", nil)
+	if err != nil {
+		return nil, err
+	}
+	var st SessionState
+	return &st, decode(resp, &st)
+}
+
+// TranscriptTurn is one persisted turn row.
+type TranscriptTurn struct {
+	ID        string `json:"id"`
+	Role      string `json:"role"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
+}
+
+// ExportTranscript fetches the persisted transcript. The daemon stores the
+// user turn at turn start and tool turns incrementally, so mid-turn exports
+// already contain partial history.
+func (c *Client) ExportTranscript(ctx context.Context, id string) ([]TranscriptTurn, error) {
+	resp, err := c.req(ctx, http.MethodGet, "/api/v1/sessions/"+id+"/export", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Transcript []TranscriptTurn `json:"transcript"`
+	}
+	if err := decode(resp, &out); err != nil {
+		return nil, err
+	}
+	return out.Transcript, nil
 }
 
 // Event is one SSE message.

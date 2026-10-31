@@ -1,5 +1,5 @@
 ---
-date_modified: 2026-10-30
+date_modified: 2026-10-31
 tags: [index, memory, lumina]
 ---
 
@@ -14,3 +14,8 @@ tags: [index, memory, lumina]
 - [[long-session-fixes]] — Long-session hardening (prompt single-flight, terminal SSE + reconnect, permission modal, context gauge, TUI space key).
 - [[context-from-providers]] — Provider-sourced context windows (`ModelMeta.context_window`, `Router.ContextWindow` cache) feeding the gauge.
 - [[prompts-parity]] — Opencode-v2 prompt/tool parity fixes (conditional tool guidance, env/date block, schemas, fence).
+- [[config-defaults-fix]] — `[defaults]` agent/permission_mode seeding TUI + headless runs (CLI flags still win).
+- [[browser-skills]] — agent-browser skill port (`bundle.Skills` ad gap, explicit load).
+- [[vault-placeholders]] — session vault + `{placeholder_xxx}` remap, detector families, layer-0 guidance, widened credential hard-deny.
+- [[resync-variants]] — session state resync endpoint + TUI rebuild, effort variant picker, identical-round loop guard.
+- [[loops-and-claims]] — per-call repeat ledger (3rd identical call) + cross-daemon turn claim (`inflight_owner`, 12 min stale takeover, 409).

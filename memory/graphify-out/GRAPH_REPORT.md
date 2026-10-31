@@ -1,12 +1,12 @@
-# Graph Report - memory  (2026-10-30)
+# Graph Report - memory  (2026-10-31, refreshed inline incl. loops-and-claims)
 
 ## Corpus Check
-- 10 files · ~2100 words
+- 14 files · ~3600 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 35 nodes · 56 edges · 4 communities
-- Extraction: 88% EXTRACTED · 12% INFERRED · 0% AMBIGUOUS · INFERRED: 6 edges (avg confidence: 0.83)
+- 56 nodes · 88 edges · 4 communities
+- Extraction: 90% EXTRACTED · 10% INFERRED · 0% AMBIGUOUS · INFERRED: 7 edges (avg confidence: 0.84)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)
@@ -19,9 +19,9 @@
 1. `Lumina Pure-Go Daemon` - 10 edges
 2. `Lumina plan.md Implementation (M0-M6)` - 8 edges
 3. `Subagent Background Web Tool Surface` - 8 edges
-4. `Lumina Memory Index` - 6 edges
+4. `Lumina Memory Index` - 7 edges
 5. `Markdown + Graphify RAG Engine` - 5 edges
-6. `lumina Live Wiring` - 5 edges
+6. `lumina Live Wiring` - 6 edges
 7. `Turn Delta Tool Completed Streaming Events` - 5 edges
 8. `Reference system-prompt Parity via toolGuidance` - 4 edges
 9. `Harness2 Propose-Probe-Compose Engine` - 3 edges
@@ -53,15 +53,19 @@ Nodes (7): Lumina plan.md Implementation (M0-M6), Go plus Web Verification Gate,
 
 ### Community 1 - "Memory Index and Live Wiring"
 Cohesion: 0.40
-Nodes (13): lumina Live Wiring, Lumina Memory Index, Steer Queue Inbox While Working, TUI Thinking Toggle plus Web Tool Pills, Turn Delta Tool Completed Streaming Events, Long-Session Hardening Pass, Per-Session Prompt Single-Flight, Terminal SSE plus Auto-Reconnect, Web Permission Modal Answers permission.asked, Live Context Gauge (turn.context), TUI Space Key Types, Provider-Sourced Context Window, Router Context Cache with Caps
+Nodes (18): lumina Live Wiring, Lumina Memory Index, Steer Queue Inbox While Working, TUI Thinking Toggle plus Web Tool Pills, Turn Delta Tool Completed Streaming Events, Long-Session Hardening Pass, Per-Session Prompt Single-Flight, Terminal SSE plus Auto-Reconnect, Web Permission Modal Answers permission.asked, Live Context Gauge (turn.context), TUI Space Key Types, Provider-Sourced Context Window, Router Context Cache with Caps, Dual Routing Session Headers, Session State Resync Endpoint, TUI Resync Timeline Rebuild, Missed-Started Recovery, Effort Variant Picker
 
 ### Community 2 - "Subagent Background Web Tools"
 Cohesion: 0.40
-Nodes (6): BTC E2E Web Subagent Background Verification, SSE Fragment Accumulation Fix, Reference system-prompt Parity via toolGuidance, Plan-Fence Deny plus Permission Gating, Depth-1 Subagent Runner with Explore Envelope, Subagent Background Web Tool Surface
+Nodes (9): BTC E2E Web Subagent Background Verification, SSE Fragment Accumulation Fix, Reference system-prompt Parity via toolGuidance, Plan-Fence Deny plus Permission Gating, Depth-1 Subagent Runner with Explore Envelope, Subagent Background Web Tool Surface, Question Round-Trip UI Wiring, Patch Tool Envelope, Identical-Round Loop Guard
 
 ### Community 3 - "Plan/Build and Permission Modes"
+Nodes (9): Lumina Pure-Go Daemon, 4-Mode Permission & Bypass Broker (Shift+Tab), Plan & Build Primary Agent Modes (Tab), AGENTS.md & Markdown Extensions Loader, Config Defaults Seed Flags, agent-browser Skill Port, Skill Advertisement Gap, Skill Advertisement Fix (skillsBlock), Global Skill Promotion plus Keyless Fallback
+
+<!-- superseded node list follows -->
+### Community 3 (prev)
 Cohesion: 0.83
-Nodes (4): Lumina Pure-Go Daemon, 4-Mode Permission & Bypass Broker (Shift+Tab), Plan & Build Primary Agent Modes (Tab), AGENTS.md & Markdown Extensions Loader
+Nodes (5): Lumina Pure-Go Daemon, 4-Mode Permission & Bypass Broker (Shift+Tab), Plan & Build Primary Agent Modes (Tab), AGENTS.md & Markdown Extensions Loader, Config Defaults Seed Flags
 
 ## Knowledge Gaps
 - **6 isolated node(s):** `Go plus Web Verification Gate`, `Singleflight Standing-Ops KB Sweeper`, `TUI Thinking Toggle plus Web Tool Pills`, `SSE Fragment Accumulation Fix`, `Plan-Fence Deny plus Permission Gating` (+1 more)

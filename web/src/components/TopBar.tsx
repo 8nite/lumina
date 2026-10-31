@@ -7,17 +7,15 @@ function fmtk(n: number): string {
   return `${(n / 1000).toFixed(1)}k`;
 }
 
+// v2-style session identity header: location crumb + title + context gauge.
 export function TopBar(props: {
   session: Session | null;
-  sessions: Session[];
-  onSelect: (s: Session | null) => void;
+  onToggleSidebar: () => void;
   onNew: () => void;
   onFork: () => void;
   onExport: () => void;
-  onShowServers: () => void;
   onToggleReview: () => void;
   reviewOpen: boolean;
-  host: string;
   ctx?: { used: number; max: number } | null;
 }) {
   const ctxText =
@@ -26,28 +24,38 @@ export function TopBar(props: {
         ? `ctx ~${fmtk(props.ctx.used)}/${fmtk(props.ctx.max)}`
         : `ctx ~${fmtk(props.ctx.used)}`
       : '';
-  const ctxPct =
-    props.ctx && props.ctx.used && props.ctx.max > 0
-      ? Math.min(100, Math.round((props.ctx.used / props.ctx.max) * 100))
-      : 0;
   const [menu, setMenu] = useState(false);
+  const ws = props.session?.workspace_dir || '';
+  const leaf = ws.split('/').filter(Boolean).pop() || ws || 'session';
   return (
-    <div className="flex h-12 shrink-0 items-center gap-1 border-b border-white/10 px-2 text-sm">
-      <button className="rounded px-2 py-1 text-zinc-400 hover:bg-white/5" title="Menu">
+    <div className="flex h-12 shrink-0 items-center gap-1 border-b border-[var(--v2-border-base)] px-2 text-[13px]">
+      <button
+        className="v2-row px-2 py-1 text-[var(--v2-text-muted)]"
+        title="Toggle sidebar (mod+shift+b)"
+        onClick={props.onToggleSidebar}
+      >
         ☰
       </button>
       <div className="relative">
         <button
           onClick={() => setMenu(!menu)}
-          className="flex items-center gap-1 rounded px-2 py-1 text-zinc-200 hover:bg-white/5"
+          className="v2-row flex max-w-72 items-center gap-1.5 px-2 py-1 text-[var(--v2-text-base)]"
         >
-          <span className="max-w-64 truncate">{props.session?.title || props.session?.id || 'New session'}</span>
-          <span className="text-xs text-zinc-500">▾</span>
+          <span className="max-w-56 truncate font-medium">
+            {props.session ? props.session.title || props.session.id.slice(0, 8) : 'New session'}
+          </span>
+          {!props.session && (
+            <span className="truncate text-[var(--v2-text-faint)]">· {leaf}</span>
+          )}
+          <span className="text-[11px] text-[var(--v2-text-faint)]">▾</span>
         </button>
         {menu && (
-          <div className="absolute left-0 top-9 z-20 w-72 rounded-lg border border-white/10 bg-[#141416] p-1 shadow-xl">
+          <div
+            className="absolute left-0 top-9 z-20 w-72 rounded-[12px] bg-[var(--v2-bg-base)] p-1 shadow-[var(--v2-elevation-floating)]"
+            style={{ border: '1px solid var(--v2-border-base)' }}
+          >
             <button
-              className="block w-full rounded px-2 py-1.5 text-left hover:bg-white/5"
+              className="v2-row block w-full rounded-[6px] px-2 py-1.5 text-left"
               onClick={() => { setMenu(false); props.onNew(); }}
             >
               + New session
@@ -55,51 +63,38 @@ export function TopBar(props: {
             {props.session && (
               <>
                 <button
-                  className="block w-full rounded px-2 py-1.5 text-left hover:bg-white/5"
+                  className="v2-row block w-full rounded-[6px] px-2 py-1.5 text-left"
                   onClick={() => { setMenu(false); props.onFork(); }}
                 >
                   Fork session
                 </button>
                 <button
-                  className="block w-full rounded px-2 py-1.5 text-left hover:bg-white/5"
+                  className="v2-row block w-full rounded-[6px] px-2 py-1.5 text-left"
                   onClick={() => { setMenu(false); props.onExport(); }}
                 >
                   Export transcript
                 </button>
               </>
             )}
-            {props.sessions.length > 0 && <div className="my-1 border-t border-white/10" />}
-            {props.sessions.map((s) => (
-              <button
-                key={s.id}
-                className="block w-full truncate rounded px-2 py-1.5 text-left text-zinc-400 hover:bg-white/5 hover:text-zinc-200"
-                onClick={() => { setMenu(false); props.onSelect(s); }}
-              >
-                {s.title || s.id} <span className="text-zinc-600">· {s.agent}</span>
-              </button>
-            ))}
           </div>
         )}
       </div>
+      {props.session && (
+        <span className="hidden truncate text-[12px] text-[var(--v2-text-faint)] md:inline" title={ws}>
+          {leaf} · {props.session.agent}
+        </span>
+      )}
       <div className="flex-1" />
       {ctxText && (
         <span
-          className="mr-1 rounded border border-white/10 px-1.5 py-0.5 font-mono text-[11px] text-zinc-400"
-          title={ctxPct ? `~${ctxPct}% of context window` : 'estimated context usage'}
+          className="mr-1 rounded border border-[var(--v2-border-base)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--v2-text-muted)]"
+          title="estimated context usage"
         >
           {ctxText}
         </span>
       )}
       <button
-        className="flex items-center gap-1.5 rounded px-2 py-1 text-xs text-zinc-400 hover:bg-white/5"
-        onClick={props.onShowServers}
-        title="See servers"
-      >
-        <span className="inline-block h-1.5 w-1.5 rounded-full bg-green-500" />
-        <span className="hidden sm:inline">🖥 {props.host}</span>
-      </button>
-      <button
-        className="rounded px-2 py-1 text-zinc-400 hover:bg-white/5"
+        className="v2-row px-2 py-1 text-[var(--v2-text-muted)]"
         onClick={props.onToggleReview}
         title="Toggle side panel"
       >
@@ -107,7 +102,7 @@ export function TopBar(props: {
       </button>
       {props.session && (
         <button
-          className="rounded px-2 py-1 text-zinc-400 hover:bg-white/5"
+          className="v2-row px-2 py-1 text-[var(--v2-text-muted)]"
           onClick={props.onExport}
           title="Share / export"
         >

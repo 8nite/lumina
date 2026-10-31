@@ -376,6 +376,41 @@ func TestPromptWithImagesAndEffort(t *testing.T) {
 	}
 }
 
+func TestPromptEffortNormalizedAndValidated(t *testing.T) {
+	newSession := func(t *testing.T, h http.Handler) string {
+		t.Helper()
+		cr := httptest.NewRecorder()
+		creq := httptest.NewRequest("POST", "/api/v1/sessions", strings.NewReader(`{"workspace_dir":"/tmp/ws","agent":"build"}`))
+		h.ServeHTTP(cr, creq)
+		if cr.Code != 201 {
+			t.Fatalf("create status=%d", cr.Code)
+		}
+		var created struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(cr.Body.Bytes(), &created)
+		return created.ID
+	}
+	// XHIGH normalizes to xhigh.
+	s := New(Options{})
+	s.Exec = func(_ context.Context, _ string, _ agent.TurnInput) (string, error) { return "seen", nil }
+	h := s.Handler()
+	id := newSession(t, h)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/v1/sessions/"+id+"/prompt", strings.NewReader(`{"text":"hi","effort":"XHIGH"}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != 202 {
+		t.Fatalf("XHIGH status=%d (%s)", rec.Code, rec.Body.String())
+	}
+	// Invalid variants reject with 400.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/api/v1/sessions/"+id+"/prompt", strings.NewReader(`{"text":"hi","effort":"ultra"}`))
+	h.ServeHTTP(rec, req)
+	if rec.Code != 400 {
+		t.Fatalf("invalid effort status=%d want 400 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
 func TestTurnCompletedCarriesSummary(t *testing.T) {
 	s := New(Options{})
 	s.Exec = func(_ context.Context, id string, _ agent.TurnInput) (string, error) {
