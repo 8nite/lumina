@@ -55,6 +55,8 @@ impl Runner {
             ToolSpec { name: "memory_write".into(), description: "Save a durable fact to ./memory/<topic>.md (deduped, secrets rejected).".into(), schema: obj(&["topic", "content"]) },
             ToolSpec { name: "skill".into(), description: "Load a full SKILL.md body by name (only name+description are advertised).".into(), schema: obj(&["name"]) },
             ToolSpec { name: "question".into(), description: "Ask the user a clarifying question with options (interactive sessions only).".into(), schema: obj(&["questions"]) },
+            ToolSpec { name: "websearch".into(), description: "Search the web for current info (needs a provider key; pick with [websearch] provider).".into(), schema: obj(&["query", "provider"]) },
+            ToolSpec { name: "webfetch".into(), description: "Fetch one HTTP(S) URL as markdown/text/HTML (cap 100KB).".into(), schema: obj(&["url", "format"]) },
         ]
     }
 
@@ -75,10 +77,10 @@ impl Runner {
         &self,
         store: &Store,
         router: &Router,
+        cfg: &crate::config::Config,
         session_id: &str,
         text: &str,
         effort: &str,
-        compat: (bool, bool),
         mut on_event: impl FnMut(&str, &str) + Send,
     ) -> Result<String, AgentError> {
         let sess = store
@@ -92,7 +94,7 @@ impl Runner {
             "auto-approve" => PermissionMode::AutoApprove,
             _ => PermissionMode::Bypass,
         };
-        let bundle = Bundle::load(&workspace, compat.0, compat.1);
+        let bundle = Bundle::load(&workspace, cfg.compat.import_global_rules, cfg.compat.import_global_skills);
         store.add_turn(session_id, "user", text)?;
 
         let mut messages = vec![llm::Message {
@@ -113,6 +115,7 @@ impl Runner {
                 crate::kb::query(ws, q, b).map_err(|e| e.to_string())
             })),
             bundle: Some(bundle),
+            websearch_provider: cfg.websearch.provider.clone(),
         };
         let (runner_headless, runner_gate) = match &self.approval {
             Some(g) => (false, g.clone()),

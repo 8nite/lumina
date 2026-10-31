@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::sync::broadcast;
 
-use crate::{agent::Runner, approve::ApprovalGate, llm::Router as LlmRouter, store::Store};
+use crate::{agent::Runner, approve::ApprovalGate, config::Config, llm::Router as LlmRouter, store::Store};
 
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
@@ -30,21 +30,21 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub router: Arc<LlmRouter>,
     pub auth_token: String,
-    pub compat: (bool, bool),
+    pub cfg: Config,
     pub events: broadcast::Sender<serde_json::Value>,
     pub gate: ApprovalGate,
     pub running: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AppState {
-    pub fn new(store: Store, router: LlmRouter, compat: (bool, bool)) -> Self {
+    pub fn new(store: Store, router: LlmRouter, cfg: Config) -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
             gate: ApprovalGate::new(events.clone()),
             store: Arc::new(store),
             router: Arc::new(router),
             auth_token: std::env::var("LUMINA_TOKEN").unwrap_or_default(),
-            compat,
+            cfg,
             events,
             running: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -87,12 +87,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/files", get(files))
         .route("/api/v1/git/diff", get(git_diff))
         .route("/api/v1/git/branch", get(git_branch))
-        .route("/api/v1/pty", get(todo))
+        .route("/api/v1/pty", get(crate::pty::pty))
         .route("/api/v1/providers", get(providers))
         .route("/api/v1/router", get(router_info).put(router_set))
         .route("/api/v1/models", get(models))
-        .route("/api/v1/auth/device/start", get(todo))
-        .route("/api/v1/auth/device/poll", get(todo))
+        .route("/api/v1/auth/device/start", get(auth_device_start))
+        .route("/api/v1/auth/device/poll", get(auth_device_poll))
         .route("/api/v1/kb/query", axum::routing::post(kb_query))
         .route("/api/v1/kb/", get(kb_browse))
         .route("/api/v1/harness", get(todo))
@@ -250,7 +250,7 @@ async fn prompt(
     let tx = st.events.clone();
     let sid = id.clone();
     let out = runner
-        .run_prompt(&st.store, &st.router, &id, &b.text, &effort, st.compat, |d, t| {
+        .run_prompt(&st.store, &st.router, &st.cfg, &id, &b.text, &effort, |d, t| {
             let _ = tx.send(serde_json::json!({"type": "turn.delta", "session": sid, "delta": d, "thinking": t}));
         })
         .await;
@@ -580,6 +580,60 @@ async fn answer_question(
         Json(serde_json::json!({"ok": true})).into_response()
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown or expired request"}))).into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct DeviceQ {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    github_url: String,
+}
+
+/// Begin GitHub device flow (copilot only). The daemon never prints the
+/// token — it lands in the 0600 token store on poll success.
+async fn auth_device_start(Query(q): Query<DeviceQ>) -> impl IntoResponse {
+    let provider = if q.provider.is_empty() { "copilot".to_string() } else { q.provider };
+    if provider != "copilot" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "only copilot supports device auth"}))).into_response();
+    }
+    let token_url = if q.github_url.is_empty() { "https://api.github.com".to_string() } else { q.github_url };
+    match crate::copilot::start_device_flow(&token_url, "").await {
+        Ok(dc) => Json(serde_json::json!({
+            "provider": provider, "device_code": dc.device_code, "user_code": dc.user_code,
+            "verification_uri": dc.verification_uri, "interval": dc.interval,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DevicePollQ {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    github_url: String,
+    #[serde(default)]
+    device_code: String,
+}
+
+async fn auth_device_poll(Query(q): Query<DevicePollQ>) -> impl IntoResponse {
+    let provider = if q.provider.is_empty() { "copilot".to_string() } else { q.provider };
+    let token_url = if q.github_url.is_empty() { "https://api.github.com".to_string() } else { q.github_url };
+    if q.device_code.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "device_code required"}))).into_response();
+    }
+    match crate::copilot::poll_device_flow(&token_url, &q.device_code).await {
+        Ok(crate::copilot::Poll::Token(t)) => {
+            if let Err(e) = crate::copilot::write_token_store(&provider, &t) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+            }
+            Json(serde_json::json!({"provider": provider, "connected": true})).into_response()
+        }
+        Ok(crate::copilot::Poll::Pending) => Json(serde_json::json!({"pending": true})).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
 

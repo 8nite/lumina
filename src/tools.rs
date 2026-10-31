@@ -50,6 +50,8 @@ pub struct Registry {
     pub kb_query: Option<KbQueryFn>,
     /// Loaded skill/agent/command bundle for the `skill` tool.
     pub bundle: Option<Bundle>,
+    /// `[websearch] provider` selection ("" = auto across keyed providers).
+    pub websearch_provider: String,
 }
 
 /// `kb::query` adapter: (workspace, query, budget) -> context text.
@@ -57,11 +59,11 @@ pub type KbQueryFn = Arc<dyn Fn(&Path, &str, usize) -> Result<String, String> + 
 
 impl Registry {
     pub fn new() -> Self {
-        Self { kb_query: None, bundle: None }
+        Self { kb_query: None, bundle: None, websearch_provider: String::new() }
     }
 
     pub fn names() -> &'static [&'static str] {
-        &["read", "edit", "write", "bash", "grep", "glob", "kb_query", "memory_write", "skill", "question"]
+        &["read", "edit", "write", "bash", "grep", "glob", "kb_query", "memory_write", "skill", "question", "websearch", "webfetch"]
     }
 
     pub fn call(
@@ -109,6 +111,8 @@ impl Registry {
             "memory_write" => do_memory_write(sc, args),
             "skill" => do_skill(self, args),
             "question" => do_question(sc, args),
+            "websearch" => do_websearch(self, args),
+            "webfetch" => do_webfetch(args),
             _ => Err(ToolError::Msg(format!("unknown tool {name}"))),
         }
     }
@@ -133,6 +137,8 @@ fn tool_target(name: &str, args: &HashMap<String, serde_json::Value>) -> String 
         "glob" => s(&["pattern", "glob"]),
         "skill" => s(&["name", "skill"]),
         "kb_query" => s(&["query", "q"]),
+        "websearch" => s(&["query", "q"]),
+        "webfetch" => s(&["url"]),
         _ => String::new(),
     }
 }
@@ -478,4 +484,26 @@ fn do_question(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result
         output: format!("user answered: {}", answers.join(" | ")),
         truncated: false,
     })
+}
+
+fn do_websearch(reg: &Registry, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+    let q = str_arg(args, &["query", "q"]);
+    let provider = str_arg(args, &["provider"]);
+    let want = if provider.is_empty() { reg.websearch_provider.clone() } else { provider };
+    crate::websearch::search(&want, &q)
+        .map(|s| {
+            let truncated = s.len() > 8000;
+            Outcome { output: s, truncated }
+        })
+        .map_err(|e| ToolError::Msg(e.to_string()))
+}
+
+fn do_webfetch(args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+    let url = str_arg(args, &["url"]);
+    let format = str_arg(args, &["format"]);
+    let format = if format.is_empty() { "markdown" } else { &format };
+    let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000).min(120_000);
+    crate::websearch::fetch(&url, format, std::time::Duration::from_millis(timeout_ms))
+        .map(|(s, t)| Outcome { output: s, truncated: t })
+        .map_err(|e| ToolError::Msg(e.to_string()))
 }

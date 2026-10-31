@@ -92,6 +92,12 @@ impl RouterConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+pub struct WebSearchConfig {
+    #[serde(default)]
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct KbConfig {
     #[serde(default = "default_idle")]
     pub idle_debounce_minutes: u64,
@@ -116,6 +122,8 @@ struct RawConfig {
     router: RouterConfig,
     #[serde(default)]
     kb: KbConfig,
+    #[serde(default)]
+    websearch: WebSearchConfig,
     /// `[permissions] edit="allow"` plus nested `[permissions.bash]` table.
     /// `toml::Value` tolerates the mixed string/table shape (Go uses `toml.Primitive`).
     #[serde(default)]
@@ -130,6 +138,7 @@ pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
     pub router: RouterConfig,
     pub kb: KbConfig,
+    pub websearch: WebSearchConfig,
     pub permissions: HashMap<String, String>,
     pub permissions_bash: HashMap<String, String>,
 }
@@ -166,6 +175,7 @@ impl Config {
             cfg.providers = raw.providers;
             cfg.router = raw.router;
             cfg.kb = raw.kb;
+            cfg.websearch = raw.websearch;
             for (k, v) in raw.permissions {
                 if k == "bash" {
                     if let toml::Value::Table(t) = v {
@@ -206,6 +216,15 @@ impl Config {
                     "config: provider {name:?}: Google endpoints are blocked (zero-Google rule)"
                 )));
             }
+        }
+        let ws = self.websearch.provider.trim().to_lowercase();
+        if !matches!(
+            ws.as_str(),
+            "" | "exa" | "firecrawl" | "tavily" | "parallel" | "tinyfish" | "random" | "auto"
+        ) {
+            return Err(ConfigError::Msg(format!(
+                "config: unknown websearch provider {ws:?} (want exa|firecrawl|parallel|tavily|tinyfish|random)"
+            )));
         }
         Ok(())
     }

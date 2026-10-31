@@ -9,8 +9,10 @@
 mod agent;
 mod approve;
 mod config;
+mod copilot;
 mod kb;
 mod llm;
+mod pty;
 mod rules;
 mod sdk;
 mod security;
@@ -18,6 +20,7 @@ mod server;
 mod store;
 mod tools;
 mod tui;
+mod websearch;
 
 use agent::Runner;
 use clap::{Parser, Subcommand};
@@ -67,6 +70,16 @@ enum Cmd {
         rest: Vec<String>,
     },
     Web {},
+    Pair {
+        #[arg(long)]
+        lan: bool,
+    },
+    Auth {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        github_url: Option<String>,
+    },
     Attach {
         url: String,
     },
@@ -169,6 +182,50 @@ async fn main() -> MainResult {
             .map_err(|e| format!("tui: {e}"))?;
             Ok(())
         }
+        Some(Cmd::Web {}) => {
+            let base = std::env::var("LUMINA_URL").unwrap_or_else(|_| "http://127.0.0.1:7432".into());
+            ensure_daemon(&base, &cfg).await?;
+            println!("{base}");
+            // Best-effort browser open; the URL above is the contract.
+            let _ = std::process::Command::new("xdg-open").arg(&base).output();
+            Ok(())
+        }
+        Some(Cmd::Pair { lan: _ }) => {
+            let mut token = std::env::var("LUMINA_TOKEN").unwrap_or_default();
+            if token.is_empty() {
+                token = uuid::Uuid::new_v4().to_string();
+                println!("LUMINA_TOKEN not set; generated one-time token (export it before serving):");
+                println!("  export LUMINA_TOKEN={token}");
+            }
+            let short = if token.len() > 6 { &token[..6] } else { &token };
+            println!("attach from another host on your LAN/Tailscale network with:");
+            println!("  lumina attach http://<this-host>:7432   (LUMINA_TOKEN={short}…)");
+            Ok(())
+        }
+        Some(Cmd::Auth { provider, github_url }) => {
+            if provider != "copilot" {
+                eprintln!("auth device is only implemented for --provider copilot");
+                std::process::exit(64);
+            }
+            let token_url = github_url.unwrap_or_else(|| "https://api.github.com".into());
+            let dc = copilot::start_device_flow(&token_url, "")
+                .await
+                .map_err(|e| format!("{e}"))?;
+            println!("open {} and enter code {}", dc.verification_uri, dc.user_code);
+            let interval = dc.interval.max(5);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                match copilot::poll_device_flow(&token_url, &dc.device_code).await {
+                    Ok(copilot::Poll::Token(t)) => {
+                        copilot::write_token_store(&provider, &t).map_err(|e| format!("{e}"))?;
+                        println!("connected (token stored 0600, never printed)");
+                        return Ok(());
+                    }
+                    Ok(copilot::Poll::Pending) => continue,
+                    Err(e) => return Err(format!("{e}").into()),
+                }
+            }
+        }
         Some(Cmd::Serve { host, port }) => {
             if !server::is_loopback(&host) && std::env::var("LUMINA_TOKEN").unwrap_or_default().is_empty() {
                 eprintln!("refusing non-loopback bind without LUMINA_TOKEN");
@@ -176,8 +233,7 @@ async fn main() -> MainResult {
             }
             let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
             let router = llm::Router::new(&cfg).map_err(|e| format!("router: {e}"))?;
-            let compat = (cfg.compat.import_global_rules, cfg.compat.import_global_skills);
-            let app = server::router(server::AppState::new(store, router, compat));
+            let app = server::router(server::AppState::new(store, router, cfg.clone()));
             let addr = format!("{host}:{port}");
             tracing::info!(%addr, agent = %cfg.defaults.agent, "lumina serve (rust M1)");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -211,9 +267,8 @@ async fn main() -> MainResult {
                 std::process::exit(64);
             }
             let runner = Runner::new();
-            let compat = (cfg.compat.import_global_rules, cfg.compat.import_global_skills);
             let answer = runner
-                .run_prompt(&store, &router, &sess.id, &text, &llm::normalize_effort(&effort), compat, |_, _| {})
+                .run_prompt(&store, &router, &cfg, &sess.id, &text, &llm::normalize_effort(&effort), |_, _| {})
                 .await
                 .map_err(|e| format!("{e}"))?;
             if dflt_format == "json" {
@@ -365,7 +420,7 @@ async fn ensure_daemon(base: &str, cfg: &config::Config) -> MainResult {
     let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
     let router = llm::Router::new(cfg).map_err(|e| format!("router: {e}"))?;
     let compat = (cfg.compat.import_global_rules, cfg.compat.import_global_skills);
-    let app = server::router(server::AppState::new(store, router, compat));
+    let app = server::router(server::AppState::new(store, router, cfg.clone()));
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;

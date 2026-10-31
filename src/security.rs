@@ -124,6 +124,7 @@ pub fn decide(e: &Eval) -> Decision {
     let is_read = matches!(
         tool,
         "read" | "read_file" | "glob" | "grep" | "kb_query" | "skill" | "lsp" | "question"
+            | "ask_question" | "webfetch" | "websearch" | "task_output"
     );
     let is_edit = matches!(
         tool,
