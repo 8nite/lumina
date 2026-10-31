@@ -226,7 +226,8 @@ impl Runner {
                 hide_websearch,
             )
             .await?;
-        store.add_turn(session_id, "assistant", &final_text)?;
+        // (All assistant turns are persisted inside the loop as they stream,
+        // so transcripts and /resume replay show every tool round.)
         Ok(final_text)
     }
 
@@ -296,10 +297,13 @@ impl Runner {
                 // backend round trip for a turn that did nothing.
                 if last_text.trim().is_empty() && did_work {
                     return Ok(self
-                        .empty_final_text(router, agent_name, model, effort, messages)
+                        .empty_final_text(router, agent_name, model, effort, messages, store, session_id)
                         .await);
                 }
-                return Ok(last_text);
+                let final_text = std::mem::take(&mut last_text);
+                messages.push(llm::Message { role: "assistant".into(), content: final_text.clone(), thinking: String::new() });
+                store.add_turn(session_id, "assistant", &final_text)?;
+                return Ok(final_text);
             }
             did_work = true;
             // Execute requested tools, feed results back as user messages.
@@ -341,7 +345,9 @@ impl Runner {
                     Err(e) => format!("tool {} failed: {e}", tc.name),
                 };
                 on_event("", &rendered);
-                messages.push(llm::Message { role: "user".into(), content: format!("[tool result {}]\n{rendered}", tc.name), thinking: String::new() });
+                let tool_msg = format!("[tool result {}]\n{rendered}", tc.name);
+                messages.push(llm::Message { role: "user".into(), content: tool_msg.clone(), thinking: String::new() });
+                store.add_turn(session_id, "user", &tool_msg)?;
             }
             // Continuation nudge: the model must not stop with a partial
             // summary while work remains. Checkpoint every 8 rounds so long
@@ -353,8 +359,11 @@ impl Runner {
             }
             // Skip empty assistant echoes so the model doesn't pattern-match
             // its own filler ("I'll query...") into a retry loop.
+            // (Continuation nudges above are deterministic scaffolding:
+            // re-added by the loop, never persisted.)
             if !last_text.trim().is_empty() {
                 messages.push(llm::Message { role: "assistant".into(), content: last_text.clone(), thinking: String::new() });
+                store.add_turn(session_id, "assistant", &last_text)?;
                 last_nonempty = last_text.clone();
             }
             last_text.clear();
@@ -362,10 +371,13 @@ impl Runner {
         // Exhausted ceiling with tools still pending: return the last real
         // model text plus an explicit resume pointer instead of an empty
         // turn (empty turns read as silent stops and force `continue`).
-        if last_nonempty.trim().is_empty() {
-            return Ok("Tool budget exhausted after 120 tool rounds with work still pending. Say `continue` to resume: the next turn should list exactly what remains and the precise next tool calls (names + arguments).".to_string());
-        }
-        Ok(last_nonempty)
+        let tail = if last_nonempty.trim().is_empty() {
+            "Tool budget exhausted after 120 tool rounds with work still pending. Say `continue` to resume: the next turn should list exactly what remains and the precise next tool calls (names + arguments).".to_string()
+        } else {
+            last_nonempty
+        };
+        store.add_turn(session_id, "assistant", &tail)?;
+        Ok(tail)
     }
 
     /// One tools-stripped round asking the model to state done-vs-remaining
@@ -378,6 +390,8 @@ impl Runner {
         model: &str,
         effort: &str,
         messages: &[llm::Message],
+        store: &Store,
+        session_id: &str,
     ) -> String {
         let mut msgs = messages.to_vec();
         msgs.push(llm::Message {
@@ -418,9 +432,13 @@ impl Runner {
             }
         }
         let _ = handle.await;
+        let _ = store.add_turn(session_id, "user", "The turn produced no final text. State briefly: what was accomplished this turn, what remains undone, and the exact next step. Text only, do not call tools.");
         if text.trim().is_empty() {
-            return "(turn completed with no text reply; transcript holds the tool results — say `continue` to resume)".to_string();
+            let canned = "(turn completed with no text reply; transcript holds the tool results \u{2014} say `continue` to resume)".to_string();
+            let _ = store.add_turn(session_id, "assistant", &canned);
+            return canned;
         }
+        let _ = store.add_turn(session_id, "assistant", &text);
         text
     }
 }
