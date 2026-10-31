@@ -1022,13 +1022,58 @@ async fn agents(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
     .into_response()
 }
 
+/// MIME type for an embedded SPA path (extension-based; unknown blobs
+/// download as octet-stream).
+fn spa_mime(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "js" | "mjs" => "application/javascript",
+        "css" => "text/css",
+        "html" => "text/html",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
+    }
+}
+
 async fn spa_fallback(uri: axum::http::Uri) -> impl IntoResponse {
-    let _ = uri;
+    // Serve the actual embedded asset (with a real MIME type) when the
+    // path names one; only unknown paths fall back to index.html for
+    // client-side routing. (Serving index.html for /assets/*.js breaks
+    // module loading: the browser rejects text/html for <script type=module>.)
+    let rel = uri.path().trim_start_matches('/');
+    if !rel.is_empty() {
+        if let Some(f) = Spa::get(rel) {
+            // Hashed build output is immutable; entry documents are not.
+            let cache = if rel.starts_with("assets/") {
+                "public, max-age=31536000, immutable"
+            } else {
+                "no-cache"
+            };
+            return (
+                StatusCode::OK,
+                [
+                    ("content-type", spa_mime(rel)),
+                    ("cache-control", cache),
+                ],
+                f.data.into_owned(),
+            )
+                .into_response();
+        }
+    }
     if let Some(f) = Spa::get("index.html") {
         let html = String::from_utf8_lossy(&f.data).into_owned();
+        // Mirror web/index.html's own policy: bare `default-src 'self'`
+        // would additionally kill unsafe-inline styles and the ws: PTY
+        // terminal (policies combine restrictively).
+        const CSP: &str = "default-src 'self'; connect-src 'self' ws:; style-src 'self' 'unsafe-inline'; font-src 'self'";
         (
             StatusCode::OK,
-            [(axum::http::header::CONTENT_SECURITY_POLICY, "default-src 'self'")],
+            [(axum::http::header::CONTENT_SECURITY_POLICY, CSP)],
             Html(html),
         )
             .into_response()
@@ -1038,5 +1083,66 @@ async fn spa_fallback(uri: axum::http::Uri) -> impl IntoResponse {
             Json(serde_json::json!({"ok": true, "hint": "run `pnpm --dir web install && pnpm --dir web build`, then restart `lumina serve`"})),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod spa_tests {
+    use super::*;
+    use axum::http::Uri;
+
+    #[test]
+    fn spa_mime_covers_bundle_types() {
+        for (path, want) in [
+            ("a.js", "application/javascript"),
+            ("a.mjs", "application/javascript"),
+            ("a.css", "text/css"),
+            ("a.html", "text/html"),
+            ("a.json", "application/json"),
+            ("a.svg", "image/svg+xml"),
+            ("a.png", "image/png"),
+            ("a.ico", "image/x-icon"),
+            ("a.woff", "font/woff"),
+            ("a.woff2", "font/woff2"),
+            ("a.ttf", "font/ttf"),
+            ("a.bin", "application/octet-stream"),
+            ("noext", "application/octet-stream"),
+        ] {
+            assert_eq!(spa_mime(path), want, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_serves_assets_with_mime() {
+        let js = Spa::iter()
+            .find(|p| p.ends_with(".js"))
+            .expect("bundle must embed a .js asset");
+        let uri = Uri::from_maybe_shared(format!("/{js}")).unwrap();
+        let resp = spa_fallback(uri).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/javascript",
+            "bundled .js must not be served as text/html (breaks <script type=module>)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 32 * 1024 * 1024).await.unwrap();
+        let embedded = Spa::get(js.as_ref()).unwrap();
+        assert_eq!(&body[..], &embedded.data[..], "asset body must be the embedded file, not index.html");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_unknown_route_serves_index_with_full_csp() {
+        let resp = spa_fallback(Uri::from_static("/s/definitely-missing")).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-security-policy").unwrap(),
+            "default-src 'self'; connect-src 'self' ws:; style-src 'self' 'unsafe-inline'; font-src 'self'",
+            "server CSP must mirror web/index.html (bare default-src kills ws: PTY + inline styles)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 32 * 1024 * 1024).await.unwrap();
+        assert!(
+            body.windows(14).any(|w| w == b"<div id=\"root\""),
+            "unknown routes must serve the SPA entry"
+        );
     }
 }
