@@ -200,6 +200,7 @@ impl Router {
         const PROTOCOLS: &[&str] = &[
             "openai-compatible",
             "openai-responses",
+            "responses",
             "anthropic-compatible",
             "ollama",
             "copilot",
@@ -241,7 +242,11 @@ impl Router {
                         String::new()
                     },
                     token_url: if p.protocol == "copilot" {
-                        std::env::var(format!("{}_TOKEN_URL", name.to_uppercase())).unwrap_or_default()
+                        if !p.token_url.is_empty() {
+                            p.token_url.clone()
+                        } else {
+                            std::env::var(format!("{}_TOKEN_URL", name.to_uppercase())).unwrap_or_default()
+                        }
                     } else {
                         String::new()
                     },
@@ -1273,7 +1278,6 @@ mod responses_tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let Ok((mut s, _)) = listener.accept() else { return };
-            let mut buf = [0u8; 8192];
             // Read just the headers; the client closes after the stream ends.
             let mut head = Vec::new();
             while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
@@ -1286,7 +1290,7 @@ mod responses_tests {
                     break;
                 }
             }
-            let _ = buf;
+            let _ = head;
             let body = concat!(
                 "event: response.output_text.done\n",
                 "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"text\":\"DONE FALLBACK\"}\n\n",

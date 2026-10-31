@@ -267,7 +267,7 @@ async fn patch_session(
 
 /// A prompt chained behind a running turn (server-side queue).
 #[derive(Clone)]
-struct QueuedPrompt {
+pub(crate) struct QueuedPrompt {
     text: String,
     effort: String,
     images: Vec<crate::llm::ImageAttachment>,

@@ -670,7 +670,7 @@ pub fn run(opts: LaunchOpts) -> Result<(), String> {
         follow: true,
         running: false,
         queued: None,
-        effort: "auto".into(),
+        effort: "xhigh".into(), // default variant (web parity; /variant auto resets to provider default)
         thinking_shown: false,
         thinking: String::new(),
         custom_cmds: vec![],

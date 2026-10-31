@@ -288,6 +288,16 @@ impl Runner {
                 .await
                 .map_err(|e| AgentError::Msg(format!("stream task: {e}")))??;
             if calls.is_empty() {
+                if last_text.trim().is_empty() {
+                    // Empty-final guard: the model ended the turn with no
+                    // text. Ask once more (no tools) for a done-vs-remaining
+                    // statement so the transcript never ends in silence;
+                    // fall back to a canned resume pointer when the model
+                    // stays silent (Go parity).
+                    return Ok(self
+                        .empty_final_text(router, agent_name, model, effort, messages)
+                        .await);
+                }
                 return Ok(last_text);
             }
             // Execute requested tools, feed results back as user messages.
@@ -354,6 +364,62 @@ impl Runner {
             return Ok("Tool budget exhausted after 120 tool rounds with work still pending. Say `continue` to resume: the next turn should list exactly what remains and the precise next tool calls (names + arguments).".to_string());
         }
         Ok(last_nonempty)
+    }
+
+    /// One tools-stripped round asking the model to state done-vs-remaining
+    /// after a silent turn end. Never fails the turn: a still-silent model
+    /// yields the canned resume pointer.
+    async fn empty_final_text(
+        &self,
+        router: &Router,
+        agent_name: &str,
+        model: &str,
+        effort: &str,
+        messages: &[llm::Message],
+    ) -> String {
+        let mut msgs = messages.to_vec();
+        msgs.push(llm::Message {
+            role: "assistant".into(),
+            content: String::new(),
+            thinking: String::new(),
+        });
+        msgs.push(llm::Message {
+            role: "user".into(),
+            content: "The turn produced no final text. State briefly: what was accomplished this turn, what remains undone, and the exact next step. Text only, do not call tools.".into(),
+            thinking: String::new(),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel::<Chunk>();
+        let req = Request {
+            model: model.into(),
+            messages: msgs,
+            tools: Vec::new(),
+            max_tokens: 0,
+            reasoning_effort: effort.into(),
+            images: Vec::new(),
+        };
+        let role = if agent_name == "plan" { "planner" } else { "executor" };
+        let router2 = router.clone();
+        let role2 = role.to_string();
+        let agent2 = agent_name.to_string();
+        let handle = tokio::spawn(async move {
+            match tokio::time::timeout(crate::llm::STREAM_TIMEOUT, router2.chat_stream(&role2, &agent2, req, tx)).await {
+                Ok(inner) => inner,
+                Err(_) => Err(crate::llm::LlmError::Msg("llm: stream timed out (no response for 600s)".into())),
+            }
+        });
+        let mut text = String::new();
+        while let Some(c) = rx.recv().await {
+            text.push_str(&c.delta);
+            text.push_str(&c.thinking);
+            if c.done {
+                break;
+            }
+        }
+        let _ = handle.await;
+        if text.trim().is_empty() {
+            return "(turn completed with no text reply; transcript holds the tool results — say `continue` to resume)".to_string();
+        }
+        text
     }
 }
 
@@ -600,6 +666,109 @@ mod specs_tests {
         let all_specs = Runner::tool_specs_filtered(false);
         let all: Vec<&str> = all_specs.iter().map(|s| s.name.as_str()).collect();
         assert!(all.contains(&"websearch"), "{all:?}");
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn body_for(n: usize) -> &'static str {
+        match n {
+            // Round 1: one read tool call.
+            1 => "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n",
+            // Round 2: silent end (empty delta, no calls).
+            2 => "data: {\"choices\":[{\"delta\":{}}]}\n\n",
+            // Round 3 (empty-final guard, tools stripped): stuck summary.
+            _ => "data: {\"choices\":[{\"delta\":{\"content\":\"stuck: audit done, nothing left\"}}]}\n\n",
+        }
+    }
+
+    /// Raw-TCP scripted OpenAI-compatible gateway: 3 sequential POSTs get
+    /// tool-call, silence, then the guard's stuck summary.
+    #[tokio::test]
+    async fn empty_final_turn_gets_stuck_summary() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                // Consume headers + body (client POSTs JSON).
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    let mut b = [0u8; 1];
+                    if s.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                let head_str = String::from_utf8_lossy(&head);
+                let len = head_str
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if len > 0 && s.read_exact(&mut body).is_err() {
+                    return;
+                }
+                let n = hits2.fetch_add(1, Ordering::SeqCst) + 1;
+                let payload = body_for(n.min(3));
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "testprov".into(),
+            crate::config::ProviderConfig {
+                protocol: "openai-compatible".into(),
+                base_url: format!("http://{addr}"),
+                api_key_env: String::new(),
+                api_key_cmd: String::new(),
+                token_url: String::new(),
+            },
+        );
+        let cfg = crate::config::Config {
+            router: crate::config::RouterConfig {
+                fast: String::new(),
+                executor: "testprov/echo".into(),
+                planner: String::new(),
+                improver: String::new(),
+            },
+            providers,
+            ..Default::default()
+        };
+        let router = Router::new(&cfg).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, "read a.txt", "", &[], |_, _| {})
+            .await
+            .unwrap();
+        assert_eq!(out, "stuck: audit done, nothing left", "silent turn must end with a stuck summary, got {out:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "expected tool + silent + guard rounds");
+        let turns = store.turns(&sess.id).unwrap();
+        let last = turns.last().unwrap();
+        assert_eq!(last.role, "assistant");
+        assert!(!last.text.trim().is_empty(), "transcript must not end in silence");
     }
 }
 
