@@ -265,7 +265,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import time
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
-        n = int(self.headers.get('Content-Length', 0)); self.rfile.read(n); time.sleep(20)
+        n = int(self.headers.get('Content-Length', 0)); self.rfile.read(n); time.sleep(8)
         b = b'{"done": true}\n'
         self.send_response(200); self.send_header('Content-Type: application/json')
         self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
@@ -289,13 +289,21 @@ sleep 4
 C2=$(timeout 10 curl -s -o /dev/null -w "%{http_code}" -X POST $DB/api/v1/sessions/$DID/prompt -H 'Content-Type: application/json' -d '{"text":"q2"}')
 [ "$C2" = "202" ] && pass "queued while running (202)" || fail "queue 202" "$C2"
 grep -q '"queued":true' <(timeout 10 curl -s -X POST $DB/api/v1/sessions/$DID/prompt -H 'Content-Type: application/json' -d '{"text":"q3"}') && pass "queue body" || fail "queue body"
-# Poll for the full drain (3 user + 3 assistant turns); 5s doze x3 + overhead.
+# Poll for the full drain (3 user + 3 assistant turns).
 N=0; for i in $(seq 1 60); do
   N=$(curl -s $DB/api/v1/sessions/$DID/export 2>/dev/null | grep -c "^## ");
   [ "$N" = "6" ] && break;
   sleep 5;
 done
-[ "$N" = "6" ] && pass "all 3 turns drained" || fail "drain count" "$N"
+if [ "$N" = "6" ]; then
+  pass "all 3 turns drained"
+else
+  fail "drain count" "$N"
+  echo "--- S17 forensics (doze hits / daemon state):"
+  grep -c "got request" "$ROOT/doze.log" 2>/dev/null || echo "doze log missing"
+  tail -c 400 "$ROOT/doze-srv.log" 2>/dev/null; echo
+  curl -s "$DB/api/v1/sessions/$DID/state" 2>/dev/null | head -c 200; echo
+fi
 kill $SRVPID $DOZEPID 2>/dev/null; wait 2>/dev/null
 
 echo
