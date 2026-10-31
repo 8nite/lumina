@@ -355,57 +355,49 @@ async fn prompt(
         return (StatusCode::ACCEPTED, Json(serde_json::json!({"session": id, "queued": true}))).into_response();
     }
     st.running.lock().unwrap().insert(id.clone());
-    // Drain the initial turn plus anything queued while it ran.
-    let mut pending = std::collections::VecDeque::from([QueuedPrompt { text: b.text, effort, images }]);
-    let first = drive_one(&st, &runner, &id, pending.pop_front().unwrap()).await;
-    // Chain the rest in the background so this request returns with its own
-    // turn; SSE carries every turn's deltas/completion.
-    if st.queued.lock().unwrap().get(&id).is_some_and(|q| !q.is_empty()) {
-        let st2 = st.clone();
-        let id2 = id.clone();
-        let runner2 = Runner::new();
-        tokio::spawn(async move {
-            let mut runner2 = runner2;
-            runner2.approval = Some(st2.gate.clone());
-            if let Ok(Some(sess)) = st2.store.get_session(&id2) {
-                let host = st2.plugins.host_for(std::path::Path::new(&sess.workspace_dir));
-                if !host.is_empty() {
-                    runner2.plugins = Some(host);
-                }
+    let first_q = QueuedPrompt { text: b.text, effort, images };
+    // Drain the initial turn plus anything queued while it ran in a
+    // detached task: a client disconnect must not cancel the in-flight
+    // turn (which would leak `running`/claim and orphan the queue,
+    // stranding queued turns with no assistant replies). The first turn's
+    // result returns over a oneshot so the blocking prompt contract
+    // (200 + text) is preserved while the task outlives the request.
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+    let st2 = st.clone();
+    let id2 = id.clone();
+    tokio::spawn(async move {
+        let first = drive_one(&st2, &runner, &id2, first_q).await;
+        // The request may be gone (disconnect); the drain continues anyway.
+        let _ = first_tx.send(first);
+        let mut runner2 = Runner::new();
+        runner2.approval = Some(st2.gate.clone());
+        if let Ok(Some(sess)) = st2.store.get_session(&id2) {
+            let host = st2.plugins.host_for(std::path::Path::new(&sess.workspace_dir));
+            if !host.is_empty() {
+                runner2.plugins = Some(host);
             }
-            loop {
-                let next = {
-                    st2.queued.lock().unwrap().get_mut(&id2).and_then(|q| q.pop_front())
-                };
-                let Some(q) = next else { break };
-                let _ = drive_one(&st2, &runner2, &id2, q).await;
-            }
-            st2.store.release_turn(&id2, &owner);
-            st2.running.lock().unwrap().remove(&id2);
-        });
-        // Ownership transfers to the background drain.
-        return match first {
-            Ok(text) => Json(serde_json::json!({"session": id, "text": text})).into_response(),
-            Err(s) => {
-                if s.contains("not found") {
-                    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": s}))).into_response()
-                } else {
-                    (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": s}))).into_response()
-                }
-            }
-        };
-    }
-    st.store.release_turn(&id, &owner);
-    st.running.lock().unwrap().remove(&id);
-    match first {
-        Ok(text) => Json(serde_json::json!({"session": id, "text": text})).into_response(),
-        Err(s) => {
+        }
+        loop {
+            let next = {
+                st2.queued.lock().unwrap().get_mut(&id2).and_then(|q| q.pop_front())
+            };
+            let Some(q) = next else { break };
+            let _ = drive_one(&st2, &runner2, &id2, q).await;
+        }
+        st2.store.release_turn(&id2, &owner);
+        st2.running.lock().unwrap().remove(&id2);
+    });
+    match first_rx.await {
+        Ok(Ok(text)) => Json(serde_json::json!({"session": id, "text": text})).into_response(),
+        Ok(Err(s)) => {
             if s.contains("not found") {
                 (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": s}))).into_response()
             } else {
                 (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": s}))).into_response()
             }
         }
+        // The drain task panicked before reporting; the queue still drains.
+        Err(_) => (StatusCode::ACCEPTED, Json(serde_json::json!({"session": id, "accepted": true}))).into_response(),
     }
 }
 

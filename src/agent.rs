@@ -249,6 +249,7 @@ impl Runner {
         let mut last_text = String::new();
         let mut last_nonempty = String::new();
         let mut snapshotted = false;
+        let mut did_work = false;
         for round in 0..self.max_steps {
             let (tx, mut rx) = mpsc::unbounded_channel::<Chunk>();
             let req = Request {
@@ -288,18 +289,19 @@ impl Runner {
                 .await
                 .map_err(|e| AgentError::Msg(format!("stream task: {e}")))??;
             if calls.is_empty() {
-                if last_text.trim().is_empty() {
-                    // Empty-final guard: the model ended the turn with no
-                    // text. Ask once more (no tools) for a done-vs-remaining
-                    // statement so the transcript never ends in silence;
-                    // fall back to a canned resume pointer when the model
-                    // stays silent (Go parity).
+                // Empty-final guard: silence after real work gets one more
+                // tools-stripped round asking for done-vs-remaining, so the
+                // transcript never ends in silence. Pure-empty turns (no
+                // tool calls at all) pass through untouched — no extra
+                // backend round trip for a turn that did nothing.
+                if last_text.trim().is_empty() && did_work {
                     return Ok(self
                         .empty_final_text(router, agent_name, model, effort, messages)
                         .await);
                 }
                 return Ok(last_text);
             }
+            did_work = true;
             // Execute requested tools, feed results back as user messages.
             if std::env::var("LUMINA_DEBUG_SSE").is_ok() {
                 let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
@@ -769,6 +771,85 @@ mod guard_tests {
         let last = turns.last().unwrap();
         assert_eq!(last.role, "assistant");
         assert!(!last.text.trim().is_empty(), "transcript must not end in silence");
+    }
+    /// Pure-empty turns (no tool calls, silent model) pass through with no
+    /// extra backend round trip — the guard only fires after real work.
+    #[tokio::test]
+    async fn empty_final_without_work_passes_through() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for _ in 0..1 {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    let mut b = [0u8; 1];
+                    if s.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                let head_str = String::from_utf8_lossy(&head);
+                let len = head_str
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if len > 0 && s.read_exact(&mut body).is_err() {
+                    return;
+                }
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let payload = "data: {\"choices\":[{\"delta\":{}}]}\n\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "testprov".into(),
+            crate::config::ProviderConfig {
+                protocol: "openai-compatible".into(),
+                base_url: format!("http://{addr}"),
+                api_key_env: String::new(),
+                api_key_cmd: String::new(),
+                token_url: String::new(),
+            },
+        );
+        let cfg = crate::config::Config {
+            router: crate::config::RouterConfig {
+                fast: String::new(),
+                executor: "testprov/echo".into(),
+                planner: String::new(),
+                improver: String::new(),
+            },
+            providers,
+            ..Default::default()
+        };
+        let router = Router::new(&cfg).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, "say nothing", "", &[], |_, _| {})
+            .await
+            .unwrap();
+        assert!(out.trim().is_empty(), "no-work silence must pass through, got {out:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "no guard round trip for idle silence");
     }
 }
 
