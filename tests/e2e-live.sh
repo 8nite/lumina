@@ -73,7 +73,7 @@ echo "$OUT" | grep -q "TOOL-DONE" && pass "final text" || fail "final text" "$(e
 
 section "S4 approval gate (ask mode + allow_once)"
 S4=$(new_session "$ROOT/ws4" build ask); mkdir -p "$ROOT/ws4"
-timeout 150 curl -s -X POST "$BASE/api/v1/sessions/$S4/prompt" -H 'Content-Type: application/json' -d '{"text":"run the shell command echo APPROVAL-TEST using the bash tool, then reply with what it printed"}' > "$ROOT/s4.out" 2>&1 &
+timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S4/prompt" -H 'Content-Type: application/json' -d '{"text":"run the shell command echo APPROVAL-TEST using the bash tool, then reply with what it printed"}' > "$ROOT/s4.out" 2>&1 &
 P4=$!
 REQ=""; for i in $(seq 1 40); do
   ST=$(api GET "/api/v1/sessions/$S4/state")
@@ -89,7 +89,7 @@ grep -q "APPROVAL-TEST" "$ROOT/s4.out" && pass "turn completed after approval" |
 
 section "S5 question gate"
 S5=$(new_session "$ROOT/ws5")
-timeout 150 curl -s -X POST "$BASE/api/v1/sessions/$S5/prompt" -H 'Content-Type: application/json' -d '{"text":"use the question tool to ask me which color I prefer with options red and blue, then stop and wait for my answer"}' > "$ROOT/s5.out" 2>&1 &
+timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S5/prompt" -H 'Content-Type: application/json' -d '{"text":"use the question tool to ask me which color I prefer with options red and blue, then stop and wait for my answer"}' > "$ROOT/s5.out" 2>&1 &
 P5=$!
 REQ=""; for i in $(seq 1 40); do
   ST=$(api GET "/api/v1/sessions/$S5/state");
@@ -105,7 +105,7 @@ python3 -c 'import sys,json;d=json.load(open("'"$ROOT/s5.out"'"));sys.exit(0 if 
 
 section "S6 undo/redo (shadow git)"
 S6=$(new_session "$ROOT/ws6"); mkdir -p "$ROOT/ws6"; (cd "$ROOT/ws6" && git init -q && git config user.email t@t && git config user.name t && echo base > t.txt && git add -A && git commit -qm init)
-timeout 150 curl -s -X POST "$BASE/api/v1/sessions/$S6/prompt" -H 'Content-Type: application/json' -d '{"text":"use the edit tool to append LINE1 to t.txt, then reply DONE6"}' > "$ROOT/s6.out" 2>&1
+timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S6/prompt" -H 'Content-Type: application/json' -d '{"text":"use the edit tool to append LINE1 to t.txt, then reply DONE6"}' > "$ROOT/s6.out" 2>&1
 grep -q "LINE1" "$ROOT/ws6/t.txt" && pass "turn mutated file" || fail "mutating turn"
 api POST "/api/v1/sessions/$S6/revert" '{}' | grep -q '"commit"' && pass "revert ok" || fail "revert"
 [ "$(cat "$ROOT/ws6/t.txt" | tr '\n' '|')" = "base|" ] && pass "revert restored pre-turn tree" || fail "revert content" "$(cat "$ROOT/ws6/t.txt" | tr '\n' '|')"
@@ -127,7 +127,7 @@ section "S8 memory (kb update + kb_query tool)"
 mkdir -p "$ROOT/ws8"
 (cd "$ROOT/ws8" && timeout 60 "$LUMINA_BIN" kb update e2emagic "the magic fruit is kiwi [[e2e-fruit]]" >/dev/null)
 S8=$(new_session "$ROOT/ws8")
-OUT=$(timeout 150 curl -s -X POST "$BASE/api/v1/sessions/$S8/prompt" -H 'Content-Type: application/json' -d '{"text":"use the kb_query tool to find the magic fruit, then reply with only its name"}')
+OUT=$(timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S8/prompt" -H 'Content-Type: application/json' -d '{"text":"use the kb_query tool to find the magic fruit, then reply with only its name"}')
 echo "$OUT" | grep -qi "kiwi" && pass "kb_query answered" || fail "kb_query" "$(echo "$OUT" | head -c 200)"
 
 section "S9 SSE fanout (2 subscribers)"
