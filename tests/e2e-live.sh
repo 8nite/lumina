@@ -85,7 +85,12 @@ if [ -n "$REQ" ]; then
   api POST "/api/v1/permissions/$REQ" '{"decision":"allow_once"}' | grep -q '"ok":true' && pass "allow_once accepted" || fail "allow_once"
 fi
 wait $P4 2>/dev/null
-grep -q "APPROVAL-TEST" "$ROOT/s4.out" && pass "turn completed after approval" || fail "approval completion" "$(head -c 200 "$ROOT/s4.out")"
+# The blocking curl may time out on a slow model; poll the session instead.
+for i in $(seq 1 60); do
+  [ "$(api GET "/api/v1/sessions/$S4/state" | python3 -c 'import sys,json;print(json.load(sys.stdin)["running"])')" = "False" ] && break
+  sleep 5
+done
+api GET "/api/v1/sessions/$S4/export" | grep -q "APPROVAL-TEST" && pass "turn completed after approval" || fail "approval completion" "$(api GET "/api/v1/sessions/$S4/export" | head -c 200)"
 
 section "S5 question gate"
 S5=$(new_session "$ROOT/ws5")
@@ -101,7 +106,17 @@ if [ -n "$REQ" ]; then
   api POST "/api/v1/questions/$REQ" '{"answers":["red"]}' | grep -q '"ok":true' && pass "answer accepted" || fail "answer"
 fi
 wait $P5 2>/dev/null
-python3 -c 'import sys,json;d=json.load(open("'"$ROOT/s5.out"'"));sys.exit(0 if "text" in d else 1)' 2>/dev/null && pass "turn completed after answer" || fail "question completion" "$(head -c 200 "$ROOT/s5.out")"
+# The blocking curl may time out on a slow model; poll the session instead.
+for i in $(seq 1 60); do
+  [ "$(api GET "/api/v1/sessions/$S5/state" | python3 -c 'import sys,json;print(json.load(sys.stdin)["running"])')" = "False" ] && break
+  sleep 5
+done
+api GET "/api/v1/sessions/$S5/export" | python3 -c '
+import sys
+t = sys.stdin.read()
+parts = t.split("## assistant")
+ok = any(p.strip() and not p.strip().startswith("##") for p in parts[1:])
+sys.exit(0 if ok else 1)' && pass "turn completed after answer" || fail "question completion" "empty assistant turn"
 
 section "S6 undo/redo (shadow git)"
 S6=$(new_session "$ROOT/ws6"); mkdir -p "$ROOT/ws6"; (cd "$ROOT/ws6" && git init -q && git config user.email t@t && git config user.name t && echo base > t.txt && git add -A && git commit -qm init)
@@ -231,11 +246,15 @@ import sys
 HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 PYEOF
 printf '[providers.o]\nprotocol="ollama"\nbase_url="http://127.0.0.1:18991"\n[router]\nexecutor="o/q"\n' > "$ROOT/doze.toml"
-LUMINA_CONFIG="$ROOT/doze.toml" LUMINA_DB="$ROOT/doze.db" nohup "$REPOROOT/target/debug/lumina" serve --port 17499 >"$ROOT/doze-srv.log" 2>&1 &
+# Dynamic ports: another suite may run concurrently — never hardcode.
+DPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+ZPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+printf '[providers.o]\nprotocol="ollama"\nbase_url="http://127.0.0.1:%s"\n[router]\nexecutor="o/q"\n' "$ZPORT" > "$ROOT/doze.toml"
+LUMINA_CONFIG="$ROOT/doze.toml" LUMINA_DB="$ROOT/doze.db" nohup "$REPOROOT/target/debug/lumina" serve --port "$DPORT" >"$ROOT/doze-srv.log" 2>&1 &
 SRVPID=$!; sleep 2
-nohup python3 "$ROOT/doze.py" 18991 >"$ROOT/doze.log" 2>&1 & DOZEPID=$!
+nohup python3 "$ROOT/doze.py" "$ZPORT" >"$ROOT/doze.log" 2>&1 & DOZEPID=$!
 sleep 1
-DB="http://127.0.0.1:17499"
+DB="http://127.0.0.1:$DPORT"
 DS=$(curl -s -X POST $DB/api/v1/sessions -H 'Content-Type: application/json' -d '{"workspace_dir":"/tmp/dz"}'); DID=$(echo "$DS" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
 timeout 60 curl -s -X POST $DB/api/v1/sessions/$DID/prompt -H 'Content-Type: application/json' -d '{"text":"hi"}' > "$ROOT/q1.out" 2>&1 &
 sleep 4
