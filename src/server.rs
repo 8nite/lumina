@@ -12,13 +12,13 @@ use axum::{
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tokio::sync::broadcast;
 
-use crate::{agent::Runner, llm::Router as LlmRouter, store::Store};
+use crate::{agent::Runner, approve::ApprovalGate, llm::Router as LlmRouter, store::Store};
 
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
@@ -32,17 +32,21 @@ pub struct AppState {
     pub auth_token: String,
     pub compat: (bool, bool),
     pub events: broadcast::Sender<serde_json::Value>,
+    pub gate: ApprovalGate,
+    pub running: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AppState {
     pub fn new(store: Store, router: LlmRouter, compat: (bool, bool)) -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
+            gate: ApprovalGate::new(events.clone()),
             store: Arc::new(store),
             router: Arc::new(router),
             auth_token: std::env::var("LUMINA_TOKEN").unwrap_or_default(),
             compat,
             events,
+            running: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -77,8 +81,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/sessions/:id/export", get(export))
         .route("/api/v1/sessions/:id/revert", axum::routing::post(todo))
         .route("/api/v1/sessions/:id/unrevert", axum::routing::post(todo))
-        .route("/api/v1/permissions/:id", axum::routing::post(todo))
-        .route("/api/v1/questions/:id", axum::routing::post(todo))
+        .route("/api/v1/sessions/:id/state", get(session_state))
+        .route("/api/v1/permissions/:id", axum::routing::post(answer_permission))
+        .route("/api/v1/questions/:id", axum::routing::post(answer_question))
         .route("/api/v1/files", get(files))
         .route("/api/v1/git/diff", get(git_diff))
         .route("/api/v1/git/branch", get(git_branch))
@@ -236,7 +241,9 @@ async fn prompt(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "empty prompt"}))).into_response();
     }
     let effort = crate::llm::normalize_effort(&b.effort).to_string();
-    let runner = Runner::new();
+    let mut runner = Runner::new();
+    runner.approval = Some(st.gate.clone());
+    st.running.lock().unwrap().insert(id.clone());
     // Store/Router are internally synchronized; no outer lock is held across
     // the turn loop. Deltas stream to SSE subscribers via the event broker.
     st.emit(serde_json::json!({"type": "turn.started", "session": id}));
@@ -249,10 +256,12 @@ async fn prompt(
         .await;
     match out {
         Ok(text) => {
+            st.running.lock().unwrap().remove(&id);
             st.emit(serde_json::json!({"type": "turn.completed", "session": id}));
             Json(serde_json::json!({"session": id, "text": text})).into_response()
         }
         Err(e) => {
+            st.running.lock().unwrap().remove(&id);
             let s = e.to_string();
             st.emit(serde_json::json!({"type": "turn.failed", "session": id, "error": s}));
             if s.contains("not found") {
@@ -518,6 +527,60 @@ async fn kb_browse(Query(q): Query<HashMap<String, String>>) -> impl IntoRespons
     }
     files.sort();
     Json(serde_json::json!({"files": files})).into_response()
+}
+
+async fn session_state(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let running = st.running.lock().unwrap().contains(&id);
+    let (perm, ques) = st.gate.pending_for_session(&id);
+    match st.store.get_session(&id) {
+        Ok(Some(s)) => Json(serde_json::json!({
+            "session": view(&s), "running": running,
+            "permission": perm, "question": ques,
+        }))
+        .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PermissionAnswer {
+    #[serde(default)]
+    decision: String,
+}
+
+async fn answer_permission(
+    State(st): State<AppState>,
+    Path(req_id): Path<String>,
+    Json(b): Json<PermissionAnswer>,
+) -> impl IntoResponse {
+    let d = if b.decision.is_empty() { "deny" } else { &b.decision };
+    if !["allow_once", "allow_session", "allow_always", "deny"].contains(&d) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "decision must be allow_once|allow_session|allow_always|deny"}))).into_response();
+    }
+    if st.gate.resolve(&req_id, d) {
+        Json(serde_json::json!({"ok": true})).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown or expired request"}))).into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct QuestionAnswer {
+    #[serde(default)]
+    answers: Vec<String>,
+}
+
+async fn answer_question(
+    State(st): State<AppState>,
+    Path(req_id): Path<String>,
+    Json(b): Json<QuestionAnswer>,
+) -> impl IntoResponse {
+    if st.gate.answer(&req_id, b.answers) {
+        Json(serde_json::json!({"ok": true})).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown or expired request"}))).into_response()
+    }
 }
 
 async fn todo() -> impl IntoResponse {

@@ -7,14 +7,17 @@
 //! plugins/kb/evolve (`M2`/`M5`) exit 66 until their milestone.
 
 mod agent;
+mod approve;
 mod config;
 mod kb;
 mod llm;
 mod rules;
+mod sdk;
 mod security;
 mod server;
 mod store;
 mod tools;
+mod tui;
 
 use agent::Runner;
 use clap::{Parser, Subcommand};
@@ -132,10 +135,39 @@ async fn main() -> MainResult {
     let dflt_format = cli.format.clone().unwrap_or_default();
     let dflt_cont = cli.cont;
     let dflt_session = cli.session.clone();
+    let dflt_plan = cli.plan;
     match cli.cmd {
         None => {
-            eprintln!("TUI lands in M3 (ratatui). Daemon API is up via `lumina serve`.");
-            std::process::exit(66);
+            // Terminal TUI: ensure the workspace daemon is up, then attach.
+            // Honors -c/-s/--agent/--mode/--plan like the Go client.
+            let base = std::env::var("LUMINA_URL").unwrap_or_else(|_| "http://127.0.0.1:7432".into());
+            ensure_daemon(&base, &cfg).await?;
+            tokio::task::block_in_place(|| {
+                tui::run(tui::LaunchOpts {
+                    base_url: base,
+                    token: std::env::var("LUMINA_TOKEN").unwrap_or_default(),
+                    cont: dflt_cont,
+                    session: dflt_session,
+                    agent: Some(if dflt_plan { "plan".into() } else { dflt_agent.clone() }),
+                    mode: Some(dflt_mode.clone()),
+                })
+            })
+            .map_err(|e| format!("tui: {e}"))?;
+            Ok(())
+        }
+        Some(Cmd::Attach { url }) => {
+            tokio::task::block_in_place(|| {
+                tui::run(tui::LaunchOpts {
+                    base_url: url,
+                    token: std::env::var("LUMINA_TOKEN").unwrap_or_default(),
+                    cont: false,
+                    session: None,
+                    agent: None,
+                    mode: None,
+                })
+            })
+            .map_err(|e| format!("tui: {e}"))?;
+            Ok(())
         }
         Some(Cmd::Serve { host, port }) => {
             if !server::is_loopback(&host) && std::env::var("LUMINA_TOKEN").unwrap_or_default().is_empty() {
@@ -309,3 +341,40 @@ fn cmd_session(args: &[String]) -> MainResult {
 }
 
 type MainResult = Result<(), Box<dyn std::error::Error>>;
+
+/// Split "http://host:port" without a URL crate (localhost tooling only).
+fn split_base(base: &str) -> (String, u16) {
+    let s = base.trim_end_matches('/');
+    let s = s.strip_prefix("http://").or_else(|| s.strip_prefix("https://")).unwrap_or(s);
+    match s.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(7432)),
+        None => (s.to_string(), 7432),
+    }
+}
+
+/// Ensure a daemon answers at `base`; if the loopback port is closed, boot
+/// an in-process server (mirrors `lumina` auto-start) and wait for readiness.
+async fn ensure_daemon(base: &str, cfg: &config::Config) -> MainResult {
+    let (host, port) = split_base(base);
+    if tokio::net::TcpStream::connect((host.as_str(), port)).await.is_ok() {
+        return Ok(());
+    }
+    if !server::is_loopback(&host) {
+        return Err(format!("no daemon at {base} (set LUMINA_TOKEN for remote attach)").into());
+    }
+    let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
+    let router = llm::Router::new(cfg).map_err(|e| format!("router: {e}"))?;
+    let compat = (cfg.compat.import_global_rules, cfg.compat.import_global_skills);
+    let app = server::router(server::AppState::new(store, router, compat));
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect((host.as_str(), port)).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err("daemon failed to start".into())
+}

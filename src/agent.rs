@@ -3,6 +3,7 @@
 /// those stay behind their own milestones).
 
 use crate::{
+    approve::ApprovalGate,
     llm::{self, Chunk, Request, Router, ToolSpec},
     rules::Bundle,
     security::{Agent, PermissionMode},
@@ -27,11 +28,13 @@ pub enum AgentError {
 
 pub struct Runner {
     pub max_steps: usize,
+    /// Live approval broker (server/TUI mode). None = headless `run`.
+    pub approval: Option<ApprovalGate>,
 }
 
 impl Runner {
     pub fn new() -> Self {
-        Self { max_steps: 16 }
+        Self { max_steps: 16, approval: None }
     }
 
     fn tool_specs() -> Vec<ToolSpec> {
@@ -51,6 +54,7 @@ impl Runner {
             ToolSpec { name: "kb_query".into(), description: "Query Markdown+graphify memory before grepping code. Prefer for durable knowledge.".into(), schema: obj(&["query", "budget"]) },
             ToolSpec { name: "memory_write".into(), description: "Save a durable fact to ./memory/<topic>.md (deduped, secrets rejected).".into(), schema: obj(&["topic", "content"]) },
             ToolSpec { name: "skill".into(), description: "Load a full SKILL.md body by name (only name+description are advertised).".into(), schema: obj(&["name"]) },
+            ToolSpec { name: "question".into(), description: "Ask the user a clarifying question with options (interactive sessions only).".into(), schema: obj(&["questions"]) },
         ]
     }
 
@@ -110,7 +114,11 @@ impl Runner {
             })),
             bundle: Some(bundle),
         };
-        let sc = SecCtx { workspace: workspace.clone(), agent, mode, headless: true };
+        let (runner_headless, runner_gate) = match &self.approval {
+            Some(g) => (false, g.clone()),
+            None => (true, ApprovalGate::default()),
+        };
+        let sc = SecCtx { workspace: workspace.clone(), session: sess.id.clone(), agent, mode, headless: runner_headless, gate: runner_gate };
         let agent_name = sess.agent.clone();
         let model = sess.model.clone();
         let final_text = self

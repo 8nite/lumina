@@ -3,6 +3,7 @@
 //! claim their own milestones). Every call is gated by `security::decide`.
 
 use crate::{
+    approve::ApprovalGate,
     rules::Bundle,
     security::{self, Agent, Decision, PermissionMode},
 };
@@ -29,10 +30,13 @@ pub enum ToolError {
 #[derive(Debug, Clone)]
 pub struct SecCtx {
     pub workspace: PathBuf,
+    pub session: String,
     pub agent: Agent,
     pub mode: PermissionMode,
     /// Fail-closed for unknown tools when true (headless `run`).
     pub headless: bool,
+    /// Live approval broker in server/TUI mode; None in headless `run`.
+    pub gate: ApprovalGate,
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +61,7 @@ impl Registry {
     }
 
     pub fn names() -> &'static [&'static str] {
-        &["read", "edit", "write", "bash", "grep", "glob", "kb_query", "memory_write", "skill"]
+        &["read", "edit", "write", "bash", "grep", "glob", "kb_query", "memory_write", "skill", "question"]
     }
 
     pub fn call(
@@ -78,6 +82,14 @@ impl Registry {
         };
         match security::decide(&eval) {
             Decision::Deny => return Err(ToolError::Denied(format!("{name} {target}"))),
+            Decision::Ask if sc.gate.is_live() => {
+                // Interactive server/TUI mode: block on the approval modal.
+                match sc.gate.ask(&sc.session, name, &target) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(ToolError::Denied(format!("{name} {target} (denied)"))),
+                    Err(e) => return Err(ToolError::Msg(e)),
+                }
+            }
             Decision::Ask if sc.headless => {
                 return Err(ToolError::ApprovalRequired(format!("{name} {target}")));
             }
@@ -96,6 +108,7 @@ impl Registry {
             "kb_query" => do_kb_query(self, sc, args),
             "memory_write" => do_memory_write(sc, args),
             "skill" => do_skill(self, args),
+            "question" => do_question(sc, args),
             _ => Err(ToolError::Msg(format!("unknown tool {name}"))),
         }
     }
@@ -344,7 +357,7 @@ mod tests {
     use super::*;
 
     fn ctx(dir: &Path, agent: Agent, mode: PermissionMode) -> SecCtx {
-        SecCtx { workspace: dir.to_path_buf(), agent, mode, headless: true }
+        SecCtx { workspace: dir.to_path_buf(), session: "t".into(), agent, mode, headless: true, gate: ApprovalGate::default() }
     }
 
     fn args(pairs: &[(&str, &str)]) -> HashMap<String, serde_json::Value> {
@@ -438,4 +451,31 @@ fn do_skill(reg: &Registry, args: &HashMap<String, serde_json::Value>) -> Result
             Err(ToolError::Msg(format!("skill {name:?} not found. Available: {}", avail.join(", "))))
         }
     }
+}
+
+fn do_question(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+    if !sc.gate.is_live() {
+        return Err(ToolError::Msg("question: interactive gate not attached".into()));
+    }
+    let raw = args.get("questions").cloned().unwrap_or(serde_json::Value::Null);
+    let list = raw.as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        return Err(ToolError::Msg("question: no questions provided".into()));
+    }
+    let mut qs = Vec::new();
+    for q in list.iter().take(4) {
+        qs.push(crate::approve::Question {
+            text: q.get("text").and_then(|t| t.as_str()).unwrap_or("?").to_string(),
+            options: q
+                .get("options")
+                .and_then(|o| o.as_array())
+                .map(|a| a.iter().filter_map(|o| o.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+        });
+    }
+    let answers = sc.gate.ask_question(&sc.session, qs).map_err(ToolError::Msg)?;
+    Ok(Outcome {
+        output: format!("user answered: {}", answers.join(" | ")),
+        truncated: false,
+    })
 }
