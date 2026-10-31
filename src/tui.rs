@@ -148,7 +148,8 @@ impl App {
         let id = self.session.id.clone();
         let effort = self.effort.clone();
         std::thread::spawn(move || {
-            // Result surfaces over SSE (turn.completed/failed); nothing to do here.
+            // Results surface over SSE (turn.completed/failed, possibly after a
+            // server-side queue); the ack itself carries no content.
             let _ = sdk.submit(&id, &text, &effort);
         });
     }
@@ -162,16 +163,25 @@ impl App {
             "build" => self.set_agent("build"),
             "mode" => match rest.first() {
                 Some(m) if MODES.contains(m) => self.set_mode(m),
-                _ => self.set_status("usage: /mode ask|auto-edit|auto-approve|bypass"),
+                Some(_) => self.set_status("usage: /mode [ask|auto-edit|auto-approve|bypass]"),
+                None => self.cycle_mode(),
             },
             "variant" | "effort" => match rest.first() {
                 Some(v) if EFFORTS.contains(v) => {
                     self.effort = v.to_string();
                     self.set_status(&format!("effort → {}", self.effort));
                 }
-                _ => self.set_status("usage: /variant auto|low|medium|high|xhigh|max"),
+                Some(_) => self.set_status("usage: /variant [auto|low|medium|high|xhigh|max]"),
+                None => {
+                    let cur = EFFORTS.iter().position(|e| *e == self.effort).unwrap_or(0);
+                    self.effort = EFFORTS[(cur + 1) % EFFORTS.len()].to_string();
+                    self.set_status(&format!("effort → {}", self.effort));
+                }
             },
-            "model" => self.open_models(),
+            "model" => match rest.first().copied() {
+                Some(p) => self.open_models_at(&p.to_string()),
+                None => self.open_models(),
+            },
             "resume" => self.open_sessions(),
             "continue" => self.continue_latest(),
             "fork" => self.fork(rest.first().copied()),
@@ -340,12 +350,31 @@ impl App {
     }
 
     fn open_models(&mut self) {
+        self.open_models_at(&String::new());
+    }
+
+    /// /model [provider]: jump straight to a provider's live models when named.
+    fn open_models_at(&mut self, want: &str) {
         match self.sdk.providers() {
             Ok(p) => {
                 let providers: Vec<String> = p.iter().filter_map(|v| v.get("name")?.as_str().map(|s| s.to_string())).collect();
-                self.popup = Some(Popup::Models { providers, pi: 0, models: vec![], mi: 0, picking_model: false });
+                let pi = providers.iter().position(|x| x == want).unwrap_or(0);
+                let picking = !want.is_empty() && providers.iter().any(|x| x == want);
+                let models = if picking { self.load_models(&providers[pi]) } else { vec![] };
+                self.popup = Some(Popup::Models { providers, pi, models, mi: 0, picking_model: picking });
             }
             Err(e) => self.set_status(&format!("models: {e}")),
+        }
+    }
+
+    fn load_models(&self, provider: &str) -> Vec<String> {
+        match self.sdk.models(provider) {
+            Ok(m) => m.iter().filter_map(|v| v.get("id")?.as_str().map(|s| s.to_string())).collect(),
+            Err(e) => {
+                // Status needs &mut; stash the error for the caller to surface.
+                let _ = e;
+                vec![]
+            }
         }
     }
 
@@ -450,8 +479,12 @@ impl App {
                     self.thinking.push_str(&thinking);
                 }
             }
-            Event::TurnCompleted { .. } => {
+            Event::TurnCompleted { ms, chars, .. } => {
                 self.running = false;
+                // Turn footer stats (model · seconds · ~tok/s), like the Go TUI.
+                let secs = ms as f64 / 1000.0;
+                let tps = if secs > 0.0 { chars as f64 / 4.0 / secs } else { 0.0 };
+                self.set_status(&format!("{} · {secs:.1}s · ~{tps:.0} tok/s", self.session.model));
                 if let Some(q) = self.queued.take() {
                     self.send_prompt(q);
                 }
@@ -869,10 +902,13 @@ fn popup_enter(app: &mut App) {
         }
         Some(Popup::Models { providers, pi, models, mi, picking_model }) => {
             if !picking_model {
-                if let Some(p) = providers.get(pi) {
-                    match app.sdk.models(p) {
+                if let Some(p) = providers.get(pi).cloned() {
+                    match app.sdk.models(&p) {
                         Ok(m) => {
                             let names: Vec<String> = m.iter().filter_map(|v| v.get("id")?.as_str().map(|s| s.to_string())).collect();
+                            if names.is_empty() {
+                                app.set_status(&format!("no live models for {p}"));
+                            }
                             app.popup = Some(Popup::Models { providers, pi, models: names, mi: 0, picking_model: true });
                         }
                         Err(e) => app.set_status(&format!("models: {e}")),

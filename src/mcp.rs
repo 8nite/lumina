@@ -221,3 +221,83 @@ impl Drop for Client {
         }
     }
 }
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Fake MCP server over stdio (line-delimited JSON-RPC).
+    fn fake_server_py() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("lumina-mcp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("fake_mcp.py");
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(
+            f,
+            r#"import sys, json
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+    except Exception:
+        continue
+    m, rid, params = req.get("method"), req.get("id"), req.get("params", {{}})
+    if m == "initialize":
+        res = {{"protocolVersion": "2024-11-05"}}
+    elif m == "tools/list":
+        res = {{"tools": [{{"name": "echo", "description": "echo back"}}]}}
+    elif m == "tools/call":
+        res = {{"content": [{{"type": "text", "text": "ok:" + params.get("name", "")}}]}}
+    else:
+        res = {{}}
+    sys.stdout.write(json.dumps({{"jsonrpc": "2.0", "id": rid, "result": res}}) + "\n")
+    sys.stdout.flush()
+"#
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn stdio_round_trip() {
+        let py = fake_server_py();
+        let conf = ServerConf {
+            transport: "stdio".into(),
+            command: "python3".into(),
+            args: vec![py.display().to_string()],
+            url: String::new(),
+            env: HashMap::new(),
+        };
+        let mut c = Client::dial(conf).expect("dial fake server");
+        let tools = c.list_tools().expect("list tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        let out = c.call_tool("echo", serde_json::json!({})).expect("call tool");
+        assert_eq!(out, "ok:echo");
+    }
+
+    #[test]
+    fn google_url_rejected_at_dial() {
+        let conf = ServerConf {
+            transport: "sse".into(),
+            command: String::new(),
+            args: vec![],
+            url: "https://generativelanguage.googleapis.com/mcp".into(),
+            env: HashMap::new(),
+        };
+        assert!(Client::dial(conf).is_err());
+    }
+
+    #[test]
+    fn config_workspace_wins() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".lumina")).unwrap();
+        std::fs::write(
+            d.path().join(".lumina/mcp.json"),
+            r#"{"servers": {"local": {"transport": "stdio", "command": "x"}}}"#,
+        )
+        .unwrap();
+        let cfg = ConfigFile::load(d.path());
+        assert!(cfg.servers.contains_key("local"));
+    }
+}

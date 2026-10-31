@@ -35,6 +35,7 @@ pub struct AppState {
     pub events: broadcast::Sender<serde_json::Value>,
     pub gate: ApprovalGate,
     pub running: Arc<Mutex<HashSet<String>>>,
+    pub queued: Arc<Mutex<HashMap<String, std::collections::VecDeque<QueuedPrompt>>>>,
     pub plugins: PluginCache,
     pub sweeper: KbSweeper,
     pub cfg_path: Option<PathBuf>,
@@ -51,6 +52,7 @@ impl AppState {
             cfg,
             events,
             running: Arc::new(Mutex::new(HashSet::new())),
+            queued: Arc::new(Mutex::new(HashMap::new())),
             plugins: PluginCache::new(),
             sweeper: KbSweeper::new(),
             cfg_path,
@@ -263,6 +265,14 @@ async fn patch_session(
     }
 }
 
+/// A prompt chained behind a running turn (server-side queue).
+#[derive(Clone)]
+struct QueuedPrompt {
+    text: String,
+    effort: String,
+    images: Vec<crate::llm::ImageAttachment>,
+}
+
 #[derive(Deserialize)]
 struct PromptBody {
     #[serde(default)]
@@ -319,15 +329,12 @@ async fn prompt(
             runner.plugins = Some(host);
         }
     }
-    st.running.lock().unwrap().insert(id.clone());
-    // Store/Router are internally synchronized; no outer lock is held across
-    // the turn loop. Deltas stream to SSE subscribers via the event broker.
-    st.emit(serde_json::json!({"type": "turn.started", "session": id}));
-    let tx = st.events.clone();
-    let sid = id.clone();
+    // Validate images before touching locks (an oversize payload must not
+    // leak the turn claim).
     let mut images = Vec::new();
     for im in &b.images {
         if im.data.len() > 8 * 1024 * 1024 {
+            st.store.release_turn(&id, &owner);
             return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"error": "image over 8MB cap"}))).into_response();
         }
         images.push(crate::llm::ImageAttachment {
@@ -336,31 +343,97 @@ async fn prompt(
             data: im.data.clone(),
         });
     }
-    let out = runner
-        .run_prompt(&st.store, &st.router, &st.cfg, &id, &b.text, &effort, &images, |d, t| {
-            let _ = tx.send(serde_json::json!({"type": "turn.delta", "session": sid, "delta": d, "thinking": t}));
-        })
-        .await;
-    match out {
-        Ok(text) => {
-            st.store.release_turn(&id, &owner);
-            st.running.lock().unwrap().remove(&id);
-            st.emit(serde_json::json!({"type": "turn.completed", "session": id}));
-            emit_context(&st, &id);
-            standing_ops(&st, &id);
-            Json(serde_json::json!({"session": id, "text": text})).into_response()
-        }
-        Err(e) => {
-            st.store.release_turn(&id, &owner);
-            st.running.lock().unwrap().remove(&id);
-            let s = e.to_string();
-            st.emit(serde_json::json!({"type": "turn.failed", "session": id, "error": s}));
-            standing_ops(&st, &id);
+    // Same-daemon gate: chain behind the running turn instead of interleaving
+    // (steer/queue semantics; cross-daemon races 409 above via the claim).
+    if st.running.lock().unwrap().contains(&id) {
+        st.queued
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_default()
+            .push_back(QueuedPrompt { text: b.text, effort, images });
+        return (StatusCode::ACCEPTED, Json(serde_json::json!({"session": id, "queued": true}))).into_response();
+    }
+    st.running.lock().unwrap().insert(id.clone());
+    // Drain the initial turn plus anything queued while it ran.
+    let mut pending = std::collections::VecDeque::from([QueuedPrompt { text: b.text, effort, images }]);
+    let first = drive_one(&st, &runner, &id, pending.pop_front().unwrap()).await;
+    // Chain the rest in the background so this request returns with its own
+    // turn; SSE carries every turn's deltas/completion.
+    if st.queued.lock().unwrap().get(&id).is_some_and(|q| !q.is_empty()) {
+        let st2 = st.clone();
+        let id2 = id.clone();
+        let runner2 = Runner::new();
+        tokio::spawn(async move {
+            let mut runner2 = runner2;
+            runner2.approval = Some(st2.gate.clone());
+            if let Ok(Some(sess)) = st2.store.get_session(&id2) {
+                let host = st2.plugins.host_for(std::path::Path::new(&sess.workspace_dir));
+                if !host.is_empty() {
+                    runner2.plugins = Some(host);
+                }
+            }
+            loop {
+                let next = {
+                    st2.queued.lock().unwrap().get_mut(&id2).and_then(|q| q.pop_front())
+                };
+                let Some(q) = next else { break };
+                let _ = drive_one(&st2, &runner2, &id2, q).await;
+            }
+            st2.store.release_turn(&id2, &owner);
+            st2.running.lock().unwrap().remove(&id2);
+        });
+        // Ownership transfers to the background drain.
+        return match first {
+            Ok(text) => Json(serde_json::json!({"session": id, "text": text})).into_response(),
+            Err(s) => {
+                if s.contains("not found") {
+                    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": s}))).into_response()
+                } else {
+                    (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": s}))).into_response()
+                }
+            }
+        };
+    }
+    st.store.release_turn(&id, &owner);
+    st.running.lock().unwrap().remove(&id);
+    match first {
+        Ok(text) => Json(serde_json::json!({"session": id, "text": text})).into_response(),
+        Err(s) => {
             if s.contains("not found") {
                 (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": s}))).into_response()
             } else {
                 (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": s}))).into_response()
             }
+        }
+    }
+}
+
+/// Run one queued turn: events, context gauge, standing-ops. Returns text or error string.
+async fn drive_one(st: &AppState, runner: &Runner, id: &str, q: QueuedPrompt) -> Result<String, String> {
+    st.emit(serde_json::json!({"type": "turn.started", "session": id}));
+    let tx = st.events.clone();
+    let sid = id.to_string();
+    let started = std::time::Instant::now();
+    let out = runner
+        .run_prompt(&st.store, &st.router, &st.cfg, id, &q.text, &q.effort, &q.images, |d, t| {
+            let _ = tx.send(serde_json::json!({"type": "turn.delta", "session": sid, "delta": d, "thinking": t}));
+        })
+        .await;
+    match out {
+        Ok(text) => {
+            let ms = started.elapsed().as_millis() as u64;
+            st.emit(serde_json::json!({"type": "turn.completed", "session": id,
+                "ms": ms, "chars": text.len()}));
+            emit_context(st, id);
+            standing_ops(st, id);
+            Ok(text)
+        }
+        Err(e) => {
+            let s = e.to_string();
+            st.emit(serde_json::json!({"type": "turn.failed", "session": id, "error": s}));
+            standing_ops(st, id);
+            Err(s)
         }
     }
 }

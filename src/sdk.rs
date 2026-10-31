@@ -18,6 +18,12 @@ pub enum SdkError {
 
 /// Daemon session view (wire schema; fields populate pickers and headers).
 #[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct SubmitOut {
+    pub text: String,
+    pub queued: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionView {
     pub id: String,
@@ -39,7 +45,7 @@ pub struct SessionView {
 pub enum Event {
     TurnStarted { session: String },
     TurnDelta { session: String, delta: String, thinking: String },
-    TurnCompleted { session: String },
+    TurnCompleted { session: String, ms: u64, chars: usize },
     TurnFailed { session: String, error: String },
     PermissionAsked { req_id: String, session: String, tool: String, target: String },
     PermissionResolved { req_id: String, decision: String },
@@ -80,7 +86,11 @@ fn classify(v: &serde_json::Value) -> Event {
     match kind {
         "turn.started" => Event::TurnStarted { session: s("session") },
         "turn.delta" => Event::TurnDelta { session: s("session"), delta: s("delta"), thinking: s("thinking") },
-        "turn.completed" => Event::TurnCompleted { session: s("session") },
+        "turn.completed" => Event::TurnCompleted {
+            session: s("session"),
+            ms: v.get("ms").and_then(|m| m.as_u64()).unwrap_or(0),
+            chars: v.get("chars").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
+        },
         "turn.failed" => Event::TurnFailed { session: s("session"), error: s("error") },
         "permission.asked" => Event::PermissionAsked {
             req_id: s("req_id"), session: s("session"), tool: s("tool"), target: s("target"),
@@ -169,14 +179,24 @@ impl Sdk {
         Ok(Self::check(self.req(reqwest::Method::PATCH, &format!("/api/v1/sessions/{id}")).json(body).send()?)?.json()?)
     }
 
-    pub fn submit(&self, id: &str, text: &str, effort: &str) -> Result<String, SdkError> {
+    pub fn submit(&self, id: &str, text: &str, effort: &str) -> Result<SubmitOut, SdkError> {
         let res = Self::check(
             self.req(reqwest::Method::POST, &format!("/api/v1/sessions/{id}/prompt"))
                 .json(&serde_json::json!({"text": text, "effort": effort}))
                 .send()?,
         )?;
         let v: serde_json::Value = res.json()?;
-        Ok(v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string())
+        if v.get("queued").and_then(|q| q.as_bool()).unwrap_or(false) {
+            return Ok(SubmitOut { text: String::new(), queued: true });
+        }
+        Ok(SubmitOut {
+            text: v.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+            queued: false,
+        })
+    }
+
+    pub fn submit_text(&self, id: &str, text: &str, effort: &str) -> Result<String, SdkError> {
+        Ok(self.submit(id, text, effort)?.text)
     }
 
     pub fn fork(&self, id: &str, turn: Option<&str>) -> Result<SessionView, SdkError> {

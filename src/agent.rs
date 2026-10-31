@@ -504,3 +504,58 @@ mod tests {
         assert!(!s.contains("PLAN MODE"));
     }
 }
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    fn setup() -> (Store, Router, crate::config::Config, String) {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("t.db").display().to_string();
+        // Keep the tempdir alive via the path alone is unsafe; leak it for test scope.
+        let dir = d.keep();
+        let _ = dir;
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let cfg = crate::config::Config::default();
+        let router = Router::new(&cfg).unwrap();
+        let sess = store.create_session("/w", "build", "bypass", "").unwrap();
+        (store, router, cfg, sess.id)
+    }
+
+    #[tokio::test]
+    async fn compact_small_session_is_noop() {
+        let (store, router, cfg, id) = setup();
+        for i in 0..5 {
+            store.add_turn(&id, "user", &format!("q{i}")).unwrap();
+        }
+        let msg = Runner::compact_session(&store, &router, &cfg, &id).await.unwrap();
+        assert_eq!(msg, "already compact");
+        assert_eq!(store.turns(&id).unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn compact_large_session_summarizes_without_llm() {
+        let (store, router, cfg, id) = setup();
+        for i in 0..25 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            store.add_turn(&id, role, &format!("turn text number {i}")).unwrap();
+        }
+        // No LLM reachable (local_ollama down or foreign): naive note path.
+        let msg = Runner::compact_session(&store, &router, &cfg, &id).await.unwrap();
+        assert!(msg.starts_with("compacted"), "{msg}");
+        let turns = store.turns(&id).unwrap();
+        assert_eq!(turns.len(), 2 + 6 + 1, "kept head+tail+summary, got {}", turns.len());
+        assert!(turns.last().unwrap().text.contains("Prior context summary"));
+    }
+
+    #[tokio::test]
+    async fn auto_compact_skips_unknown_window() {
+        let (store, router, cfg, id) = setup();
+        for i in 0..25 {
+            store.add_turn(&id, "user", &format!("q{i}")).unwrap();
+        }
+        // Executor model unset + no Ollama → window 0 → never auto-compact blind.
+        Runner::maybe_auto_compact(&store, &router, &cfg, &id).await.unwrap();
+        assert_eq!(store.turns(&id).unwrap().len(), 25);
+    }
+}

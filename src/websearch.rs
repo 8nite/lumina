@@ -360,3 +360,46 @@ mod tests {
         assert!(e.is_err());
     }
 }
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+
+    fn local_page(body: &'static str) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            // Serve exactly one request, then exit (join must not hang).
+            let Ok((mut s, _)) = listener.accept() else { return };
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+                let head = if body.starts_with('<') {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                };
+                let _ = s.write_all(format!("{head}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+        });
+        (addr, h)
+    }
+
+    #[test]
+    fn fetch_strips_html() {
+        let (addr, h) = local_page("<html><body><h1>Hi</h1><script>evil()</script><p>there</p></body></html>");
+        let url = format!("http://{addr}/");
+        let (text, trunc) = fetch(&url, "markdown", Duration::from_secs(10)).expect("fetch html");
+        assert!(!trunc);
+        assert!(text.contains("Hi") && text.contains("there"), "{text}");
+        assert!(!text.contains("evil"));
+        assert!(!trunc);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_rejects_bad_targets() {
+        assert!(fetch("ftp://x/y", "text", Duration::from_secs(5)).is_err());
+        assert!(fetch("https://x.googleapis.com/v1", "text", Duration::from_secs(5)).is_err());
+        assert!(fetch("", "text", Duration::from_secs(5)).is_err());
+    }
+}
