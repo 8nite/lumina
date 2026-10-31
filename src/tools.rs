@@ -9,7 +9,7 @@ use crate::{
     security::{self, Agent, Decision, PermissionMode},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -63,6 +63,8 @@ pub struct Registry {
     pub plugins: Option<Arc<Host>>,
     /// Subagent executor (wired by the agent to avoid a tools↔agent cycle).
     pub subagent: Option<SubagentFn>,
+    /// Per-agent tool matrix (`tools: {bash: false}` in agents/*.md).
+    pub disabled_tools: HashSet<String>,
 }
 
 /// Subagent runner: (parent ctx, task, agent name) -> final text.
@@ -73,7 +75,7 @@ pub type KbQueryFn = Arc<dyn Fn(&Path, &str, usize) -> Result<String, String> + 
 
 impl Registry {
     pub fn new() -> Self {
-        Self { kb_query: None, bundle: None, websearch_provider: String::new(), plugins: None, subagent: None }
+        Self { kb_query: None, bundle: None, websearch_provider: String::new(), plugins: None, subagent: None, disabled_tools: HashSet::new() }
     }
 
 
@@ -117,7 +119,6 @@ impl Registry {
         match security::decide(&eval) {
             Decision::Deny => return Err(ToolError::Denied(format!("{name} {target}"))),
             Decision::Ask => {
-                // Lumina hook: permission.ask short-circuits the modal.
                 let mut plugin_allow = false;
                 if let Some(h) = &self.plugins {
                     let payload = serde_json::json!({"tool": name, "target": target, "sessionID": sc.session});
@@ -145,6 +146,10 @@ impl Registry {
                 }
             }
             Decision::Allow => {}
+        }
+        // Per-agent tool matrix (agents/*.md `tools: {bash: false}`).
+        if self.disabled_tools.contains(name) {
+            return Err(ToolError::Denied(format!("{name}: disabled by the active agent")));
         }
         let started = std::time::Instant::now();
         let result = match name {

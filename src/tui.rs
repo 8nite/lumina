@@ -57,6 +57,15 @@ enum Popup {
     Sessions { list: Vec<SessionView>, idx: usize },
 }
 
+struct PendingConnect {
+    provider: String,
+    github_url: String,
+    device_code: String,
+    next_poll: Instant,
+    interval: u64,
+    deadline: Instant,
+}
+
 struct App {
     sdk: Sdk,
     session: SessionView,
@@ -71,6 +80,10 @@ struct App {
     effort: String,
     thinking_shown: bool,
     thinking: String,
+    custom_cmds: Vec<(String, String)>,
+    primaries: Vec<String>,
+    pending_connect: Option<PendingConnect>,
+    ctx: String,
     popup: Option<Popup>,
     perm: Option<PermModal>,
     ques: Option<QModal>,
@@ -189,9 +202,7 @@ impl App {
                 }
                 _ => self.set_status("usage: /thinking [show|hide]"),
             },
-            "connect" => {
-                self.set_status(&format!("/{cmd} not yet ported in Rust"));
-            }
+            "connect" => self.connect(rest),
             "init" => {
                 let p = std::path::Path::new(&self.workspace).join("AGENTS.md");
                 if p.exists() {
@@ -218,7 +229,81 @@ impl App {
                 Ok(r) => self.push_msg("system", format!("evolve: {r}")),
                 Err(e) => self.set_status(&format!("evolve: {e}")),
             },
-            _ => self.set_status(&format!("unknown /{cmd} — try /help")),
+            _ => {
+                // Custom workspace slash commands (prompt templates).
+                let name = cmd.to_string();
+                if let Some((_, body)) = self.custom_cmds.iter().find(|(n, _)| *n == name) {
+                    let expanded = expand_command(&body.clone(), &rest);
+                    self.send_prompt(expanded);
+                } else {
+                    self.set_status(&format!("unknown /{cmd} — try /help"));
+                }
+            }
+        }
+    }
+
+    /// /connect wizard: provider → device code → tick-driven poll to connected.
+    /// Mirrors Go's provider picker + GitHub URL prompt + device polling.
+    fn connect(&mut self, rest: Vec<&str>) {
+        let provider = rest.first().copied().unwrap_or("copilot").to_string();
+        if provider != "copilot" {
+            self.set_status(&format!("/connect only supports copilot (got {provider:?})"));
+            return;
+        }
+        let github_url = rest.get(1).copied().unwrap_or("https://api.github.com").to_string();
+        let dc = match self.sdk.auth_start(&provider, &github_url) {
+            Ok(v) => v,
+            Err(e) => {
+                self.set_status(&format!("connect: {e}"));
+                return;
+            }
+        };
+        let code = dc.get("device_code").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        let user_code = dc.get("user_code").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        let uri = dc.get("verification_uri").and_then(|u| u.as_str()).unwrap_or("").to_string();
+        let interval = dc.get("interval").and_then(|i| i.as_u64()).unwrap_or(5).max(2);
+        if code.is_empty() {
+            self.set_status("connect: bad device response");
+            return;
+        }
+        self.push_msg("system", format!("To connect {provider}: open {uri} and enter {user_code}"));
+        self.pending_connect = Some(PendingConnect {
+            provider,
+            github_url,
+            device_code: code,
+            next_poll: Instant::now() + Duration::from_secs(interval),
+            interval,
+            deadline: Instant::now() + Duration::from_secs(600),
+        });
+        self.set_status("device flow started — approve in your browser");
+    }
+
+    /// One non-blocking poll step, driven by the UI tick.
+    fn poll_connect(&mut self) {
+        let mut done = false;
+        let mut connected = false;
+        if let Some(p) = &mut self.pending_connect {
+            if Instant::now() >= p.next_poll {
+                p.next_poll = Instant::now() + Duration::from_secs(p.interval);
+                match self.sdk.auth_poll(&p.provider, &p.github_url, &p.device_code) {
+                    Ok(v) if v.get("connected").and_then(|c| c.as_bool()).unwrap_or(false) => {
+                        connected = true;
+                        done = true;
+                    }
+                    // Pending/rate-limited/transient: keep polling to deadline.
+                    Ok(_) | Err(_) => {}
+                }
+                if Instant::now() >= p.deadline {
+                    done = true;
+                }
+            }
+        }
+        if done {
+            self.pending_connect = None;
+        }
+        if connected {
+            self.push_msg("system", "provider connected — pick it with /model".into());
+            self.set_status("connected");
         }
     }
 
@@ -243,8 +328,10 @@ impl App {
     }
 
     fn cycle_agent(&mut self) {
-        let next = if self.session.agent == "plan" { "build" } else { "plan" };
-        self.set_agent(next);
+        let mut order = vec!["plan".to_string(), "build".to_string()];
+        order.extend(self.primaries.iter().cloned());
+        let cur = order.iter().position(|a| *a == self.session.agent).unwrap_or(1);
+        self.set_agent(&order[(cur + 1) % order.len()].clone());
     }
 
     fn cycle_mode(&mut self) {
@@ -386,7 +473,15 @@ impl App {
                 });
             }
             Event::ConfigUpdated { role, model } => self.set_status(&format!("{role} → {model}")),
-            Event::Other { .. } => {}
+            Event::Other { kind, raw } => {
+                if kind == "turn.context" {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        let used = v.get("used").and_then(|u| u.as_u64()).map(|u| u.to_string()).unwrap_or_else(|| "?".into());
+                        let max = v.get("max").and_then(|m| m.as_u64()).unwrap_or(0);
+                        self.ctx = if max == 0 { format!("ctx ~{used}") } else { format!("ctx ~{used}/{max}") };
+                    }
+                }
+            }
         }
     }
 
@@ -408,12 +503,22 @@ impl App {
             self.popup = None;
             return;
         };
-        let items = match kind {
-            "cmd" => ["plan", "build", "mode", "model", "variant", "resume", "continue", "fork", "graphify", "clear", "help"]
-                .into_iter()
-                .filter(|c| c.starts_with(prefix))
-                .map(|s| format!("/{s}"))
-                .collect(),
+        let items: Vec<String> = match kind {
+            "cmd" => {
+                let mut builtin: Vec<String> = ["plan", "build", "mode", "model", "variant", "resume", "continue", "fork", "graphify", "clear", "help", "compact", "thinking", "undo", "redo", "evolve", "init", "connect"]
+                    .into_iter()
+                    .filter(|c| c.starts_with(prefix))
+                    .map(|s| format!("/{s}"))
+                    .collect();
+                let mut customs: Vec<String> = self
+                    .custom_cmds
+                    .iter()
+                    .map(|(n, _)| format!("/{n}"))
+                    .filter(|s| s[1..].starts_with(prefix))
+                    .collect();
+                builtin.append(&mut customs);
+                builtin
+            }
             "file" => complete_files(&self.workspace, prefix),
             "memory" => complete_memory(&self.workspace, prefix),
             _ => vec![],
@@ -477,6 +582,13 @@ fn complete_files(workspace: &str, prefix: &str) -> Vec<String> {
     out
 }
 
+/// Expand a custom command template: $ARGUMENTS (and $@) become the rest
+/// line; other $vars pass through for the model to resolve via tools.
+fn expand_command(body: &str, args: &[&str]) -> String {
+    let rest = args.join(" ");
+    body.replace("$ARGUMENTS", &rest).replace("$@", &rest)
+}
+
 fn complete_memory(workspace: &str, prefix: &str) -> Vec<String> {
     let dir = std::path::Path::new(workspace).join("memory");
     let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
@@ -495,7 +607,7 @@ fn complete_memory(workspace: &str, prefix: &str) -> Vec<String> {
     out
 }
 
-const HELP: &str = "keys: Tab flip plan/build · Shift+Tab approval · Enter send · Ctrl+X queue · Esc cancel/close\n/plan /build /mode /model /variant /resume /continue /fork /graphify <q> /clear · @file paths · [[memory]] notes";
+const HELP: &str = "keys: Tab plan/build/* · Shift+Tab approval · Enter send · Ctrl+X queue · Esc cancel/close\n/plan /build /mode /model /variant /resume /continue /fork /graphify <q> /compact /thinking /undo /redo /evolve /init /clear · @file paths · [[memory]] notes";
 
 pub fn run(opts: LaunchOpts) -> Result<(), String> {
     let sdk = Sdk::new(&opts.base_url, &opts.token);
@@ -516,7 +628,7 @@ pub fn run(opts: LaunchOpts) -> Result<(), String> {
     let events = sdk.subscribe();
     let mut app = App {
         sdk,
-        workspace: ws,
+        workspace: ws.clone(),
         session,
         messages: vec![],
         input: vec![],
@@ -528,6 +640,10 @@ pub fn run(opts: LaunchOpts) -> Result<(), String> {
         effort: "auto".into(),
         thinking_shown: false,
         thinking: String::new(),
+        custom_cmds: vec![],
+        primaries: vec![],
+        pending_connect: None,
+        ctx: String::from("ctx —"),
         popup: None,
         perm: None,
         ques: None,
@@ -535,6 +651,13 @@ pub fn run(opts: LaunchOpts) -> Result<(), String> {
         status_at: Instant::now(),
     };
     app.load_transcript();
+    // Custom slash commands + primary agents (best-effort; builtins work regardless).
+    if let Ok(cmds) = app.sdk.commands(&ws) {
+        app.custom_cmds = cmds.into_iter().map(|c| (c.name, c.body)).collect();
+    }
+    if let Ok(agents) = app.sdk.agents(&ws) {
+        app.primaries = agents.into_iter().filter(|a| a.mode == "primary").map(|a| a.name).collect();
+    }
     // Resync: pick up in-flight turns and pending modals missed while away.
     app.resync();
 
@@ -558,6 +681,7 @@ fn event_loop(
         for ev in events.try_iter() {
             app.on_event(ev);
         }
+        app.poll_connect();
         term.draw(|f| draw(f, app)).map_err(|e| e.to_string())?;
         if !event::poll(Duration::from_millis(100)).map_err(|e| e.to_string())? {
             continue;
@@ -790,6 +914,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Span::raw(" "),
         Span::styled(format!(" {} ", app.session.permission_mode), Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::raw(format!(" {} · {}", app.session.model, app.effort)),
+        Span::raw(format!(" · {}", app.ctx)),
         Span::raw(if app.running { " · working…" } else { "" }),
     ]);
     f.render_widget(Paragraph::new(header), chunks[0]);
@@ -974,6 +1099,10 @@ mod tests {
             popup: None,
             perm: Some(PermModal { req_id: "r".into(), tool: "bash".into(), target: "ls".into(), choice: 1 }),
             ques: None,
+            custom_cmds: vec![("deploy".into(), "deploy $ARGUMENTS".into())],
+            primaries: vec![],
+            pending_connect: None,
+            ctx: "ctx —".into(),
             status: "ok".into(),
             status_at: Instant::now(),
         }
@@ -999,5 +1128,16 @@ mod tests {
         app.input = "plain text".chars().collect();
         app.update_complete();
         assert!(app.popup.is_none());
+    }
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::expand_command;
+
+    #[test]
+    fn expands_arguments() {
+        assert_eq!(expand_command("deploy $ARGUMENTS now", &["prod", "--force"]), "deploy prod --force now");
+        assert_eq!(expand_command("no vars", &["x"]), "no vars");
     }
 }

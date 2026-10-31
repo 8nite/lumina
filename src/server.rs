@@ -119,6 +119,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/kb/query", axum::routing::post(kb_query))
         .route("/api/v1/kb/", get(kb_browse))
         .route("/api/v1/mcp/tools", get(mcp_tools))
+        .route("/api/v1/commands", get(commands))
+        .route("/api/v1/agents", get(agents))
         .route("/api/v1/harness", get(harness_info))
         .route("/api/v1/harness/evolve", axum::routing::post(harness_evolve))
         .fallback(spa_fallback)
@@ -233,7 +235,19 @@ async fn patch_session(
     // ponytail: validate enums at the boundary, not in the store.
     if let Some(a) = &b.agent {
         if !["plan", "build"].contains(&a.as_str()) {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "agent must be plan|build"}))).into_response();
+            // Custom primary agents (agents/*.md with mode: primary).
+            let ws = st
+                .store
+                .get_session(&id)
+                .ok()
+                .flatten()
+                .map(|s| s.workspace_dir)
+                .unwrap_or_else(|| ".".into());
+            let bundle = crate::rules::Bundle::load(std::path::Path::new(&ws), true, true);
+            let ok = bundle.agents.iter().any(|ag| &ag.name == a && ag.mode == "primary");
+            if !ok {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "agent must be plan|build or a custom primary agent"}))).into_response();
+            }
         }
     }
     if let Some(m) = &b.permission_mode {
@@ -270,6 +284,16 @@ struct ImageIn {
     data: String,
 }
 
+/// This daemon's turn-claim identity (host/pid + random suffix).
+fn daemon_owner() -> String {
+    static ONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| format!("{}-{}-{}", hostname_simple(), std::process::id(), &uuid::Uuid::new_v4().to_string()[..8])).clone()
+}
+
+fn hostname_simple() -> String {
+    std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "host".into())
+}
+
 async fn prompt(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -280,6 +304,12 @@ async fn prompt(
     }
     let effort = crate::llm::normalize_effort(&b.effort).to_string();
     let _ = st.store.touch(&id);
+    // Cross-daemon turn claim: 409 when another daemon holds the turn
+    // (mirrors Go ClaimTurn: free, ours, or stale >10min).
+    let owner = daemon_owner();
+    if !st.store.claim_turn(&id, &owner, 600) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "turn in flight (another daemon holds this session)"}))).into_response();
+    }
     let mut runner = Runner::new();
     runner.approval = Some(st.gate.clone());
     // Workspace plugin worker (started on demand, cached per workspace).
@@ -313,12 +343,15 @@ async fn prompt(
         .await;
     match out {
         Ok(text) => {
+            st.store.release_turn(&id, &owner);
             st.running.lock().unwrap().remove(&id);
             st.emit(serde_json::json!({"type": "turn.completed", "session": id}));
+            emit_context(&st, &id);
             standing_ops(&st, &id);
             Json(serde_json::json!({"session": id, "text": text})).into_response()
         }
         Err(e) => {
+            st.store.release_turn(&id, &owner);
             st.running.lock().unwrap().remove(&id);
             let s = e.to_string();
             st.emit(serde_json::json!({"type": "turn.failed", "session": id, "error": s}));
@@ -330,6 +363,18 @@ async fn prompt(
             }
         }
     }
+}
+
+/// Emit one `turn.context` gauge event (used tokens vs advertised window).
+fn emit_context(st: &AppState, id: &str) {
+    let Ok(Some(sess)) = st.store.get_session(id) else { return };
+    let Ok(turns) = st.store.turns(id) else { return };
+    let used: usize = turns.iter().map(|t| t.text.len() + t.role.len()).sum::<usize>() / 4;
+    // Window resolution is async; best-effort snapshot via blocking park.
+    let router = st.router.clone();
+    let model = if sess.model.is_empty() { router.model_for("executor", "build") } else { sess.model.clone() };
+    let max = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(router.context_window(&model))) as usize;
+    let _ = st.events.send(serde_json::json!({"type": "turn.context", "session": id, "used": used, "max": max}));
 }
 
 /// Standing-ops: debounced KB freshness pass after every turn (success or
@@ -886,6 +931,22 @@ async fn mcp_tools(Query(q): Query<HashMap<String, String>>) -> impl IntoRespons
         Ok(tools) => Json(serde_json::json!({"server": server, "tools": tools})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
+}
+
+/// Custom slash commands (prompt templates with $ARGUMENTS expansion).
+async fn commands(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let ws = q.get("directory").map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+    let bundle = crate::rules::Bundle::load(&ws, true, true);
+    Json(serde_json::json!({"commands": bundle.commands.iter().map(|c| serde_json::json!({"name": c.name, "body": c.body})).collect::<Vec<_>>()}))
+    .into_response()
+}
+
+/// Custom agents (including `mode: primary` Tab-cycle targets).
+async fn agents(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let ws = q.get("directory").map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+    let bundle = crate::rules::Bundle::load(&ws, true, true);
+    Json(serde_json::json!({"agents": bundle.agents.iter().map(|a| serde_json::json!({"name": a.name, "mode": a.mode, "description": a.description})).collect::<Vec<_>>()}))
+    .into_response()
 }
 
 async fn spa_fallback(uri: axum::http::Uri) -> impl IntoResponse {

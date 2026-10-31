@@ -102,6 +102,13 @@ impl Runner {
             _ => PermissionMode::Bypass,
         };
         let bundle = Bundle::load(&workspace, cfg.compat.import_global_rules, cfg.compat.import_global_skills);
+        // Custom primary agent (agents/*.md, mode: primary): extra system
+        // framing, per-agent model default, and tool matrix.
+        let custom = if sess.agent != "plan" && sess.agent != "build" {
+            bundle.agents.iter().find(|a| a.name == sess.agent && a.mode == "primary").cloned()
+        } else {
+            None
+        };
         // Auto-compact near the context limit (best-effort, never fails the turn).
         if Self::maybe_auto_compact(store, router, cfg, session_id).await.is_err() {
             // proceed with full history; the loop degrades gracefully
@@ -123,6 +130,15 @@ impl Runner {
             content: Self::system_prompt(&bundle, agent),
             thinking: String::new(),
         }];
+        if let Some(def) = &custom {
+            if !def.body.trim().is_empty() {
+                messages.push(llm::Message {
+                    role: "system".into(),
+                    content: format!("Active custom agent '{}':\n{}", def.name, def.body),
+                    thinking: String::new(),
+                });
+            }
+        }
         for t in store.turns(session_id)? {
             // Replay persisted history (skip the user turn just stored — re-added below).
             if t.role == "user" || t.role == "assistant" {
@@ -138,6 +154,9 @@ impl Runner {
             bundle: Some(bundle),
             websearch_provider: cfg.websearch.provider.clone(),
             plugins: self.plugins.clone(),
+            disabled_tools: custom.as_ref().map(|d| {
+                d.tools.iter().filter(|(_, &on)| !on).map(|(t, _)| t.clone()).collect()
+            }).unwrap_or_default(),
             subagent: Some(Arc::new({
                 let router = router.clone();
                 let cfg = cfg.clone();
@@ -168,7 +187,12 @@ impl Runner {
             depth: 0,
         };
         let agent_name = sess.agent.clone();
-        let model = sess.model.clone();
+        // Per-agent model default (falls back to the router executor tier).
+        let model = if sess.model.is_empty() {
+            custom.as_ref().and_then(|d| (!d.model.is_empty()).then(|| d.model.clone())).unwrap_or_default()
+        } else {
+            sess.model.clone()
+        };
         let (final_text, mutated) = self
             .loop_until_done(router, &reg, &sc, &agent_name, &model, effort, images, &mut messages, &mut on_event)
             .await?;
@@ -300,6 +324,7 @@ async fn run_subtask(
         websearch_provider: cfg.websearch.provider.clone(),
         plugins: None,
         subagent: None, // depth guard is also enforced in do_subagent
+        disabled_tools: std::collections::HashSet::new(),
     };
     let sc = SecCtx {
         workspace: parent.workspace.clone(),

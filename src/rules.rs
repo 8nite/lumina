@@ -39,6 +39,8 @@ pub struct AgentDef {
     pub model: String,
     pub path: String,
     pub body: String,
+    /// Per-tool overrides from a `tools:` frontmatter block (`bash: false`).
+    pub tools: HashMap<String, bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,13 +84,33 @@ pub fn parse_frontmatter(content: &str) -> (HashMap<String, String>, String) {
     let Some(end) = content[3..].find("\n---") else { return (meta, content.to_string()) };
     let fm = &content[3..3 + end];
     let rest = content[3 + end + 4..].trim_start_matches('\n').to_string();
+    let mut current_block: Option<String> = None;
     for line in fm.lines() {
+        // Nested `tools:` block: indented `name: bool` lines.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(block) = &current_block {
+                let t = line.trim();
+                if !t.is_empty() && !t.starts_with('#') {
+                    if let Some((k, v)) = t.split_once(':') {
+                        meta.insert(format!("{block}.{}", k.trim()), v.trim().trim_matches(|c| c == '"' || c == '\'').to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        current_block = None;
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let Some((k, v)) = line.split_once(':') else { continue };
-        meta.insert(k.trim().to_string(), v.trim().trim_matches(|c| c == '"' || c == '\'').to_string());
+        let (k, v) = (k.trim().to_string(), v.trim().trim_matches(|c| c == '"' || c == '\'').to_string());
+        if v.is_empty() {
+            // Block header (`tools:` with nested lines following).
+            current_block = Some(k);
+        } else {
+            meta.insert(k, v);
+        }
     }
     (meta, rest)
 }
@@ -123,6 +145,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             model: String::new(),
             path: String::new(),
             body: "You are a general-purpose subagent. Research the workspace, run safe diagnostics, and complete multi-step tasks. Prefer kb_query and grep before broad edits. Summarize what you did with file references.".into(),
+            tools: HashMap::new(),
         },
         AgentDef {
             name: "explore".into(),
@@ -131,6 +154,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             model: String::new(),
             path: String::new(),
             body: "You are an explore subagent. Search and read code (read, glob, grep), memory (kb_query, skill), and the web (webfetch, websearch). Do not edit files. Report findings with file and line references.".into(),
+            tools: HashMap::new(),
         },
     ]
 }
@@ -156,6 +180,14 @@ fn discover_agents(workspace: &Path) -> Vec<AgentDef> {
                 model: meta.get("model").cloned().unwrap_or_default(),
                 path: f.display().to_string(),
                 body,
+                tools: meta
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        k.strip_prefix("tools.").map(|t| {
+                            (t.to_string(), !matches!(v.to_lowercase().as_str(), "false" | "no" | "0" | "off"))
+                        })
+                    })
+                    .collect(),
             });
         }
     }
@@ -282,5 +314,20 @@ impl Bundle {
             s.push_str(&format!("- {}: {}\n", sk.name, sk.description));
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod frontmatter_tests {
+    use super::*;
+
+    #[test]
+    fn tools_block_parses() {
+        let content = "---\nname: reviewer\nmode: primary\ntools:\n  bash: false\n  edit: true\n---\nBody here.\n";
+        let (meta, body) = parse_frontmatter(content);
+        assert_eq!(body.trim(), "Body here.");
+        assert_eq!(meta.get("tools.bash").map(|s| s.as_str()), Some("false"));
+        assert_eq!(meta.get("tools.edit").map(|s| s.as_str()), Some("true"));
+        assert_eq!(meta.get("name").map(|s| s.as_str()), Some("reviewer"));
     }
 }

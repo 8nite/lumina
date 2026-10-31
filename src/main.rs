@@ -368,7 +368,7 @@ async fn main() -> MainResult {
 fn cmd_plugin(args: &[String]) -> MainResult {
     let ws = cwd();
     let wpath = PathBuf::from(&ws);
-    let files = plugins::discover(&wpath, false);
+    let files = plugins::discover(&wpath, true);
     match args.first().map(|s| s.as_str()) {
         Some("list") | None => {
             if files.is_empty() {
@@ -405,6 +405,10 @@ fn cmd_plugin(args: &[String]) -> MainResult {
                 }
                 None => println!("worker FAILED to answer config hook"),
             }
+            Ok(())
+        }
+        Some("enable") | Some("disable") => {
+            println!("plugin {}: managed by editing ~/.config/lumina/plugins (no registry yet)", args[0]);
             Ok(())
         }
         _ => {

@@ -56,6 +56,24 @@ pub struct QuestionView {
     pub options: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommandView {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentView {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub description: String,
+}
+
 fn classify(v: &serde_json::Value) -> Event {
     let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -220,6 +238,36 @@ impl Sdk {
         )?
         .json()?;
         Ok(v.get("context").and_then(|c| c.as_str()).unwrap_or("").to_string())
+    }
+
+    pub fn commands(&self, dir: &str) -> Result<Vec<CommandView>, SdkError> {
+        let v: serde_json::Value =
+            Self::check(self.req(reqwest::Method::GET, "/api/v1/commands").query(&[("directory", dir)]).send()?)?.json()?;
+        Ok(v.get("commands").and_then(|c| serde_json::from_value(c.clone()).ok()).unwrap_or_default())
+    }
+
+    pub fn agents(&self, dir: &str) -> Result<Vec<AgentView>, SdkError> {
+        let v: serde_json::Value =
+            Self::check(self.req(reqwest::Method::GET, "/api/v1/agents").query(&[("directory", dir)]).send()?)?.json()?;
+        Ok(v.get("agents").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default())
+    }
+
+    pub fn auth_start(&self, provider: &str, github_url: &str) -> Result<serde_json::Value, SdkError> {
+        Ok(Self::check(
+            self.req(reqwest::Method::GET, "/api/v1/auth/device/start")
+                .query(&[("provider", provider), ("github_url", github_url)])
+                .send()?,
+        )?
+        .json()?)
+    }
+
+    pub fn auth_poll(&self, provider: &str, github_url: &str, device_code: &str) -> Result<serde_json::Value, SdkError> {
+        Ok(Self::check(
+            self.req(reqwest::Method::GET, "/api/v1/auth/device/poll")
+                .query(&[("provider", provider), ("github_url", github_url), ("device_code", device_code)])
+                .send()?,
+        )?
+        .json()?)
     }
 
     pub fn evolve(&self) -> Result<String, SdkError> {

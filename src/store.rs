@@ -428,3 +428,64 @@ mod tests {
         assert!(out.contains("REDACTED"));
     }
 }
+
+impl Store {
+    /// Atomically claim the in-flight turn slot (cross-daemon safety).
+    /// Takes the slot when free, owned by us, or stale (> max_age_secs).
+    pub fn claim_turn(&self, id: &str, owner: &str, max_age_secs: i64) -> bool {
+        let db = self.db.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let stale_before = now - max_age_secs;
+        let n = db
+            .execute(
+                "UPDATE sessions SET inflight_owner=?, inflight_since=? WHERE id=? AND (inflight_owner='' OR inflight_owner=? OR inflight_since<?)",
+                params![owner, now, id, owner, stale_before],
+            )
+            .unwrap_or(0);
+        n > 0
+    }
+
+    /// Release the turn slot (only our own claims).
+    pub fn release_turn(&self, id: &str, owner: &str) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE sessions SET inflight_owner='', inflight_since=0 WHERE id=? AND inflight_owner=?",
+            params![id, owner],
+        );
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    #[test]
+    fn claim_release_cycle() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_id TEXT DEFAULT '',
+             workspace_dir TEXT NOT NULL, agent TEXT DEFAULT 'build',
+             permission_mode TEXT DEFAULT 'bypass', model TEXT DEFAULT '', title TEXT DEFAULT '',
+             created_at TEXT, updated_at TEXT);",
+        )
+        .unwrap();
+        // inflight columns missing on this scratch schema: migrate tolerantly.
+        for ddl in [
+            "ALTER TABLE sessions ADD COLUMN inflight_owner TEXT DEFAULT ''",
+            "ALTER TABLE sessions ADD COLUMN inflight_since INTEGER DEFAULT 0",
+        ] {
+            let _ = db.execute_batch(ddl);
+        }
+        let s = Store { db: Mutex::new(db) };
+        let sess = s.create_session("/w", "build", "bypass", "").unwrap();
+        assert!(s.claim_turn(&sess.id, "daemon-a", 600));
+        assert!(!s.claim_turn(&sess.id, "daemon-b", 600)); // held: 409 path
+        assert!(s.claim_turn(&sess.id, "daemon-a", 600)); // owner re-entry ok
+        s.release_turn(&sess.id, "daemon-b"); // wrong owner: no-op
+        assert!(!s.claim_turn(&sess.id, "daemon-b", 600));
+        s.release_turn(&sess.id, "daemon-a");
+        assert!(s.claim_turn(&sess.id, "daemon-b", 600));
+        assert!(!s.claim_turn(&sess.id, "daemon-c", 3600)); // fresh: still held
+        assert!(s.claim_turn(&sess.id, "daemon-c", -1)); // stale: taken over
+    }
+}
