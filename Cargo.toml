@@ -1,0 +1,26 @@
+[package]
+name = "lumina"
+version = "0.1.0"
+edition = "2021"
+description = "Lumina daemon + CLI (Rust port, M0: config/security/rules/server). Web SPA in web/ unchanged, embedded via rust-embed."
+license = "MIT"
+
+[[bin]]
+name = "lumina"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { version = "0.8", features = ["parse"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rust-embed = { version = "8", features = ["include-exclude"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+[dev-dependencies]
+tempfile = "3"
