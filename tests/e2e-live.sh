@@ -58,6 +58,10 @@ api PATCH "/api/v1/sessions/$S1" '{"agent":"nope"}' | grep -q 'must be plan' && 
 api PATCH "/api/v1/sessions/$S1" '{"agent":"build"}' >/dev/null
 api GET "/api/v1/sessions/$S1/export?sanitize=1" | head -1 | grep -q "# Session" && pass "export" || fail "export"
 api POST "/api/v1/sessions/$S1/fork" '{}' | grep -q '"parent_id":"'$S1'"' && pass "fork" || fail "fork"
+SD=$(new_session "$ROOT/wsdel"); [ -n "$SD" ] && pass "create for delete" || fail "create for delete"
+api DELETE "/api/v1/sessions/$SD" | grep -q '"deleted":true' && pass "delete 200" || fail "delete"
+[ "$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/v1/sessions/$SD")" = "404" ] && pass "gone after delete" || fail "gone after delete"
+[ "$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$BASE/api/v1/sessions/$SD")" = "404" ] && pass "delete missing 404" || fail "delete missing"
 [ "$(api GET "/api/v1/sessions/$S1/state" | python3 -c 'import sys,json;print(json.load(sys.stdin)["running"])')" = "False" ] && pass "state idle" || fail "state idle"
 
 section "S2 exact-reply turn (no tools)"
