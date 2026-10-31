@@ -252,7 +252,20 @@ async fn main() -> MainResult {
             let router = llm::Router::new(&cfg).map_err(|e| format!("router: {e}"))?;
             let app = server::router(server::AppState::new(store, router, cfg.clone(), config_path()));
             let addr = format!("{host}:{port}");
-            tracing::info!(%addr, agent = %cfg.defaults.agent, "lumina serve (rust)");
+            // The store path is cwd-relative by default, so a restart from
+            // another directory silently switches databases (sessions vanish
+            // from every attached client). Print the absolute path so a wrong
+            // cwd is visible immediately instead of surfacing as 404s.
+            // (eprintln: startup banners must show without RUST_LOG set.)
+            let db_display = std::env::var("LUMINA_DB").unwrap_or_else(|_| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| ".".into())
+                    .join(".lumina/lumina.db")
+                    .display()
+                    .to_string()
+            });
+            eprintln!("lumina serve (rust) on {addr} (db {db_display})");
+            tracing::info!(%addr, agent = %cfg.defaults.agent, db = %db_display, "lumina serve (rust)");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             axum::serve(
                 listener,
