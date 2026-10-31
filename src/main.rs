@@ -248,7 +248,7 @@ async fn main() -> MainResult {
             }
             let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
             let router = llm::Router::new(&cfg).map_err(|e| format!("router: {e}"))?;
-            let app = server::router(server::AppState::new(store, router, cfg.clone()));
+            let app = server::router(server::AppState::new(store, router, cfg.clone(), config_path()));
             let addr = format!("{host}:{port}");
             tracing::info!(%addr, agent = %cfg.defaults.agent, "lumina serve (rust)");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -347,8 +347,7 @@ async fn main() -> MainResult {
             Ok(())
         }
         Some(Cmd::Openapi { out }) => {
-            let spec = serde_json::json!({"openapi": "3.1.0", "info": {"title": "Lumina daemon", "version": env!("CARGO_PKG_VERSION")}});
-            let text = serde_json::to_string_pretty(&spec)?;
+            let text = serde_json::to_string_pretty(&server::openapi_spec())?;
             if let Some(p) = out {
                 std::fs::write(&p, text)?;
                 println!("{}", p.display());
@@ -520,7 +519,7 @@ async fn ensure_daemon(base: &str, cfg: &config::Config) -> MainResult {
     }
     let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
     let router = llm::Router::new(cfg).map_err(|e| format!("router: {e}"))?;
-    let app = server::router(server::AppState::new(store, router, cfg.clone()));
+    let app = server::router(server::AppState::new(store, router, cfg.clone(), config_path()));
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     tokio::spawn(async move {
         let _ = axum::serve(
@@ -536,4 +535,13 @@ async fn ensure_daemon(base: &str, cfg: &config::Config) -> MainResult {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     Err("daemon failed to start".into())
+}
+
+/// Config file path for model-persist (explicit env wins, else the default
+/// path when it exists; None keeps overrides in-memory only).
+fn config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("LUMINA_CONFIG") {
+        return Some(PathBuf::from(p));
+    }
+    config::default_path().filter(|p| p.exists())
 }

@@ -2,7 +2,7 @@
 //! Mirrors `internal/config/config.go` (M0 scope).
 
 use serde::Deserialize;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::{Path, PathBuf}};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -260,6 +260,57 @@ pub fn is_google_url(url: &str) -> bool {
     u.contains("googleapis.com") || u.contains("google.com") || u.contains("gemini")
 }
 
+/// Hot-swap a tier model and persist it to the config file when one is
+/// configured (model-persist: survives daemon restarts).
+pub fn persist_router_model(path: &Path, role: &str, model: &str) -> Result<(), ConfigError> {
+    if !matches!(role, "fast" | "executor" | "planner" | "improver") {
+        return Err(ConfigError::Msg(format!("bad router role {role:?}")));
+    }
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = String::new();
+    let mut in_router = false;
+    let mut done = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            if in_router && !done {
+                out.push_str(&format!("{role} = \"{model}\"\n"));
+                done = true;
+            }
+            in_router = t == "[router]";
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_router && !done {
+            let key = t.split(['=', ' ']).next().unwrap_or("");
+            if key == role {
+                out.push_str(&format!("{role} = \"{model}\"\n"));
+                done = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !done {
+        if !in_router {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str("[router]\n");
+        }
+        out.push_str(&format!("{role} = \"{model}\"\n"));
+    }
+    std::fs::write(path, out)?;
+    Ok(())
+}
+
 pub fn default_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("LUMINA_CONFIG") {
         return Some(PathBuf::from(p));
@@ -302,5 +353,29 @@ mod tests {
         let f = write_tmp("[permissions.bash]\n\"git status*\" = \"allow\"\n");
         let cfg = Config::load(Some(f.path().into())).unwrap();
         assert_eq!(cfg.permissions_bash.get("git status*").unwrap(), "allow");
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    #[test]
+    fn persist_updates_and_appends() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, "[router]\nexecutor = \"a/x\"\n").unwrap();
+        persist_router_model(&p, "executor", "b/y").unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("executor = \"b/y\""), "{text}");
+        assert_eq!(text.matches("executor").count(), 1);
+        persist_router_model(&p, "fast", "c/z").unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("fast = \"c/z\""), "{text}");
+        // Missing file: creates a minimal [router] section.
+        let p2 = d.path().join("fresh.toml");
+        persist_router_model(&p2, "improver", "d/w").unwrap();
+        assert!(std::fs::read_to_string(&p2).unwrap().contains("[router]"));
+        assert!(persist_router_model(&p, "bogus", "x").is_err());
     }
 }

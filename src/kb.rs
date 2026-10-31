@@ -287,26 +287,59 @@ pub fn resolve_wikilinks(mem_dir: &Path, start: &str, budget: usize) -> HashMap<
     out
 }
 
-/// Singleflight idle/session-close KB refresh per workspace.
+/// Singleflight idle/session-close KB refresh per workspace, with a
+/// per-workspace debounce so idle ticks and rapid turn completions collapse
+/// into one refresh (mirrors `kb.idle_debounce_minutes`).
+/// Clone shares the same inflight/debounce state (correct under axum's
+/// per-request `State` clones).
+#[derive(Clone)]
 pub struct Sweeper {
+    inner: std::sync::Arc<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
     inflight: std::sync::Mutex<HashSet<String>>,
+    last_run: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl Sweeper {
     pub fn new() -> Self {
-        Self { inflight: std::sync::Mutex::new(HashSet::new()) }
+        Self { inner: std::sync::Arc::new(Inner::default()) }
     }
 
     pub fn run(&self, workspace: &str, f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
         {
-            let mut g = self.inflight.lock().unwrap();
+            let mut g = self.inner.inflight.lock().unwrap();
             if !g.insert(workspace.to_string()) {
                 return Ok(()); // dedup: a sweep is already running
             }
         }
         let r = f();
-        self.inflight.lock().unwrap().remove(workspace);
+        self.inner.inflight.lock().unwrap().remove(workspace);
         r
+    }
+
+    /// Run at most once per `debounce`; returns true when the pass executed.
+    pub fn run_throttled(
+        &self,
+        workspace: &str,
+        debounce: std::time::Duration,
+        f: impl FnOnce() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        {
+            let last = self.inner.last_run.lock().unwrap();
+            if let Some(t) = last.get(workspace) {
+                if t.elapsed() < debounce {
+                    return Ok(false);
+                }
+            }
+        }
+        let r = self.run(workspace, f);
+        if r.is_ok() {
+            self.inner.last_run.lock().unwrap().insert(workspace.to_string(), std::time::Instant::now());
+        }
+        r.map(|_| true)
     }
 }
 
@@ -314,6 +347,20 @@ impl Default for Sweeper {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Re-stamp `memory/graphify-out/manifest.json` from the current `./memory`
+/// notes (cheap freshness anchor for the standing-ops pass).
+pub fn refresh_memory_manifest(workspace: &Path) -> Result<bool, KbError> {
+    let dir = workspace.join("memory");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return Ok(false) };
+    let files: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+        .map(|e| format!("memory/{}", e.file_name().to_string_lossy()))
+        .collect();
+    manifest_stamp(workspace, &dir.join("graphify-out"), &files)?;
+    Ok(true)
 }
 
 /// Write the canonical root-relative manifest.json.
@@ -559,7 +606,7 @@ mod sweeper_tests {
         let r2 = ran.clone();
         // Second Run while the first is inflight is a no-op.
         let s2 = Sweeper::new();
-        s2.inflight.lock().unwrap().insert("ws".to_string());
+        s2.inner.inflight.lock().unwrap().insert("ws".to_string());
         assert!(s2.run("ws", || { r2.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Ok(()) }).is_ok());
         assert_eq!(r2.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(s.run("ws", || { ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Ok(()) }).is_ok());

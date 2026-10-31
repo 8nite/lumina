@@ -1,10 +1,11 @@
 # Lumina — local-first AI coding & open-world agent harness
 
 > **Branch `rust-revamp`:** full Rust port of the Go daemon + CLI + TUI
-> (`src/`, `cargo build` → `target/debug/lumina`). The React SPA in `web/`
-> is unchanged and embedded the same way. Go sources remain for reference;
-> `make build` still builds the Go binary, `cargo build` the Rust one.
-> Both speak the same daemon API (`GET /openapi.json`) and SQLite schema.
+> (`src/`, `cargo build` → `target/debug/lumina`, or `make rust-build`).
+> The React SPA in `web/` is unchanged and embedded the same way. Go sources
+> remain for reference; `make build` still builds the Go binary, `make
+> rust-build` / `make rust-test` the Rust one. Both speak the same daemon API
+> (`GET /openapi.json`) and SQLite schema.
 
 See `plan.md` for the full architecture & implementation plan,
 and `test-plan.md` for the verification matrix (all suites PASS).

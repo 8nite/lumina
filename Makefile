@@ -3,7 +3,19 @@ PKG := github.com/8nite/lumina
 GOFLAGS := CGO_ENABLED=0
 PREFIX ?= $(HOME)/.local
 
-.PHONY: build dev test lint openapi-gen web-build clean install stop
+.PHONY: build dev test lint openapi-gen web-build clean install stop rust-build rust-test rust-release rust-lint
+
+rust-build: web/dist
+	cargo build
+
+rust-test:
+	cargo test
+
+rust-release: web/dist
+	cargo build --release
+
+rust-lint:
+	cargo clippy --tests
 
 build: web-build
 	$(GOFLAGS) go build -o bin/$(BINARY) ./cmd/lumina

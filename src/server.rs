@@ -19,7 +19,7 @@ use std::{
 };
 use tokio::sync::broadcast;
 
-use crate::{agent::Runner, approve::ApprovalGate, config::Config, llm::Router as LlmRouter, plugins::Cache as PluginCache, store::Store};
+use crate::{agent::Runner, approve::ApprovalGate, config::Config, kb::Sweeper as KbSweeper, llm::Router as LlmRouter, plugins::Cache as PluginCache, store::Store};
 
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
@@ -36,10 +36,12 @@ pub struct AppState {
     pub gate: ApprovalGate,
     pub running: Arc<Mutex<HashSet<String>>>,
     pub plugins: PluginCache,
+    pub sweeper: KbSweeper,
+    pub cfg_path: Option<PathBuf>,
 }
 
 impl AppState {
-    pub fn new(store: Store, router: LlmRouter, cfg: Config) -> Self {
+    pub fn new(store: Store, router: LlmRouter, cfg: Config, cfg_path: Option<PathBuf>) -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
             gate: ApprovalGate::new(events.clone()),
@@ -50,6 +52,8 @@ impl AppState {
             events,
             running: Arc::new(Mutex::new(HashSet::new())),
             plugins: PluginCache::new(),
+            sweeper: KbSweeper::new(),
+            cfg_path,
         }
     }
 
@@ -311,12 +315,14 @@ async fn prompt(
         Ok(text) => {
             st.running.lock().unwrap().remove(&id);
             st.emit(serde_json::json!({"type": "turn.completed", "session": id}));
+            standing_ops(&st, &id);
             Json(serde_json::json!({"session": id, "text": text})).into_response()
         }
         Err(e) => {
             st.running.lock().unwrap().remove(&id);
             let s = e.to_string();
             st.emit(serde_json::json!({"type": "turn.failed", "session": id, "error": s}));
+            standing_ops(&st, &id);
             if s.contains("not found") {
                 (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": s}))).into_response()
             } else {
@@ -324,6 +330,30 @@ async fn prompt(
             }
         }
     }
+}
+
+/// Standing-ops: debounced KB freshness pass after every turn (success or
+/// failure), mirroring session-close distillation hooks.
+fn standing_ops(st: &AppState, id: &str) {
+    if !st.cfg.kb.standing_ops {
+        return;
+    }
+    let Ok(Some(sess)) = st.store.get_session(id) else { return };
+    let mins = st.cfg.kb.idle_debounce_minutes.max(1);
+    let ws = sess.workspace_dir.clone();
+    let sid = id.to_string();
+    let tx = st.events.clone();
+    let _ = st.sweeper.run_throttled(
+        &ws,
+        std::time::Duration::from_secs(mins * 60),
+        || {
+            crate::kb::refresh_memory_manifest(std::path::Path::new(&ws))
+                .map(|_| {
+                    let _ = tx.send(serde_json::json!({"type": "kb.refreshed", "session": sid}));
+                })
+                .map_err(|e| e.to_string())
+        },
+    );
 }
 
 #[derive(Deserialize)]
@@ -358,25 +388,44 @@ async fn export(
     }
 }
 
-async fn openapi() -> impl IntoResponse {
-    Json(serde_json::json!({
+/// Single source of truth for the daemon schema (routes + CLI `openapi`).
+pub fn openapi_spec() -> serde_json::Value {
+    serde_json::json!({
         "openapi": "3.1.0",
         "info": {"title": "Lumina daemon", "version": "0.1.0"},
         "paths": {
             "/api/v1/events": "SSE: turn/context/delta/tool/completed/failed, permission.asked/resolved, question.asked/resolved, session.*, config.updated",
             "/api/v1/sessions": "list (?directory=, ?latest=1) / create",
             "/api/v1/sessions/{id}": "fetch / patch agent,permission,model,title",
+            "/api/v1/sessions/{id}/state": "resync: session + running + pending permission/question",
             "/api/v1/sessions/{id}/prompt": "submit turn",
             "/api/v1/sessions/{id}/fork": "branch at turn",
             "/api/v1/sessions/{id}/export": "transcript (?sanitize=1)",
-            "/api/v1/sessions/{id}/revert": "shadow-git undo (M2)",
-            "/api/v1/permissions/{reqId}": "allow_once/session/always|deny (M3)",
-            "/api/v1/files": "workspace tree (M2)",
-            "/api/v1/pty": "websocket shell (M2)",
-            "/api/v1/kb/query": "graphify+memory query (M2)",
-            "/api/v1/harness/evolve": "Propose-Probe-Compose (M5)"
+            "/api/v1/sessions/{id}/revert": "shadow-git undo (?turn=)",
+            "/api/v1/sessions/{id}/unrevert": "shadow-git redo",
+            "/api/v1/sessions/{id}/compact": "auto-compact session",
+            "/api/v1/permissions/{reqId}": "allow_once/session/always|deny",
+            "/api/v1/questions/{reqId}": "answer lists",
+            "/api/v1/files": "workspace tree (?path=)",
+            "/api/v1/git/diff": "working-tree stat",
+            "/api/v1/git/branch": "current branch",
+            "/api/v1/pty": "websocket shell",
+            "/api/v1/providers": "configured providers (no secrets)",
+            "/api/v1/router": "get/set fast|executor|planner|improver (persisted)",
+            "/api/v1/models": "live models (?provider=)",
+            "/api/v1/mcp/tools": "list tools (?server=)",
+            "/api/v1/auth/device/start": "copilot device flow",
+            "/api/v1/auth/device/poll": "copilot device poll",
+            "/api/v1/kb/query": "graphify+memory query",
+            "/api/v1/kb/": "browse memory/ + graphify-out/",
+            "/api/v1/harness": "8 components",
+            "/api/v1/harness/evolve": "Propose-Probe-Compose"
         }
-    }))
+    })
+}
+
+async fn openapi() -> impl IntoResponse {
+    Json(openapi_spec())
 }
 
 async fn events(
@@ -497,6 +546,12 @@ async fn router_set(State(st): State<AppState>, Json(b): Json<RouterSet>) -> imp
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "bad role"}))).into_response();
     }
     st.router.set_model(&b.role, &b.model);
+    // Model-persist: hot-swap now, survive restarts via the config file.
+    if let Some(p) = &st.cfg_path {
+        if let Err(e) = crate::config::persist_router_model(p, &b.role, &b.model) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+        }
+    }
     st.emit(serde_json::json!({"type": "config.updated", "role": b.role, "model": b.model}));
     Json(serde_json::json!({"ok": true})).into_response()
 }

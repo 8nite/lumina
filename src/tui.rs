@@ -69,6 +69,8 @@ struct App {
     running: bool,
     queued: Option<String>,
     effort: String,
+    thinking_shown: bool,
+    thinking: String,
     popup: Option<Popup>,
     perm: Option<PermModal>,
     ques: Option<QModal>,
@@ -176,7 +178,18 @@ impl App {
                 self.set_status("cleared");
             }
             "help" => self.push_msg("system", HELP.into()),
-            "thinking" | "connect" => {
+            "thinking" => match rest.first().copied() {
+                Some("show") => {
+                    self.thinking_shown = true;
+                    self.set_status("thinking shown");
+                }
+                Some("hide") => {
+                    self.thinking_shown = false;
+                    self.set_status("thinking hidden");
+                }
+                _ => self.set_status("usage: /thinking [show|hide]"),
+            },
+            "connect" => {
                 self.set_status(&format!("/{cmd} not yet ported in Rust"));
             }
             "init" => {
@@ -342,8 +355,14 @@ impl App {
         match ev {
             Event::TurnStarted { .. } => {
                 self.running = true;
+                self.thinking.clear();
             }
-            Event::TurnDelta { delta, .. } => self.append_delta(&delta),
+            Event::TurnDelta { delta, thinking, .. } => {
+                self.append_delta(&delta);
+                if !thinking.is_empty() {
+                    self.thinking.push_str(&thinking);
+                }
+            }
             Event::TurnCompleted { .. } => {
                 self.running = false;
                 if let Some(q) = self.queued.take() {
@@ -507,6 +526,8 @@ pub fn run(opts: LaunchOpts) -> Result<(), String> {
         running: false,
         queued: None,
         effort: "auto".into(),
+        thinking_shown: false,
+        thinking: String::new(),
         popup: None,
         perm: None,
         ques: None,
@@ -801,8 +822,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .block(Block::default().borders(Borders::ALL).title(if app.running { "steer: Enter queues" } else { "prompt (Enter send · / commands)" }));
     f.render_widget(composer, chunks[2]);
 
-    // Status bar.
-    let status = if !app.status.is_empty() && app.status_at.elapsed() < Duration::from_secs(8) {
+    // Status bar (thinking excerpt when /thinking show).
+    let status = if app.thinking_shown && !app.thinking.is_empty() {
+        let tail: String = app.thinking.chars().rev().take(120).collect::<String>().chars().rev().collect();
+        format!("…{tail}")
+    } else if !app.status.is_empty() && app.status_at.elapsed() < Duration::from_secs(8) {
         app.status.clone()
     } else {
         "Tab plan/build · Shift+Tab approval · /help".to_string()
@@ -945,6 +969,8 @@ mod tests {
             running: true,
             queued: None,
             effort: "auto".into(),
+            thinking_shown: false,
+            thinking: String::new(),
             popup: None,
             perm: Some(PermModal { req_id: "r".into(), tool: "bash".into(), target: "ls".into(), choice: 1 }),
             ques: None,

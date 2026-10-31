@@ -387,7 +387,11 @@ impl Runner {
         if window == 0 {
             return Ok(()); // unknown window: never auto-compact blind
         }
-        let used: usize = turns.iter().map(|t| t.text.len() + t.role.len()).sum::<usize>() / 4;
+        let msgs: Vec<llm::Message> = turns
+            .iter()
+            .map(|t| llm::Message { role: t.role.clone(), content: t.text.clone(), thinking: String::new() })
+            .collect();
+        let used = Self::estimate_tokens(&msgs, &Self::tool_specs());
         if used * 100 < window * 80 {
             return Ok(());
         }

@@ -300,7 +300,7 @@ pub fn offline_pass(workspace: &Path) -> Result<String, HarnessError> {
         rationale: "re-ground tool guidance in current rules bundle".into(),
         files,
     };
-    let results = probe(workspace, &[cand.clone()], |_, _| (true, 0.6, "offline heuristic".into()))?;
+    let results = probe(workspace, std::slice::from_ref(&cand), |_, _| (true, 0.6, "offline heuristic".into()))?;
     let map: HashMap<String, Candidate> = [(cand.id.clone(), cand)].into_iter().collect();
     let landed = compose(&loader, &results, &map, 0.5)?;
     if landed.is_empty() {
