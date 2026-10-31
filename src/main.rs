@@ -24,6 +24,7 @@ mod server;
 mod store;
 mod tools;
 mod tui;
+mod vault;
 mod websearch;
 
 use agent::Runner;
@@ -66,6 +67,9 @@ enum Cmd {
         host: String,
         #[arg(long, default_value_t = 7432)]
         port: u16,
+        /// Accepted for CLI parity (informational: loopback allowed by default).
+        #[arg(long, default_value = "*")]
+        cors: String,
     },
     Run {
         #[arg(allow_hyphen_values = true)]
@@ -81,6 +85,7 @@ enum Cmd {
         #[arg(long)]
         lan: bool,
     },
+    #[command(alias = "device")]
     Auth {
         #[arg(long)]
         provider: String,
@@ -112,6 +117,10 @@ enum Cmd {
     Openapi {
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    Vault {
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -233,7 +242,7 @@ async fn main() -> MainResult {
                 }
             }
         }
-        Some(Cmd::Serve { host, port }) => {
+        Some(Cmd::Serve { host, port, cors: _ }) => {
             if !server::is_loopback(&host) && std::env::var("LUMINA_TOKEN").unwrap_or_default().is_empty() {
                 eprintln!("refusing non-loopback bind without LUMINA_TOKEN");
                 std::process::exit(77);
@@ -326,12 +335,22 @@ async fn main() -> MainResult {
                     runner.plugins = Some(Arc::new(plugins::Host::new(files)));
                 }
             }
+            // Headless progress log (Go parity): stages on stderr, only the
+            // final answer on stdout.
             let answer = runner
-                .run_prompt(&store, &router, &cfg, &sess.id, &text, llm::normalize_effort(&effort), &images, |_, _| {})
+                .run_prompt(&store, &router, &cfg, &sess.id, &text, llm::normalize_effort(&effort), &images,
+                    |d, t| {
+                        let preview = if d.is_empty() { t } else { d };
+                        let one: String = preview.chars().take(120).collect();
+                        if !one.trim().is_empty() {
+                            eprintln!("\u{2192} {}", one.trim());
+                        }
+                    },
+                    |s| eprintln!("\u{203a} {s}"))
                 .await
                 .map_err(|e| format!("{e}"))?;
             if dflt_format == "json" {
-                println!("{}", serde_json::json!({"session": sess.id, "text": answer}));
+                println!("{}", serde_json::json!({"session_id": sess.id, "text": answer}));
             } else {
                 println!("{answer}");
             }
@@ -372,6 +391,7 @@ async fn main() -> MainResult {
             Ok(())
         }
         Some(Cmd::Plugin { args }) => cmd_plugin(&args),
+        Some(Cmd::Vault { args }) => cmd_vault(&args),
         Some(Cmd::Evolve { session: _ }) => {
             let ws = std::env::current_dir().unwrap_or_else(|_| ".".into());
             println!("{}", harness::offline_pass(&ws).map_err(|e| format!("{e}"))?);
@@ -511,11 +531,42 @@ fn cmd_session(args: &[String]) -> MainResult {
             print!("{}", store.export_markdown(id, sanitize).map_err(|e| format!("store: {e}"))?);
             Ok(())
         }
+        Some("delete") => {
+            let Some(id) = args.get(1) else { eprintln!("usage: lumina session delete <id>"); std::process::exit(64); };
+            if store.delete_session(id).map_err(|e| format!("store: {e}"))? {
+                println!("{id}");
+                Ok(())
+            } else {
+                eprintln!("session {id} not found");
+                std::process::exit(64);
+            }
+        }
         _ => {
-            eprintln!("usage: lumina session [list [--all]|show <id>|fork <id> [turn]|export <id> [--sanitize]]");
+            eprintln!("usage: lumina session [list [--all]|show <id>|fork <id> [turn]|export <id> [--sanitize]|delete <id>]");
             std::process::exit(64);
         }
     }
+}
+
+fn cmd_vault(args: &[String]) -> MainResult {
+    // `lumina vault check "<text>"`: what the LLM would receive for text —
+    // secret-shaped spans replaced with {placeholder_xxx} refs, everything
+    // else byte-identical. Throwaway in-memory vault, never the live store.
+    if args.first().map(|s| s.as_str()) != Some("check") || args.len() < 2 {
+        eprintln!("usage: lumina vault check \"<text>\"");
+        std::process::exit(64);
+    }
+    let store = store::Store::open(Some(":memory:")).map_err(|e| format!("store: {e}"))?;
+    let sess = store.create_session("", "build", "ask", "").map_err(|e| format!("store: {e}"))?;
+    let input = args[1..].join(" ");
+    let out = store.vault.substitute_for_llm(&sess.id, &input).map_err(|e| format!("vault: {e}"))?;
+    println!("user side: {input}\nllm sees:  {out}");
+    if out == input {
+        println!("verdict:   UNCHANGED — no detector matched (see vault patterns)");
+    } else {
+        println!("verdict:   VAULTED — values hidden from the model, remapped locally on return");
+    }
+    Ok(())
 }
 
 type MainResult = Result<(), Box<dyn std::error::Error>>;

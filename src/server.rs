@@ -99,7 +99,7 @@ pub fn router(state: AppState) -> Router {
         .route("/openapi.json", get(openapi))
         .route("/api/v1/events", get(events))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
-        .route("/api/v1/sessions/:id", get(get_session).patch(patch_session))
+        .route("/api/v1/sessions/:id", get(get_session).patch(patch_session).delete(delete_session))
         .route("/api/v1/sessions/:id/prompt", axum::routing::post(prompt))
         .route("/api/v1/sessions/:id/fork", axum::routing::post(fork))
         .route("/api/v1/sessions/:id/export", get(export))
@@ -217,6 +217,15 @@ async fn get_session(State(st): State<AppState>, Path(id): Path<String>) -> impl
     match store.get_session(&id) {
         Ok(Some(s)) => Json(serde_json::json!(view(&s))).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn delete_session(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let store = &st.store;
+    match store.delete_session(&id) {
+        Ok(true) => Json(serde_json::json!({"deleted": true})).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -407,16 +416,20 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, q: QueuedPrompt) ->
     let tx = st.events.clone();
     let sid = id.to_string();
     let started = std::time::Instant::now();
+    let tx2 = tx.clone();
+    let sid2 = sid.clone();
     let out = runner
         .run_prompt(&st.store, &st.router, &st.cfg, id, &q.text, &q.effort, &q.images, |d, t| {
             let _ = tx.send(serde_json::json!({"type": "turn.delta", "session": sid, "delta": d, "thinking": t}));
+        }, |stage| {
+            let _ = tx2.send(serde_json::json!({"type": "turn.progress", "session": sid2, "stage": stage}));
         })
         .await;
     match out {
         Ok(text) => {
             let ms = started.elapsed().as_millis() as u64;
             st.emit(serde_json::json!({"type": "turn.completed", "session": id,
-                "ms": ms, "chars": text.len()}));
+                "ms": ms, "chars": text.len(), "text": text}));
             emit_context(st, id);
             standing_ops(st, id);
             Ok(text)
@@ -515,7 +528,7 @@ pub fn openapi_spec() -> serde_json::Value {
             "/api/v1/sessions/{id}/unrevert": "shadow-git redo",
             "/api/v1/sessions/{id}/compact": "auto-compact session",
             "/api/v1/permissions/{reqId}": "allow_once/session/always|deny",
-            "/api/v1/questions/{reqId}": "answer lists",
+            "/api/v1/questions/{reqId}": "answer lists or {\"dismissed\": true}",
             "/api/v1/files": "workspace tree (?path=)",
             "/api/v1/git/diff": "working-tree stat",
             "/api/v1/git/branch": "current branch",
@@ -790,6 +803,8 @@ async fn answer_permission(
 struct QuestionAnswer {
     #[serde(default)]
     answers: Vec<String>,
+    #[serde(default)]
+    dismissed: bool,
 }
 
 async fn answer_question(
@@ -797,11 +812,14 @@ async fn answer_question(
     Path(req_id): Path<String>,
     Json(b): Json<QuestionAnswer>,
 ) -> impl IntoResponse {
-    if st.gate.answer(&req_id, b.answers) {
-        Json(serde_json::json!({"ok": true})).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown or expired request"}))).into_response()
+    if b.dismissed {
+        if st.gate.dismiss(&req_id) {
+            return Json(serde_json::json!({"ok": true})).into_response();
+        }
+    } else if st.gate.answer(&req_id, b.answers) {
+        return Json(serde_json::json!({"ok": true})).into_response();
     }
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown or expired request"}))).into_response()
 }
 
 #[derive(Deserialize)]

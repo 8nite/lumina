@@ -5,7 +5,7 @@ use regex::Regex;
 use rusqlite::{params, Connection};
 use std::{
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 use thiserror::Error;
 
@@ -44,6 +44,9 @@ pub struct Turn {
 
 pub struct Store {
     db: Mutex<Connection>,
+    /// Memory-only secret vault (dies with the process; transcripts keep values).
+    /// Arc-shared: subagent closures outlive the turn borrow.
+    pub vault: Arc<crate::vault::Vault>,
 }
 
 fn now() -> String {
@@ -95,7 +98,7 @@ impl Store {
             // Duplicate-column is the happy path on a migrated DB.
             let _ = db.execute_batch(ddl);
         }
-        Ok(Self { db: Mutex::new(db) })
+        Ok(Self { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()) })
     }
 
     pub fn create_session(
@@ -351,6 +354,13 @@ impl Store {
         Ok(n)
     }
 
+    /// Delete a session and its turns. Returns true iff a session row was deleted.
+    pub fn delete_session(&self, id: &str) -> Result<bool, StoreError> {
+        let db = self.db.lock().unwrap();
+        db.execute("DELETE FROM turns WHERE session_id=?", params![id])?;
+        Ok(db.execute("DELETE FROM sessions WHERE id=?", params![id])? > 0)
+    }
+
     /// Append a trace event (checkpoints, reverts, stats).
     pub fn add_trace(&self, session: &str, kind: &str, payload: &str) -> Result<(), StoreError> {
         let db = self.db.lock().unwrap();
@@ -404,7 +414,7 @@ mod tests {
              CREATE TABLE traces(id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, payload TEXT, created_at TEXT);",
         )
         .unwrap();
-        Store { db: Mutex::new(db) }
+        Store { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()) }
     }
 
     #[test]
@@ -418,6 +428,18 @@ mod tests {
         let child = s.fork(&a.id, None).unwrap();
         assert_eq!(child.parent_id, a.id);
         assert_eq!(s.turns(&child.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn delete_session_removes_turns_and_row() {
+        let s = mem();
+        let a = s.create_session("/repo", "build", "bypass", "").unwrap();
+        s.add_turn(&a.id, "user", "hello").unwrap();
+        assert!(s.delete_session(&a.id).unwrap());
+        assert!(s.get_session(&a.id).unwrap().is_none());
+        assert!(s.turns(&a.id).unwrap().is_empty());
+        assert!(!s.delete_session(&a.id).unwrap());
+        assert!(!s.delete_session("no-such-session").unwrap());
     }
 
     #[test]
@@ -476,7 +498,7 @@ mod claim_tests {
         ] {
             let _ = db.execute_batch(ddl);
         }
-        let s = Store { db: Mutex::new(db) };
+        let s = Store { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()) };
         let sess = s.create_session("/w", "build", "bypass", "").unwrap();
         assert!(s.claim_turn(&sess.id, "daemon-a", 600));
         assert!(!s.claim_turn(&sess.id, "daemon-b", 600)); // held: 409 path
