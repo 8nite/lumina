@@ -43,11 +43,14 @@ pub struct ApprovalGate {
 #[derive(Debug)]
 struct Inner {
     broker: broadcast::Sender<serde_json::Value>,
-    perms: Mutex<HashMap<String, (PendingPerm, oneshot::Sender<String>)>>,
-    questions: Mutex<HashMap<String, (PendingQuestion, oneshot::Sender<Vec<String>>)>>,
+    perms: Mutex<PermMap>,
+    questions: Mutex<QuesMap>,
     /// (session, tool, target-prefix) grants from "allow for session".
     grants: Mutex<HashSet<(String, String, String)>>,
 }
+
+type PermMap = HashMap<String, (PendingPerm, oneshot::Sender<String>)>;
+type QuesMap = HashMap<String, (PendingQuestion, oneshot::Sender<Vec<String>>)>;
 
 impl ApprovalGate {
     pub fn new(broker: broadcast::Sender<serde_json::Value>) -> Self {
@@ -183,6 +186,7 @@ fn wait_timeout<T>(mut rx: oneshot::Receiver<T>, max: Duration) -> Result<T, ()>
         (perm, ques)
     }
 }
+
 
 #[cfg(test)]
 mod tests {

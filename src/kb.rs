@@ -219,7 +219,7 @@ impl Graph {
 
     pub fn god_nodes(&self, k: usize) -> Vec<String> {
         let mut ds: Vec<(&String, usize)> = self.adj.iter().map(|(id, es)| (id, es.len())).collect();
-        ds.sort_by(|a, b| b.1.cmp(&a.1));
+        ds.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
         let k = if k == 0 || k > ds.len() { ds.len() } else { k };
         ds.into_iter().take(k).map(|(id, _)| id.clone()).collect()
     }
@@ -250,7 +250,7 @@ impl Graph {
             }
         }
         let mut ranked: Vec<(String, i32)> = scored.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.sort_by_key(|&(_, v)| std::cmp::Reverse(v));
         ranked.into_iter().take(max_tokens).map(|(k, _)| k).collect()
     }
 }
@@ -471,8 +471,19 @@ pub fn memory_write(workspace: &Path, topic: &str, content: &str) -> Result<Stri
         c.push('\n');
         std::fs::write(&idx, c)?;
     }
+    // Keep the graphify manifest fresh so kb queries never go stale.
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        let files: Vec<String> = rd
+            .flatten()
+            .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+            .map(|e| format!("memory/{}", e.file_name().to_string_lossy()))
+            .collect();
+        let _ = manifest_stamp(workspace, &dir.join("graphify-out"), &files);
+    }
     Ok(format!("wrote {}", p.display()))
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -505,6 +516,7 @@ mod tests {
     fn traversal_shapes() {
         let g = sample();
         assert_eq!(g.bfs("a", 10), vec!["a", "b", "c"]);
+        assert_eq!(g.dfs("a", 10), vec!["a", "b", "c"]);
         assert_eq!(g.shortest_path("a", "c"), Some(vec!["a".into(), "b".into(), "c".into()]));
         assert!(g.explain("a", "c").contains("broker") || g.explain("a", "c").contains('b'));
         assert_eq!(g.affected("b").len(), 2);
@@ -533,5 +545,24 @@ mod tests {
         // Traversal stays inside memory/.
         assert!(!d.path().join("..").join("escaped.md").exists());
         assert!(memory_write(d.path(), "../escaped", "x").unwrap().contains("memory"));
+    }
+}
+
+#[cfg(test)]
+mod sweeper_tests {
+    use super::*;
+
+    #[test]
+    fn singleflight_dedups() {
+        let s = Sweeper::new();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r2 = ran.clone();
+        // Second Run while the first is inflight is a no-op.
+        let s2 = Sweeper::new();
+        s2.inflight.lock().unwrap().insert("ws".to_string());
+        assert!(s2.run("ws", || { r2.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Ok(()) }).is_ok());
+        assert_eq!(r2.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(s.run("ws", || { ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Ok(()) }).is_ok());
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

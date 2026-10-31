@@ -1,5 +1,11 @@
 # Lumina — local-first AI coding & open-world agent harness
 
+> **Branch `rust-revamp`:** full Rust port of the Go daemon + CLI + TUI
+> (`src/`, `cargo build` → `target/debug/lumina`). The React SPA in `web/`
+> is unchanged and embedded the same way. Go sources remain for reference;
+> `make build` still builds the Go binary, `cargo build` the Rust one.
+> Both speak the same daemon API (`GET /openapi.json`) and SQLite schema.
+
 See `plan.md` for the full architecture & implementation plan,
 and `test-plan.md` for the verification matrix (all suites PASS).
 
@@ -279,9 +285,16 @@ context/delta/tool/completed/failed`, `permission.asked/resolved`, …).
 
 ## Layout
 
-- `cmd/lumina` — CLI: TUI, `run`, `serve`, `web`, `attach`, `session`, `plugin`, `kb`, `evolve`
-- `internal/*` — daemon packages (config, server, security, rules, plugins, llm, agent, tools, mcp, kb, harness, tui)
-- `pkg/sdk` — typed Go client for the daemon HTTP + SSE API
-- `web/` — React + Vite + Tailwind workspace SPA (embedded via `//go:embed`)
+- `cmd/lumina` — Go CLI: TUI, `run`, `serve`, `web`, `attach`, `session`, `plugin`, `kb`, `evolve`
+- `internal/*` — Go daemon packages (config, server, security, rules, plugins, llm, agent, tools, mcp, kb, harness, tui)
+- `pkg/sdk` — Go typed client for the daemon HTTP + SSE API
+- `src/` — **Rust port** (branch `rust-revamp`): `main.rs` (CLI), `server.rs`
+  (axum daemon), `security.rs` (fence), `config.rs`, `rules.rs`, `llm.rs`
+  (streaming + router), `agent.rs` (turn loop, subagents, compaction),
+  `tools.rs` (+`patch`, `todowrite`), `mcp.rs`, `plugins.rs` (Node bridge),
+  `kb.rs` (graphify RAG), `harness.rs` (Harness²), `checkpoints.rs`
+  (shadow-git), `store.rs` (rusqlite), `approve.rs` (permission broker),
+  `sdk.rs`, `tui.rs` (ratatui), `pty.rs`, `copilot.rs`, `websearch.rs`
+- `web/` — React + Vite + Tailwind workspace SPA (embedded via `//go:embed` / `rust-embed`)
 - `memory/` — durable Markdown memory + `memory/graphify-out/`
 - `docs/` — screenshots and test evidence

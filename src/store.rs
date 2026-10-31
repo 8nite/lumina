@@ -339,6 +339,51 @@ pub fn sanitize_export(text: &str) -> String {
     out
 }
 
+
+impl Store {
+    /// Delete turns by id (compaction).
+    pub fn delete_turns(&self, session: &str, ids: &[String]) -> Result<usize, StoreError> {
+        let db = self.db.lock().unwrap();
+        let mut n = 0;
+        for id in ids {
+            n += db.execute("DELETE FROM turns WHERE session_id=? AND id=?", params![session, id])?;
+        }
+        Ok(n)
+    }
+
+    /// Append a trace event (checkpoints, reverts, stats).
+    pub fn add_trace(&self, session: &str, kind: &str, payload: &str) -> Result<(), StoreError> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO traces(id,session_id,kind,payload,created_at) VALUES(?,?,?,?,?)",
+            params![uuid::Uuid::new_v4().to_string(), session, kind, payload, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Latest trace payload of a kind for a session.
+    pub fn latest_trace(&self, session: &str, kind: &str) -> Result<Option<String>, StoreError> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare(
+            "SELECT payload FROM traces WHERE session_id=? AND kind=? ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = st.query(params![session, kind])?;
+        Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
+    }
+}
+
+impl Store {
+    /// Checkpoint payloads in creation order (oldest first).
+    pub fn traces(&self, session: &str, kind: &str) -> Result<Vec<String>, StoreError> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare(
+            "SELECT payload FROM traces WHERE session_id=? AND kind=? ORDER BY created_at",
+        )?;
+        let rows = st.query_map(params![session, kind], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

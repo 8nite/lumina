@@ -113,6 +113,51 @@ pub struct Eval {
     pub target: String, // path, command, or URL
     pub workspace: PathBuf,
     pub destructive: bool, // rm -rf, push --force, reset --hard, etc.
+    /// Glob/command rules from `[permissions.bash]` (first match wins, `*` last).
+    pub bash_rules: std::collections::HashMap<String, String>,
+    /// Writes to skills//instructions docs need explicit opt-in (default false).
+    pub allow_tooling_write: bool,
+}
+
+/// Glob-prefix bash rules: `"go test *" = "allow"`, `"*" = "ask"`.
+pub fn match_bash_rules(rules: &std::collections::HashMap<String, String>, cmd: &str) -> Option<Decision> {
+    for (pattern, verdict) in rules {
+        if pattern == "*" {
+            continue;
+        }
+        let prefix = pattern.trim_end_matches('*');
+        if cmd.starts_with(prefix) {
+            return Some(match verdict.to_lowercase().as_str() {
+                "allow" => Decision::Allow,
+                "deny" => Decision::Deny,
+                _ => Decision::Ask,
+            });
+        }
+    }
+    rules.get("*").map(|v| match v.to_lowercase().as_str() {
+        "allow" => Decision::Allow,
+        "deny" => Decision::Deny,
+        _ => Decision::Ask,
+    })
+}
+
+pub fn is_tooling_doc(target: &str) -> bool {
+    let t = target.to_lowercase().replace('\\', "/");
+    t.contains("skills/") || t.ends_with("agents.md") || t.contains("instructions/")
+}
+
+/// Read-only shell allowlist for plan mode (inspection only, never mutating).
+fn is_readonly_bash(cmd: &str) -> bool {
+    let c = cmd.trim_start();
+    for p in [
+        "git status", "git diff", "git log", "git show", "git branch", "ls", "pwd", "echo ", "cat ",
+        "head ", "tail ", "wc ",
+    ] {
+        if c.starts_with(p) || c == p.trim_end() {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn decide(e: &Eval) -> Decision {
@@ -142,9 +187,22 @@ pub fn decide(e: &Eval) -> Decision {
             };
         }
         if is_bash {
-            return Decision::Deny; // M0: plan bash denied; read-only inspection allowlist lands in M1 tools.
+            // Plan research may run read-only inspection, never mutations.
+            return if !e.destructive && is_readonly_bash(&e.target) {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            };
         }
-        return Decision::Allow;
+        // Delegation could bypass the read-only fence (a build child edits
+        // while the parent stays in plan), so plan denies it.
+        if tool == "subagent" || tool == "mcp" {
+            return Decision::Deny;
+        }
+        if is_read || tool == "patch" {
+            return Decision::Allow;
+        }
+        return Decision::Deny;
     }
 
     // Build envelope governed by permission mode.
@@ -152,12 +210,19 @@ pub fn decide(e: &Eval) -> Decision {
         return Decision::Allow;
     }
     if is_edit {
+        // Writes to shared tooling docs need an explicit opt-in.
+        if !e.allow_tooling_write && is_tooling_doc(&e.target) {
+            return Decision::Deny;
+        }
         return match e.mode {
             PermissionMode::Ask => Decision::Ask,
             _ => Decision::Allow,
         };
     }
     if is_bash {
+        if let Some(d) = match_bash_rules(&e.bash_rules, &e.target) {
+            return d;
+        }
         if e.destructive {
             return match e.mode {
                 PermissionMode::Bypass => Decision::Allow,
@@ -169,9 +234,14 @@ pub fn decide(e: &Eval) -> Decision {
             PermissionMode::AutoApprove | PermissionMode::Bypass => Decision::Allow,
         };
     }
-    // Unknown tools default to prompt (fail closed).
-    Decision::Ask
+    // MCP / subagents / external tools: ask unless bypass (fail closed).
+    match e.mode {
+        PermissionMode::Bypass => Decision::Allow,
+        _ => Decision::Ask,
+    }
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -190,6 +260,8 @@ mod tests {
             target: "src/main.go".into(),
             workspace: ws(),
             destructive: false,
+            bash_rules: Default::default(),
+            allow_tooling_write: false,
         };
         assert_eq!(decide(&e), Decision::Deny);
     }
@@ -204,6 +276,8 @@ mod tests {
                 target: t.into(),
                 workspace: ws(),
                 destructive: false,
+                bash_rules: Default::default(),
+                allow_tooling_write: false,
             };
             assert_eq!(decide(&e), Decision::Allow, "{t}");
         }
@@ -218,6 +292,8 @@ mod tests {
             target: "/tmp/other/plan.md".into(),
             workspace: ws(),
             destructive: false,
+            bash_rules: Default::default(),
+            allow_tooling_write: false,
         };
         assert_eq!(decide(&e), Decision::Deny);
     }
@@ -232,8 +308,81 @@ mod tests {
                 target: t.into(),
                 workspace: ws(),
                 destructive: false,
+                bash_rules: Default::default(),
+                allow_tooling_write: false,
             };
             assert_eq!(decide(&e), Decision::Deny, "{t}");
         }
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    fn ws() -> PathBuf {
+        PathBuf::from("/repo")
+    }
+
+    #[test]
+    fn bash_rules_precedence() {
+        use std::collections::HashMap;
+        let rules: HashMap<String, String> =
+            [("git status*".into(), "allow".into()), ("*".into(), "ask".into())].into_iter().collect();
+        assert_eq!(match_bash_rules(&rules, "git status --porcelain"), Some(Decision::Allow));
+        assert_eq!(match_bash_rules(&rules, "rm -rf /"), Some(Decision::Ask));
+        assert_eq!(match_bash_rules(&HashMap::new(), "ls"), None);
+    }
+
+    #[test]
+    fn tooling_doc_writes_denied_without_opt_in() {
+        let e = Eval {
+            agent: Agent::Build,
+            mode: PermissionMode::Bypass,
+            tool: "edit".into(),
+            target: "skills/foo/SKILL.md".into(),
+            workspace: ws(),
+            destructive: false,
+            bash_rules: Default::default(),
+            allow_tooling_write: false,
+        };
+        assert_eq!(decide(&e), Decision::Deny);
+    }
+
+    #[test]
+    fn plan_allows_readonly_bash() {
+        let e = Eval {
+            agent: Agent::Plan,
+            mode: PermissionMode::Bypass,
+            tool: "bash".into(),
+            target: "git status --porcelain".into(),
+            workspace: ws(),
+            destructive: false,
+            bash_rules: Default::default(),
+            allow_tooling_write: false,
+        };
+        assert_eq!(decide(&e), Decision::Allow);
+        let e2 = Eval { target: "rm -rf /tmp/x".into(), ..e.clone() };
+        assert_eq!(decide(&e2), Decision::Deny);
+    }
+
+    #[test]
+    fn mcp_asks_unless_bypass() {
+        let mk = |mode| Eval {
+            agent: Agent::Build,
+            mode,
+            tool: "mcp".into(),
+            target: "local:tool".into(),
+            workspace: ws(),
+            destructive: false,
+            bash_rules: Default::default(),
+            allow_tooling_write: false,
+        };
+        assert_eq!(decide(&mk(PermissionMode::Ask)), Decision::Ask);
+        assert_eq!(decide(&mk(PermissionMode::Bypass)), Decision::Allow);
+        let mut p = mk(PermissionMode::Bypass);
+        p.agent = Agent::Plan;
+        p.tool = "subagent".into();
+        assert_eq!(decide(&p), Decision::Deny);
     }
 }

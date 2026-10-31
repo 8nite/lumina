@@ -74,7 +74,7 @@ async fn serve_shell(mut socket: WebSocket) {
             Ok(Err(e)) => format!("pty: {e}"),
             Err(e) => format!("pty: task failed: {e}"),
         };
-        if socket.send(Message::Text(text.into())).await.is_err() {
+        if socket.send(Message::Text(text)).await.is_err() {
             break;
         }
     }

@@ -43,8 +43,11 @@ struct QModal {
     qi: usize,
     oi: usize,
 }
+#[derive(serde::Deserialize)]
 struct Q {
+    #[serde(default)]
     text: String,
+    #[serde(default)]
     options: Vec<String>,
 }
 
@@ -173,9 +176,31 @@ impl App {
                 self.set_status("cleared");
             }
             "help" => self.push_msg("system", HELP.into()),
-            "compact" | "thinking" | "undo" | "redo" | "init" | "connect" => {
-                self.set_status(&format!("/{cmd} not yet ported in Rust (lands with M6)"));
+            "thinking" | "connect" => {
+                self.set_status(&format!("/{cmd} not yet ported in Rust"));
             }
+            "init" => {
+                let p = std::path::Path::new(&self.workspace).join("AGENTS.md");
+                if p.exists() {
+                    self.set_status("AGENTS.md already exists");
+                } else if std::fs::write(&p, "# AGENTS.md — workspace rules (see Lumina memory protocol)\n\n- Durable notes live in ./memory/*.md (YAML frontmatter + [[wikilinks]]).\n- Query memory with kb_query before grepping code.\n").is_ok() {
+                    self.set_status("created AGENTS.md");
+                } else {
+                    self.set_status("init: could not write AGENTS.md");
+                }
+            }
+            "compact" => match self.sdk.compact(&self.session.id) {
+                Ok(r) => self.push_msg("system", format!("compact: {r}")),
+                Err(e) => self.set_status(&format!("compact: {e}")),
+            },
+            "undo" => match self.sdk.revert(&self.session.id, rest.first().copied()) {
+                Ok(c) => self.set_status(&format!("undone @ {c}")),
+                Err(e) => self.set_status(&format!("undo: {e}")),
+            },
+            "redo" => match self.sdk.unrevert(&self.session.id) {
+                Ok(c) => self.set_status(&format!("redone @ {c}")),
+                Err(e) => self.set_status(&format!("redo: {e}")),
+            },
             "evolve" => match self.sdk.evolve() {
                 Ok(r) => self.push_msg("system", format!("evolve: {r}")),
                 Err(e) => self.set_status(&format!("evolve: {e}")),
@@ -280,6 +305,37 @@ impl App {
             }
         }
         flush(&mut role, &mut buf, &mut self.messages);
+    }
+
+    /// Resync after (re)connect: running flag + pending permission/question
+    /// modals, so a reloaded client never sticks at `working…` with no way
+    /// to answer.
+    fn resync(&mut self) {
+        let Ok(v) = self.sdk.state(&self.session.id) else { return };
+        self.running = v.get("running").and_then(|r| r.as_bool()).unwrap_or(false);
+        if let Some(p) = v.get("permission") {
+            if !p.is_null() {
+                self.perm = Some(PermModal {
+                    req_id: p.get("req_id").and_then(|r| r.as_str()).unwrap_or("").into(),
+                    tool: p.get("tool").and_then(|r| r.as_str()).unwrap_or("").into(),
+                    target: p.get("target").and_then(|t| t.as_str()).unwrap_or("").into(),
+                    choice: 0,
+                });
+            }
+        }
+        if let Some(q) = v.get("question") {
+            if !q.is_null() {
+                self.ques = Some(QModal {
+                    req_id: q.get("req_id").and_then(|r| r.as_str()).unwrap_or("").into(),
+                    questions: q
+                        .get("questions")
+                        .and_then(|x| serde_json::from_value(x.clone()).ok())
+                        .unwrap_or_default(),
+                    qi: 0,
+                    oi: 0,
+                });
+            }
+        }
     }
 
     fn on_event(&mut self, ev: Event) {
@@ -458,6 +514,8 @@ pub fn run(opts: LaunchOpts) -> Result<(), String> {
         status_at: Instant::now(),
     };
     app.load_transcript();
+    // Resync: pick up in-flight turns and pending modals missed while away.
+    app.resync();
 
     crossterm::terminal::enable_raw_mode().map_err(|e| e.to_string())?;
     let mut stdout = std::io::stdout();
@@ -649,11 +707,10 @@ fn popup_nav(app: &mut App, up: bool) {
                 *pi = if up { (*pi + providers.len() - 1) % providers.len() } else { (*pi + 1) % providers.len() };
             }
         }
-        Some(Popup::Sessions { list, idx }) => {
-            if !list.is_empty() {
-                *idx = if up { (*idx + list.len() - 1) % list.len() } else { (*idx + 1) % list.len() };
-            }
+        Some(Popup::Sessions { list, idx }) if !list.is_empty() => {
+            *idx = if up { (*idx + list.len() - 1) % list.len() } else { (*idx + 1) % list.len() };
         }
+        Some(Popup::Sessions { .. }) => {}
         None => {}
     }
 }
@@ -725,7 +782,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             "assistant" => Color::White,
             _ => Color::DarkGray,
         };
-        lines.push(Line::from(Span::styled(format!("{role}"), Style::default().fg(color).add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(role.to_owned(), Style::default().fg(color).add_modifier(Modifier::BOLD))));
         for w in wrap(text, width.max(10)) {
             lines.push(Line::from(w));
         }
@@ -861,6 +918,7 @@ fn centered(area: Rect, w_pct: u16, h: u16) -> Rect {
     let y = area.y + area.height.saturating_sub(h) / 2;
     Rect { x, y, width: w.min(area.width), height: h.min(area.height) }
 }
+
 
 #[cfg(test)]
 mod tests {

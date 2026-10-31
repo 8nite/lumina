@@ -8,11 +8,14 @@
 
 mod agent;
 mod approve;
+mod checkpoints;
 mod config;
 mod copilot;
 mod harness;
 mod kb;
 mod llm;
+mod mcp;
+mod plugins;
 mod pty;
 mod rules;
 mod sdk;
@@ -25,7 +28,7 @@ mod websearch;
 
 use agent::Runner;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 #[derive(Parser)]
 #[command(name = "lumina", version, about = "Local-first AI coding harness (Rust port)")]
@@ -67,6 +70,9 @@ enum Cmd {
     Run {
         #[arg(allow_hyphen_values = true)]
         prompt: Vec<String>,
+        /// Attach image files (repeatable, 8MB cap each; vision-capable models only).
+        #[arg(long = "attach")]
+        attach: Vec<PathBuf>,
         #[arg(last = true)]
         rest: Vec<String>,
     },
@@ -232,21 +238,52 @@ async fn main() -> MainResult {
                 eprintln!("refusing non-loopback bind without LUMINA_TOKEN");
                 std::process::exit(77);
             }
+            // Startup sweep: drop stale per-session TMPDIRs from dead daemons.
+            if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
+                for e in rd.flatten() {
+                    if e.file_name().to_string_lossy().starts_with("lumina-ses-") {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+            }
             let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
             let router = llm::Router::new(&cfg).map_err(|e| format!("router: {e}"))?;
             let app = server::router(server::AppState::new(store, router, cfg.clone()));
             let addr = format!("{host}:{port}");
-            tracing::info!(%addr, agent = %cfg.defaults.agent, "lumina serve (rust M1)");
+            tracing::info!(%addr, agent = %cfg.defaults.agent, "lumina serve (rust)");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
-            axum::serve(listener, app).await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await?;
             Ok(())
         }
-        Some(Cmd::Run { mut prompt, rest }) => {
+        Some(Cmd::Run { mut prompt, attach, rest }) => {
             prompt.extend(rest);
             let text = prompt.join(" ");
             if text.trim().is_empty() {
                 eprintln!("usage: lumina run \"<prompt>\"");
                 std::process::exit(64);
+            }
+            let mut images = Vec::new();
+            for p in &attach {
+                let raw = std::fs::read(p).map_err(|e| format!("attach {}: {e}", p.display()))?;
+                if raw.len() > 8 * 1024 * 1024 {
+                    eprintln!("attach {}: over 8MB cap", p.display());
+                    std::process::exit(64);
+                }
+                let mt = match p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    _ => "image/png",
+                };
+                images.push(llm::ImageAttachment {
+                    name: p.display().to_string(),
+                    media_type: mt.into(),
+                    data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &raw),
+                });
             }
             let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
             let router = llm::Router::new(&cfg).map_err(|e| format!("router: {e}"))?;
@@ -267,9 +304,15 @@ async fn main() -> MainResult {
                 eprintln!("unknown --effort {effort:?} (auto|low|medium|high|xhigh|max)");
                 std::process::exit(64);
             }
-            let runner = Runner::new();
+            let mut runner = Runner::new();
+            {
+                let files = plugins::discover(std::path::Path::new(&sess.workspace_dir), false);
+                if !files.is_empty() {
+                    runner.plugins = Some(Arc::new(plugins::Host::new(files)));
+                }
+            }
             let answer = runner
-                .run_prompt(&store, &router, &cfg, &sess.id, &text, &llm::normalize_effort(&effort), |_, _| {})
+                .run_prompt(&store, &router, &cfg, &sess.id, &text, llm::normalize_effort(&effort), &images, |_, _| {})
                 .await
                 .map_err(|e| format!("{e}"))?;
             if dflt_format == "json" {
@@ -283,17 +326,23 @@ async fn main() -> MainResult {
         Some(Cmd::Kb { args }) => cmd_kb(&args),
         Some(Cmd::Models { provider }) => {
             let router = llm::Router::new(&cfg).map_err(|e| format!("router: {e}"))?;
-            let names: Vec<String> = match provider {
-                Some(p) => router.providers.keys().filter(|k| *k == &p).cloned().collect(),
-                None => router.providers.keys().cloned().collect(),
-            };
-            if names.is_empty() {
-                eprintln!("unknown provider");
-                std::process::exit(64);
-            }
-            // M1: list configured provider keys (live /models enumeration lands with TUI pickers in M3).
-            for n in names {
-                println!("{n}");
+            match provider {
+                Some(p) => {
+                    for m in router.list_models(&p).await.map_err(|e| format!("{e}"))? {
+                        if m.context_window > 0 {
+                            println!("{}  (ctx {})", m.id, m.context_window);
+                        } else {
+                            println!("{}", m.id);
+                        }
+                    }
+                }
+                None => {
+                    let mut names: Vec<&String> = router.providers.keys().collect();
+                    names.sort();
+                    for n in names {
+                        println!("{n}");
+                    }
+                }
             }
             Ok(())
         }
@@ -308,14 +357,60 @@ async fn main() -> MainResult {
             }
             Ok(())
         }
+        Some(Cmd::Plugin { args }) => cmd_plugin(&args),
         Some(Cmd::Evolve { session: _ }) => {
             let ws = std::env::current_dir().unwrap_or_else(|_| ".".into());
             println!("{}", harness::offline_pass(&ws).map_err(|e| format!("{e}"))?);
             Ok(())
         }
-        Some(_) => {
-            eprintln!("not yet ported in Rust M1 (see plan.md milestones); Go binary still owns this subcommand");
-            std::process::exit(66);
+    }
+}
+
+fn cmd_plugin(args: &[String]) -> MainResult {
+    let ws = cwd();
+    let wpath = PathBuf::from(&ws);
+    let files = plugins::discover(&wpath, false);
+    match args.first().map(|s| s.as_str()) {
+        Some("list") | None => {
+            if files.is_empty() {
+                println!("(no plugins configured)");
+            }
+            for f in &files {
+                println!("{}", f.display());
+            }
+            Ok(())
+        }
+        Some("doctor") => {
+            let node = std::process::Command::new("node").arg("--version").output();
+            match node {
+                Ok(o) if o.status.success() => {
+                    println!("node {}", String::from_utf8_lossy(&o.stdout).trim());
+                }
+                _ => {
+                    println!("node v22 NOT found (plugin worker disabled)");
+                    return Ok(());
+                }
+            }
+            if files.is_empty() {
+                println!("no plugin files discovered");
+                return Ok(());
+            }
+            let host = plugins::Host::new(files);
+            let t = std::time::Instant::now();
+            match host.dispatch("config", &serde_json::json!({}), std::time::Duration::from_secs(15)) {
+                Some(_) => {
+                    println!("worker ok ({:?})", t.elapsed());
+                    for p in host.loaded() {
+                        println!("  {p}");
+                    }
+                }
+                None => println!("worker FAILED to answer config hook"),
+            }
+            Ok(())
+        }
+        _ => {
+            eprintln!("usage: lumina plugin [list|doctor]");
+            std::process::exit(64);
         }
     }
 }
@@ -425,11 +520,14 @@ async fn ensure_daemon(base: &str, cfg: &config::Config) -> MainResult {
     }
     let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
     let router = llm::Router::new(cfg).map_err(|e| format!("router: {e}"))?;
-    let compat = (cfg.compat.import_global_rules, cfg.compat.import_global_skills);
     let app = server::router(server::AppState::new(store, router, cfg.clone()));
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
     for _ in 0..50 {
         if tokio::net::TcpStream::connect((host.as_str(), port)).await.is_ok() {

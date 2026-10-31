@@ -19,3 +19,4 @@ tags: [index, memory, lumina]
 - [[vault-placeholders]] — session vault + `{placeholder_xxx}` remap, detector families, layer-0 guidance, widened credential hard-deny.
 - [[resync-variants]] — session state resync endpoint + TUI rebuild, effort variant picker, identical-round loop guard.
 - [[loops-and-claims]] — per-call repeat ledger (3rd identical call) + cross-daemon turn claim (`inflight_owner`, 12 min stale takeover, 409).
+- [[rust-port]] — single-binary Rust port (M0/M1/M2): axum server + broker/hard-deny, BYO-LLM router, tool registry, native `graph.json` KB (`kb/query|update|reflect|status`), compat flags.

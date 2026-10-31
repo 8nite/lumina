@@ -3,8 +3,9 @@
 //! export, fork over rusqlite; events broker + PTY land in M2/M3).
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Json, Sse},
     routing::get,
     Router,
@@ -18,7 +19,7 @@ use std::{
 };
 use tokio::sync::broadcast;
 
-use crate::{agent::Runner, approve::ApprovalGate, config::Config, llm::Router as LlmRouter, store::Store};
+use crate::{agent::Runner, approve::ApprovalGate, config::Config, llm::Router as LlmRouter, plugins::Cache as PluginCache, store::Store};
 
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
@@ -34,6 +35,7 @@ pub struct AppState {
     pub events: broadcast::Sender<serde_json::Value>,
     pub gate: ApprovalGate,
     pub running: Arc<Mutex<HashSet<String>>>,
+    pub plugins: PluginCache,
 }
 
 impl AppState {
@@ -47,6 +49,7 @@ impl AppState {
             cfg,
             events,
             running: Arc::new(Mutex::new(HashSet::new())),
+            plugins: PluginCache::new(),
         }
     }
 
@@ -70,6 +73,21 @@ pub fn is_loopback(host: &str) -> bool {
     host == "127.0.0.1" || host == "::1" || host == "localhost"
 }
 
+/// Non-loopback binds require LUMINA_TOKEN (checked per request; loopback is
+/// trusted like the Go daemon).
+async fn require_token(
+    State(token): State<String>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    if is_loopback(&addr.ip().to_string()) || bearer_ok(req.headers(), &token) {
+        next.run(req).await.into_response()
+    } else {
+        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "LUMINA_TOKEN required"}))).into_response()
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/openapi.json", get(openapi))
@@ -79,8 +97,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/sessions/:id/prompt", axum::routing::post(prompt))
         .route("/api/v1/sessions/:id/fork", axum::routing::post(fork))
         .route("/api/v1/sessions/:id/export", get(export))
-        .route("/api/v1/sessions/:id/revert", axum::routing::post(todo))
-        .route("/api/v1/sessions/:id/unrevert", axum::routing::post(todo))
+        .route("/api/v1/sessions/:id/revert", axum::routing::post(revert))
+        .route("/api/v1/sessions/:id/unrevert", axum::routing::post(unrevert))
+        .route("/api/v1/sessions/:id/compact", axum::routing::post(compact))
         .route("/api/v1/sessions/:id/state", get(session_state))
         .route("/api/v1/permissions/:id", axum::routing::post(answer_permission))
         .route("/api/v1/questions/:id", axum::routing::post(answer_question))
@@ -95,10 +114,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/device/poll", get(auth_device_poll))
         .route("/api/v1/kb/query", axum::routing::post(kb_query))
         .route("/api/v1/kb/", get(kb_browse))
+        .route("/api/v1/mcp/tools", get(mcp_tools))
         .route("/api/v1/harness", get(harness_info))
         .route("/api/v1/harness/evolve", axum::routing::post(harness_evolve))
         .fallback(spa_fallback)
-        .with_state(state)
+        .with_state(state.clone())
+        .route_layer(middleware::from_fn_with_state(
+            state.auth_token.clone(),
+            require_token,
+        ))
 }
 
 #[derive(Deserialize)]
@@ -204,11 +228,8 @@ async fn patch_session(
 ) -> impl IntoResponse {
     // ponytail: validate enums at the boundary, not in the store.
     if let Some(a) = &b.agent {
-        if !["plan", "build"].contains(&a.as_str()) && !a.starts_with("custom:") && a != &"custom" {
-            // Custom primary agents (agents/*.md) arrive in M2; accept `plan|build` now.
-            if !["plan", "build"].contains(&a.as_str()) {
-                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "agent must be plan|build"}))).into_response();
-            }
+        if !["plan", "build"].contains(&a.as_str()) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "agent must be plan|build"}))).into_response();
         }
     }
     if let Some(m) = &b.permission_mode {
@@ -230,6 +251,19 @@ struct PromptBody {
     text: String,
     #[serde(default)]
     effort: String,
+    /// Attached images (8MB cap each, vision-capable models only).
+    #[serde(default)]
+    images: Vec<ImageIn>,
+}
+
+#[derive(Deserialize)]
+struct ImageIn {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    media_type: String,
+    #[serde(default)]
+    data: String,
 }
 
 async fn prompt(
@@ -241,16 +275,35 @@ async fn prompt(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "empty prompt"}))).into_response();
     }
     let effort = crate::llm::normalize_effort(&b.effort).to_string();
+    let _ = st.store.touch(&id);
     let mut runner = Runner::new();
     runner.approval = Some(st.gate.clone());
+    // Workspace plugin worker (started on demand, cached per workspace).
+    if let Ok(Some(sess)) = st.store.get_session(&id) {
+        let host = st.plugins.host_for(std::path::Path::new(&sess.workspace_dir));
+        if !host.is_empty() {
+            runner.plugins = Some(host);
+        }
+    }
     st.running.lock().unwrap().insert(id.clone());
     // Store/Router are internally synchronized; no outer lock is held across
     // the turn loop. Deltas stream to SSE subscribers via the event broker.
     st.emit(serde_json::json!({"type": "turn.started", "session": id}));
     let tx = st.events.clone();
     let sid = id.clone();
+    let mut images = Vec::new();
+    for im in &b.images {
+        if im.data.len() > 8 * 1024 * 1024 {
+            return (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({"error": "image over 8MB cap"}))).into_response();
+        }
+        images.push(crate::llm::ImageAttachment {
+            name: im.name.clone(),
+            media_type: im.media_type.clone(),
+            data: im.data.clone(),
+        });
+    }
     let out = runner
-        .run_prompt(&st.store, &st.router, &st.cfg, &id, &b.text, &effort, |d, t| {
+        .run_prompt(&st.store, &st.router, &st.cfg, &id, &b.text, &effort, &images, |d, t| {
             let _ = tx.send(serde_json::json!({"type": "turn.delta", "session": sid, "delta": d, "thinking": t}));
         })
         .await;
@@ -467,7 +520,10 @@ async fn models(State(st): State<AppState>, Query(q): Query<ModelsQ>) -> impl In
     let Some(def) = r.providers.get(&q.provider).cloned() else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
     };
-    match crate::llm::list_models(&def).await {
+    if crate::config::is_google_url(&def.base_url) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Google endpoints blocked"}))).into_response();
+    }
+    match st.router.list_models(&q.provider).await {
         Ok(models) => Json(serde_json::json!({"provider": q.provider, "models": models})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
@@ -659,8 +715,122 @@ async fn harness_evolve(State(st): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn todo() -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({"error": "not yet ported (see plan.md milestones)"})))
+#[derive(Deserialize)]
+struct RevertBody {
+    #[serde(default)]
+    turn: Option<String>,
+}
+
+fn workspace_of(st: &AppState, id: &str) -> Result<String, String> {
+    st.store
+        .get_session(id)
+        .map_err(|e| e.to_string())?
+        .map(|s| s.workspace_dir)
+        .ok_or_else(|| "session not found".to_string())
+}
+
+/// Shadow-Git /undo: restore tracked files from the turn checkpoint.
+async fn revert(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<RevertBody>>,
+) -> impl IntoResponse {
+    let ws = match workspace_of(&st, &id) {
+        Ok(w) => w,
+        Err(e) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response(),
+    };
+    let ws = PathBuf::from(ws);
+    // Exact turn match, else the latest checkpoint.
+    let checkpoint = match body.and_then(|b| b.0.turn) {
+        Some(t) => find_checkpoint(&st, &id, &t).or_else(|| latest_checkpoint(&st, &id)),
+        None => latest_checkpoint(&st, &id),
+    };
+    let Some((turn, commit)) = checkpoint else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "no checkpoint for this session yet (mutating turns create them)"}))).into_response();
+    };
+    // Remember where we were so /redo can come back.
+    let head = std::process::Command::new("git").arg("-C").arg(&ws).arg("rev-parse").arg("HEAD").output();
+    if let Ok(o) = head {
+        if o.status.success() {
+            let _ = st.store.add_trace(&id, "revert_from", &serde_json::json!({"commit": String::from_utf8_lossy(&o.stdout).trim()}).to_string());
+        }
+    }
+    match crate::checkpoints::restore(&ws, &commit) {
+        Ok(_) => {
+            st.emit(serde_json::json!({"type": "session.reverted", "session": id, "turn": turn}));
+            Json(serde_json::json!({"session": id, "turn": turn, "commit": commit})).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+fn parse_checkpoint(payload: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    Some((v.get("turn")?.as_str()?.to_string(), v.get("commit")?.as_str()?.to_string()))
+}
+
+fn latest_checkpoint(st: &AppState, id: &str) -> Option<(String, String)> {
+    let all = st.store.traces(id, "checkpoint").ok()?;
+    all.into_iter().filter_map(|p| parse_checkpoint(&p)).next_back()
+}
+
+fn find_checkpoint(st: &AppState, id: &str, turn: &str) -> Option<(String, String)> {
+    let all = st.store.traces(id, "checkpoint").ok()?;
+    all.into_iter().filter_map(|p| parse_checkpoint(&p)).find(|(t, _)| t == turn)
+}
+
+/// Shadow-Git /redo: return to the pre-undo HEAD.
+async fn unrevert(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let ws = match workspace_of(&st, &id) {
+        Ok(w) => w,
+        Err(e) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response(),
+    };
+    let Some(payload) = st.store.latest_trace(&id, "revert_from").ok().flatten() else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "nothing to redo"}))).into_response();
+    };
+    let commit = serde_json::from_str::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|v| v.get("commit").and_then(|c| c.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default();
+    if commit.is_empty() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "nothing to redo"}))).into_response();
+    }
+    match crate::checkpoints::restore(&PathBuf::from(ws), &commit) {
+        Ok(_) => {
+            st.emit(serde_json::json!({"type": "session.unreverted", "session": id}));
+            Json(serde_json::json!({"session": id, "commit": commit})).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn compact(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    match Runner::compact_session(&st.store, &st.router, &st.cfg, &id).await {
+        Ok(msg) => {
+            st.emit(serde_json::json!({"type": "session.compacted", "session": id, "result": msg}));
+            Json(serde_json::json!({"session": id, "result": msg})).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// List tools from a configured MCP server (powers TUI/Web tool pickers).
+async fn mcp_tools(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let Some(server) = q.get("server") else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "server required"}))).into_response();
+    };
+    let ws = q.get("directory").map(PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+    let cfg = crate::mcp::ConfigFile::load(&ws);
+    let Some(conf) = cfg.servers.get(server) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown MCP server"}))).into_response();
+    };
+    if crate::config::is_google_url(&conf.url) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Google endpoints blocked"}))).into_response();
+    };
+    match crate::mcp::Client::dial(conf.clone()).and_then(|mut c| c.list_tools().map_err(|e| crate::mcp::McpError::Msg(e.to_string()))) {
+        Ok(tools) => Json(serde_json::json!({"server": server, "tools": tools})).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
 }
 
 async fn spa_fallback(uri: axum::http::Uri) -> impl IntoResponse {

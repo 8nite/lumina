@@ -1,15 +1,15 @@
 //! Agentic turn loop: prompt → stream → tool calls → repeat.
-//! Mirrors `internal/agent` `RunPrompt` (M1: core loop, no subagents/shadow-git;
-/// those stay behind their own milestones).
-
+//! Mirrors `internal/agent`: sessions, subagents, compaction, checkpoints.
 use crate::{
     approve::ApprovalGate,
-    llm::{self, Chunk, Request, Router, ToolSpec},
+    llm::{self, Chunk, ImageAttachment, Request, Router, ToolSpec},
+    plugins::Host,
     rules::Bundle,
     security::{Agent, PermissionMode},
     store::Store,
     tools::{Registry, SecCtx},
 };
+use std::sync::Arc;
 use std::{collections::HashMap, path::PathBuf};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -30,11 +30,13 @@ pub struct Runner {
     pub max_steps: usize,
     /// Live approval broker (server/TUI mode). None = headless `run`.
     pub approval: Option<ApprovalGate>,
+    /// Lumina-compatible JS/TS plugin worker (None when unconfigured).
+    pub plugins: Option<Arc<Host>>,
 }
 
 impl Runner {
     pub fn new() -> Self {
-        Self { max_steps: 16, approval: None }
+        Self { max_steps: 16, approval: None, plugins: None }
     }
 
     fn tool_specs() -> Vec<ToolSpec> {
@@ -57,6 +59,10 @@ impl Runner {
             ToolSpec { name: "question".into(), description: "Ask the user a clarifying question with options (interactive sessions only).".into(), schema: obj(&["questions"]) },
             ToolSpec { name: "websearch".into(), description: "Search the web for current info (needs a provider key; pick with [websearch] provider).".into(), schema: obj(&["query", "provider"]) },
             ToolSpec { name: "webfetch".into(), description: "Fetch one HTTP(S) URL as markdown/text/HTML (cap 100KB).".into(), schema: obj(&["url", "format"]) },
+            ToolSpec { name: "mcp".into(), description: "Call a local MCP tool (stdio/SSE; see .lumina/mcp.json).".into(), schema: obj(&["server", "tool", "args"]) },
+            ToolSpec { name: "subagent".into(), description: "Launch a scoped subagent (general|explore). Subagents cannot delegate further.".into(), schema: obj(&["task", "agent"]) },
+            ToolSpec { name: "todowrite".into(), description: "Track task progress as a todo list.".into(), schema: obj(&["todos"]) },
+            ToolSpec { name: "patch".into(), description: "Apply a unified diff (---/+++ with @@ hunks) with exact context matching.".into(), schema: obj(&["patch"]) },
         ]
     }
 
@@ -81,6 +87,7 @@ impl Runner {
         session_id: &str,
         text: &str,
         effort: &str,
+        images: &[ImageAttachment],
         mut on_event: impl FnMut(&str, &str) + Send,
     ) -> Result<String, AgentError> {
         let sess = store
@@ -95,7 +102,21 @@ impl Runner {
             _ => PermissionMode::Bypass,
         };
         let bundle = Bundle::load(&workspace, cfg.compat.import_global_rules, cfg.compat.import_global_skills);
-        store.add_turn(session_id, "user", text)?;
+        // Auto-compact near the context limit (best-effort, never fails the turn).
+        if Self::maybe_auto_compact(store, router, cfg, session_id).await.is_err() {
+            // proceed with full history; the loop degrades gracefully
+        }
+        // Lumina hook: chat.message may rewrite the incoming turn text.
+        let mut user_text = text.to_string();
+        if let Some(h) = &self.plugins {
+            let payload = serde_json::json!({"text": text, "sessionID": session_id});
+            if let Some(out) = h.dispatch("chat.message", &payload, std::time::Duration::from_secs(5)) {
+                if let Some(t) = out.get("patch").and_then(|p| p.get("text")).and_then(|t| t.as_str()) {
+                    user_text = t.to_string();
+                }
+            }
+        }
+        store.add_turn(session_id, "user", &user_text)?;
 
         let mut messages = vec![llm::Message {
             role: "system".into(),
@@ -108,7 +129,7 @@ impl Runner {
                 messages.push(llm::Message { role: t.role, content: t.text, thinking: String::new() });
             }
         }
-        messages.push(llm::Message { role: "user".into(), content: text.into(), thinking: String::new() });
+        messages.push(llm::Message { role: "user".into(), content: user_text.clone(), thinking: String::new() });
 
         let reg = Registry {
             kb_query: Some(std::sync::Arc::new(|ws, q, b| {
@@ -116,18 +137,56 @@ impl Runner {
             })),
             bundle: Some(bundle),
             websearch_provider: cfg.websearch.provider.clone(),
+            plugins: self.plugins.clone(),
+            subagent: Some(Arc::new({
+                let router = router.clone();
+                let cfg = cfg.clone();
+                move |sc: &SecCtx, task: &str, name: &str| {
+                    // Sync tool context inside the async turn: park this worker
+                    // thread and drive the subagent future to completion.
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(run_subtask(&router, &cfg, sc, task, name))
+                    })
+                    .map_err(|e| e.to_string())
+                }
+            })),
         };
         let (runner_headless, runner_gate) = match &self.approval {
             Some(g) => (false, g.clone()),
             None => (true, ApprovalGate::default()),
         };
-        let sc = SecCtx { workspace: workspace.clone(), session: sess.id.clone(), agent, mode, headless: runner_headless, gate: runner_gate };
+        let sc = SecCtx {
+            workspace: workspace.clone(),
+            session: sess.id.clone(),
+            agent,
+            mode,
+            headless: runner_headless,
+            gate: runner_gate,
+            bash_rules: cfg.permissions_bash.clone(),
+            allow_tooling_write: false,
+            depth: 0,
+        };
         let agent_name = sess.agent.clone();
         let model = sess.model.clone();
-        let final_text = self
-            .loop_until_done(router, &reg, &sc, &agent_name, &model, effort, &mut messages, &mut on_event)
+        let (final_text, mutated) = self
+            .loop_until_done(router, &reg, &sc, &agent_name, &model, effort, images, &mut messages, &mut on_event)
             .await?;
-        store.add_turn(session_id, "assistant", &final_text)?;
+        let turn = store.add_turn(session_id, "assistant", &final_text)?;
+        // Shadow-Git checkpoint after mutating turns (best-effort: plain
+        // directories and non-repos simply skip).
+        if mutated {
+            match crate::checkpoints::snapshot(&workspace, session_id, &turn.id) {
+                Ok(commit) => {
+                    let _ = store.add_trace(
+                        session_id,
+                        "checkpoint",
+                        &serde_json::json!({"turn": turn.id, "commit": commit}).to_string(),
+                    );
+                }
+                Err(e) => tracing::warn!("checkpoint skipped: {e}"),
+            }
+        }
         Ok(final_text)
     }
 
@@ -139,10 +198,12 @@ impl Runner {
         agent_name: &str,
         model: &str,
         effort: &str,
+        images: &[ImageAttachment],
         messages: &mut Vec<llm::Message>,
         on_event: &mut (dyn FnMut(&str, &str) + Send),
-    ) -> Result<String, AgentError> {
+    ) -> Result<(String, bool), AgentError> {
         let mut last_text = String::new();
+        let mut mutated = false;
         for _ in 0..self.max_steps {
             let (tx, mut rx) = mpsc::unbounded_channel::<Chunk>();
             let req = Request {
@@ -151,6 +212,7 @@ impl Runner {
                 tools: Self::tool_specs(),
                 max_tokens: 0,
                 reasoning_effort: effort.into(),
+                images: images.to_vec(),
             };
             let role = if agent_name == "plan" { "planner" } else { "executor" };
             // Spawn the stream pump (Router is Clone + 'static); drain below.
@@ -175,10 +237,13 @@ impl Runner {
                 .await
                 .map_err(|e| AgentError::Msg(format!("stream task: {e}")))??;
             if calls.is_empty() {
-                return Ok(last_text);
+                return Ok((last_text, mutated));
             }
             // Execute requested tools, feed results back as user messages.
             for tc in &calls {
+                if matches!(tc.name.as_str(), "edit" | "write" | "bash" | "memory_write") {
+                    mutated = true;
+                }
                 let args: HashMap<String, serde_json::Value> = tc.args.clone();
                 let result = reg.call(sc, &tc.name, &args);
                 let rendered = match result {
@@ -191,7 +256,209 @@ impl Runner {
             messages.push(llm::Message { role: "assistant".into(), content: last_text.clone(), thinking: String::new() });
             last_text.clear();
         }
-        Ok(last_text)
+        Ok((last_text, mutated))
+    }
+}
+
+
+
+
+/// Scoped subagent run: fresh context with a builtin (general|explore) system
+/// prompt, restricted tool specs, max 6 steps, no further delegation.
+async fn run_subtask(
+    router: &Router,
+    cfg: &crate::config::Config,
+    parent: &SecCtx,
+    task: &str,
+    name: &str,
+) -> Result<String, AgentError> {
+    let def = crate::rules::builtin_agents()
+        .into_iter()
+        .find(|a| a.name == name)
+        .ok_or_else(|| AgentError::Msg(format!("unknown subagent {name:?} (want general|explore)")))?;
+    let bundle = Bundle::load(&parent.workspace, cfg.compat.import_global_rules, cfg.compat.import_global_skills);
+    let mut prompt = bundle.system_prompt.clone();
+    prompt.push_str(&format!("\n{}\n", def.body));
+    let specs: Vec<ToolSpec> = Runner::tool_specs()
+        .into_iter()
+        .filter(|t| {
+            if name == "explore" {
+                matches!(
+                    t.name.as_str(),
+                    "read" | "grep" | "glob" | "kb_query" | "skill" | "webfetch" | "websearch"
+                )
+            } else {
+                t.name != "subagent"
+            }
+        })
+        .collect();
+    let reg = Registry {
+        kb_query: Some(std::sync::Arc::new(|ws, q, b| {
+            crate::kb::query(ws, q, b).map_err(|e| e.to_string())
+        })),
+        bundle: Some(bundle),
+        websearch_provider: cfg.websearch.provider.clone(),
+        plugins: None,
+        subagent: None, // depth guard is also enforced in do_subagent
+    };
+    let sc = SecCtx {
+        workspace: parent.workspace.clone(),
+        session: parent.session.clone(),
+        agent: parent.agent,
+        mode: parent.mode,
+        headless: parent.headless,
+        gate: parent.gate.clone(),
+        bash_rules: parent.bash_rules.clone(),
+        allow_tooling_write: false,
+        depth: parent.depth + 1,
+    };
+    let mut messages = vec![
+        llm::Message { role: "system".into(), content: prompt, thinking: String::new() },
+        llm::Message { role: "user".into(), content: task.into(), thinking: String::new() },
+    ];
+    let model = if def.model.is_empty() { String::new() } else { def.model.clone() };
+    let mut last = String::new();
+    for _ in 0..6 {
+        let (txs, mut rxs) = mpsc::unbounded_channel::<Chunk>();
+        let req = Request {
+            model: model.clone(),
+            messages: messages.clone(),
+            tools: specs.clone(),
+            max_tokens: 0,
+            reasoning_effort: String::new(),
+            images: vec![],
+        };
+        let router2 = router.clone();
+        let handle = tokio::spawn(async move { router2.chat_stream("executor", "build", req, txs).await });
+        let mut calls = Vec::new();
+        while let Some(c) = rxs.recv().await {
+            if !c.delta.is_empty() {
+                last.push_str(&c.delta);
+            }
+            if !c.tool_calls.is_empty() {
+                calls = c.tool_calls;
+            }
+            if c.done {
+                break;
+            }
+        }
+        let _usage = handle.await.map_err(|e| AgentError::Msg(format!("subagent task: {e}")))??;
+        if calls.is_empty() {
+            return Ok(last);
+        }
+        for tc in &calls {
+            let result = reg.call(&sc, &tc.name, &tc.args);
+            let rendered = match result {
+                Ok(o) => format!("tool {} →\n{}", tc.name, o.output),
+                Err(e) => format!("tool {} failed: {e}", tc.name),
+            };
+            messages.push(llm::Message { role: "user".into(), content: format!("[tool result {}]\n{rendered}", tc.name), thinking: String::new() });
+        }
+        messages.push(llm::Message { role: "assistant".into(), content: last.clone(), thinking: String::new() });
+        last.clear();
+    }
+    Ok(last)
+}
+
+impl Runner {
+    /// Rough token estimate (chars/4 over messages + tool specs).
+    pub fn estimate_tokens(messages: &[llm::Message], specs: &[ToolSpec]) -> usize {
+        let chars: usize = messages.iter().map(|m| m.content.len() + m.role.len()).sum::<usize>()
+            + specs.iter().map(|s| s.name.len() + s.description.len() + s.schema.to_string().len()).sum::<usize>();
+        chars / 4
+    }
+
+    /// Compact when the estimate crosses 80% of the advertised window.
+    pub async fn maybe_auto_compact(
+        store: &Store,
+        router: &Router,
+        cfg: &crate::config::Config,
+        session_id: &str,
+    ) -> Result<(), AgentError> {
+        let sess = store
+            .get_session(session_id)?
+            .ok_or_else(|| AgentError::Msg(format!("session {session_id} not found")))?;
+        let turns = store.turns(session_id)?;
+        if turns.len() < 20 {
+            return Ok(());
+        }
+        let model = if sess.model.is_empty() { router.model_for("executor", "build") } else { sess.model.clone() };
+        let window = router.context_window(&model).await as usize;
+        if window == 0 {
+            return Ok(()); // unknown window: never auto-compact blind
+        }
+        let used: usize = turns.iter().map(|t| t.text.len() + t.role.len()).sum::<usize>() / 4;
+        if used * 100 < window * 80 {
+            return Ok(());
+        }
+        Self::compact_session(store, router, cfg, session_id).await?;
+        Ok(())
+    }
+
+    /// Keep the first 2 + last 6 turns, summarize the middle via the fast
+    /// tier (naive truncation note when no LLM is reachable), and persist a
+    /// summary turn. Mirrors Go auto-compaction (rules/diffs/memory pointers
+    /// are rebuilt from disk, never summarized away).
+    pub async fn compact_session(
+        store: &Store,
+        router: &Router,
+        cfg: &crate::config::Config,
+        session_id: &str,
+    ) -> Result<String, AgentError> {
+        let turns = store.turns(session_id)?;
+        if turns.len() < 20 {
+            return Ok("already compact".into());
+        }
+        let keep_head = 2.min(turns.len());
+        let keep_tail = 6.min(turns.len() - keep_head);
+        let middle = &turns[keep_head..turns.len() - keep_tail];
+        if middle.is_empty() {
+            return Ok("already compact".into());
+        }
+        let digest: String = middle
+            .iter()
+            .map(|t| format!("{}: {}", t.role, t.text.chars().take(400).collect::<String>()))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .take(12_000)
+            .collect();
+        // Summarize with the fast tier; degrade to a pointer note offline.
+        let summary = {
+            let (tx, mut rx) = mpsc::unbounded_channel::<Chunk>();
+            let req = Request {
+                model: String::new(),
+                messages: vec![
+                    llm::Message { role: "system".into(), content: "Summarize this coding session's middle turns in 10 bullet lines: decisions, file changes, open threads. No preamble.".into(), thinking: String::new() },
+                    llm::Message { role: "user".into(), content: digest.clone(), thinking: String::new() },
+                ],
+                tools: vec![],
+                max_tokens: 0,
+                reasoning_effort: String::new(),
+                images: vec![],
+            };
+            let router2 = router.clone();
+            let handle = tokio::spawn(async move { router2.chat_stream("fast", "build", req, tx).await });
+            let mut text = String::new();
+            while let Some(c) = rx.recv().await {
+                text.push_str(&c.delta);
+                if c.done {
+                    break;
+                }
+                if text.len() > 4000 {
+                    break;
+                }
+            }
+            match handle.await {
+                Ok(Ok(_)) if !text.trim().is_empty() => text,
+                _ => format!("(omitted {} middle turns; LLM unavailable)\n{}", middle.len(), digest.chars().take(2000).collect::<String>()),
+            }
+        };
+        let ids: Vec<String> = middle.iter().map(|t| t.id.clone()).collect();
+        let n = store.delete_turns(session_id, &ids)?;
+        store.add_turn(session_id, "assistant", &format!("Prior context summary ({n} turns compacted):\n{summary}"))?;
+        let _ = cfg; // compat flags are read at prompt time, not compaction time
+        Ok(format!("compacted {n} turns"))
     }
 }
 
@@ -208,5 +475,3 @@ mod tests {
         assert!(!s.contains("PLAN MODE"));
     }
 }
-
-

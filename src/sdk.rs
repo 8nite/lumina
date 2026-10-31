@@ -16,6 +16,8 @@ pub enum SdkError {
     Json(#[from] serde_json::Error),
 }
 
+/// Daemon session view (wire schema; fields populate pickers and headers).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionView {
     pub id: String,
@@ -190,10 +192,6 @@ impl Sdk {
         Ok(())
     }
 
-    pub fn router(&self) -> Result<serde_json::Value, SdkError> {
-        Ok(Self::check(self.req(reqwest::Method::GET, "/api/v1/router").send()?)?.json()?)
-    }
-
     pub fn set_router(&self, role: &str, model: &str) -> Result<(), SdkError> {
         Self::check(
             self.req(reqwest::Method::PUT, "/api/v1/router")
@@ -228,6 +226,28 @@ impl Sdk {
         let v: serde_json::Value =
             Self::check(self.req(reqwest::Method::POST, "/api/v1/harness/evolve").send()?)?.json()?;
         Ok(v.get("result").and_then(|r| r.as_str()).unwrap_or("accepted").to_string())
+    }
+
+    pub fn revert(&self, id: &str, turn: Option<&str>) -> Result<String, SdkError> {
+        let v: serde_json::Value = Self::check(
+            self.req(reqwest::Method::POST, &format!("/api/v1/sessions/{id}/revert"))
+                .json(&serde_json::json!({"turn": turn}))
+                .send()?,
+        )?
+        .json()?;
+        Ok(v.get("commit").and_then(|c| c.as_str()).unwrap_or("").to_string())
+    }
+
+    pub fn unrevert(&self, id: &str) -> Result<String, SdkError> {
+        let v: serde_json::Value =
+            Self::check(self.req(reqwest::Method::POST, &format!("/api/v1/sessions/{id}/unrevert")).send()?)?.json()?;
+        Ok(v.get("commit").and_then(|c| c.as_str()).unwrap_or("").to_string())
+    }
+
+    pub fn compact(&self, id: &str) -> Result<String, SdkError> {
+        let v: serde_json::Value =
+            Self::check(self.req(reqwest::Method::POST, &format!("/api/v1/sessions/{id}/compact")).send()?)?.json()?;
+        Ok(v.get("result").and_then(|r| r.as_str()).unwrap_or("").to_string())
     }
 
     pub fn export(&self, id: &str) -> Result<String, SdkError> {

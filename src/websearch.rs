@@ -273,10 +273,8 @@ pub fn fetch(raw_url: &str, format: &str, timeout: Duration) -> Result<(String, 
         bytes.truncate(CAP);
     }
     let mut out = String::from_utf8_lossy(&bytes).into_owned();
-    if format == "markdown" || format == "text" || format.is_empty() {
-        if ct.contains("html") || looks_like_html(&out) {
-            out = html_to_text(&out);
-        }
+    if !matches!(format, "html") && (ct.contains("html") || looks_like_html(&out)) {
+        out = html_to_text(&out);
     }
     if truncated {
         out.push_str("\n…[truncated at 100KB]");
@@ -337,6 +335,7 @@ fn html_to_text(s: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
 
 #[cfg(test)]
 mod tests {

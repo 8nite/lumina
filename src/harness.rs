@@ -74,9 +74,6 @@ impl Loader {
         Ok(std::fs::write(&p, content)?)
     }
 
-    pub fn list(&self) -> Vec<String> {
-        COMPONENTS.iter().map(|s| s.to_string()).collect()
-    }
 }
 
 fn non_comment_lines(s: &str) -> Vec<&str> {
@@ -286,6 +283,40 @@ impl Library {
     }
 }
 
+
+/// Level-1 offline pass: one candidate refreshing tool guidance, probed in a
+/// worktree, quality-gated (floor 0.5), committed, and promoted to the library.
+pub fn offline_pass(workspace: &Path) -> Result<String, HarnessError> {
+    let loader = Loader { workspace: workspace.to_path_buf() };
+    loader.ensure()?;
+    let cur = loader.get("tool_guidance.md").unwrap_or_default();
+    let mut files = HashMap::new();
+    files.insert(
+        "tool_guidance.md".into(),
+        format!("{cur}\n- Prefer kb_query before grep for project questions.\n"),
+    );
+    let cand = Candidate {
+        id: "guidance-refresh".into(),
+        rationale: "re-ground tool guidance in current rules bundle".into(),
+        files,
+    };
+    let results = probe(workspace, &[cand.clone()], |_, _| (true, 0.6, "offline heuristic".into()))?;
+    let map: HashMap<String, Candidate> = [(cand.id.clone(), cand)].into_iter().collect();
+    let landed = compose(&loader, &results, &map, 0.5)?;
+    if landed.is_empty() {
+        return Ok("evolve: no candidate cleared the quality floor".into());
+    }
+    let commit = commit_all(workspace, &format!("harness: evolve {}", landed.join(",")))?;
+    let lib = Library { dir: Library::default_dir() };
+    let date = chrono::Utc::now().format("%Y%m%d").to_string();
+    let _ = lib.promote(
+        &format!("evolve-{date}"),
+        "# evolve run",
+        &format!("offline pass landed {}", landed.join(",")),
+    );
+    Ok(format!("evolve landed: {} @ {}", landed.join(","), commit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,7 +360,7 @@ mod tests {
         let mut files = HashMap::new();
         files.insert("tool_guidance.md".into(), "guidance\n".into());
         let cand = Candidate { id: "g".into(), files, rationale: "r".into() };
-        let results = probe(ws, &[cand.clone()], |sandbox, _| {
+        let results = probe(ws, std::slice::from_ref(&cand), |sandbox, _| {
             assert!(sandbox.join(".lumina/harness/tool_guidance.md").exists());
             (true, 0.6, "ok".into())
         })
@@ -340,37 +371,4 @@ mod tests {
         let r = git(ws, &["rev-parse", "refs/lumina/harness"]).unwrap();
         assert_eq!(r, commit);
     }
-}
-
-/// Level-1 offline pass: one candidate refreshing tool guidance, probed in a
-/// worktree, quality-gated (floor 0.5), committed, and promoted to the library.
-pub fn offline_pass(workspace: &Path) -> Result<String, HarnessError> {
-    let loader = Loader { workspace: workspace.to_path_buf() };
-    loader.ensure()?;
-    let cur = loader.get("tool_guidance.md").unwrap_or_default();
-    let mut files = HashMap::new();
-    files.insert(
-        "tool_guidance.md".into(),
-        format!("{cur}\n- Prefer kb_query before grep for project questions.\n"),
-    );
-    let cand = Candidate {
-        id: "guidance-refresh".into(),
-        rationale: "re-ground tool guidance in current rules bundle".into(),
-        files,
-    };
-    let results = probe(workspace, &[cand.clone()], |_, _| (true, 0.6, "offline heuristic".into()))?;
-    let map: HashMap<String, Candidate> = [(cand.id.clone(), cand)].into_iter().collect();
-    let landed = compose(&loader, &results, &map, 0.5)?;
-    if landed.is_empty() {
-        return Ok("evolve: no candidate cleared the quality floor".into());
-    }
-    let commit = commit_all(workspace, &format!("harness: evolve {}", landed.join(",")))?;
-    let lib = Library { dir: Library::default_dir() };
-    let date = chrono::Utc::now().format("%Y%m%d").to_string();
-    let _ = lib.promote(
-        &format!("evolve-{date}"),
-        "# evolve run",
-        &format!("offline pass landed {}", landed.join(",")),
-    );
-    Ok(format!("evolve landed: {} @ {}", landed.join(","), commit))
 }

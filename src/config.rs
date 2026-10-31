@@ -79,8 +79,8 @@ pub struct RouterConfig {
 }
 
 impl RouterConfig {
-    /// Tier model lookup; empty string means unset.
-    /// Planner fallback to executor happens in `agent` (mirrors Go `ModelFor`).
+    /// Tier model lookup; prefer `llm::Router::model_for` (planner fallback).
+    #[allow(dead_code)]
     pub fn model_for_role(&self, role: &str) -> &str {
         match role {
             "fast" => &self.fast,
@@ -268,6 +268,7 @@ pub fn default_path() -> Option<PathBuf> {
         .ok()
         .map(|h| PathBuf::from(h).join(".config/lumina/config.toml"))
 }
+
 
 #[cfg(test)]
 mod tests {

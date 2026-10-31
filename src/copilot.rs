@@ -166,6 +166,7 @@ pub fn effective_token(provider: &str, cfg: &crate::config::Config) -> String {
     read_token_store(provider)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;

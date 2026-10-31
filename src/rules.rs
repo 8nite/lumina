@@ -6,13 +6,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Merge order layers (lowest wins instructionally; Layer 0 core lives in `security`).
-#[derive(Debug, Clone)]
-pub struct RuleSet {
-    /// (source_path, body) in merge order.
-    pub layers: Vec<(PathBuf, String)>,
-}
-
 pub fn workspace_root(start: &Path) -> PathBuf {
     let mut cur = start.to_path_buf();
     loop {
@@ -26,65 +19,6 @@ pub fn workspace_root(start: &Path) -> PathBuf {
     }
 }
 
-/// Collect rule files without reading global imports twice; skips missing files.
-pub fn discover(workspace: &Path, global: bool) -> RuleSet {
-    let mut layers = Vec::new();
-    let mut push = |p: PathBuf| {
-        if let Ok(body) = std::fs::read_to_string(&p) {
-            layers.push((p, body));
-        }
-    };
-    if global {
-        if let Ok(home) = std::env::var("HOME") {
-            let h = PathBuf::from(home);
-            push(h.join(".config/lumina/AGENTS.md"));
-            let inst = h.join(".config/lumina/instructions");
-            if let Ok(rd) = std::fs::read_dir(&inst) {
-                let mut v: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-                v.sort();
-                for p in v {
-                    if p.extension().map(|e| e == "md").unwrap_or(false) {
-                        push(p);
-                    }
-                }
-            }
-        }
-    }
-    // Project + directory walk: git root down to workspace dir.
-    let root = workspace_root(workspace);
-    let mut chain = Vec::new();
-    let mut cur = workspace.to_path_buf();
-    loop {
-        chain.push(cur.clone());
-        if cur == root || cur.parent().is_none() {
-            break;
-        }
-        cur = cur.parent().unwrap().to_path_buf();
-    }
-    chain.reverse();
-    for dir in chain {
-        let a = dir.join("AGENTS.md");
-        if a.exists() {
-            push(a);
-        } else {
-            let c = dir.join("CLAUDE.md"); // fallback when AGENTS.md absent
-            if c.exists() {
-                push(c);
-            }
-        }
-        let inst = dir.join(".lumina/instructions");
-        if let Ok(rd) = std::fs::read_dir(&inst) {
-            let mut v: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-            v.sort();
-            for p in v {
-                if p.extension().map(|e| e == "md").unwrap_or(false) {
-                    push(p);
-                }
-            }
-        }
-    }
-    RuleSet { layers }
-}
 
 pub const IMMUTABLE_SECURITY_CORE: &str = "# Lumina Immutable Security Core (Layer 0)\n- Workspace fence: agents may only touch the session workspace_dir (+ TMPDIR).\n- Credential files (.env, auth.json, lumina.json, *secret*, *credential*, *.pem) are HARD DENY in every mode.\n- Google services (googleapis.com, generativelanguage, gemini, google-workspace) are HARD DENY.\n- plan-mode agents are read-only except plan.md / .lumina/plans/*.md.\n";
 
