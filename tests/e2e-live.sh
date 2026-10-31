@@ -96,15 +96,23 @@ section "S5 question gate"
 S5=$(new_session "$ROOT/ws5")
 timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S5/prompt" -H 'Content-Type: application/json' -d '{"text":"use the question tool to ask me which color I prefer with options red and blue, then stop and wait for my answer"}' > "$ROOT/s5.out" 2>&1 &
 P5=$!
-REQ=""; for i in $(seq 1 70); do
-  ST=$(api GET "/api/v1/sessions/$S5/state");
-  REQ=$(echo "$ST" | python3 -c 'import sys,json;q=json.load(sys.stdin).get("question");print(q["req_id"] if q else "")');
-  [ -n "$REQ" ] && break; sleep 3;
+# Answer every pending question (up to 3 rounds): the model must see its
+# answers land before it stops asking.
+ASKED=0; ANSWERED=0
+for round in 1 2 3; do
+  REQ=""
+  for i in $(seq 1 70); do
+    ST=$(api GET "/api/v1/sessions/$S5/state");
+    if [ "$(echo "$ST" | python3 -c 'import sys,json;print(json.load(sys.stdin)["running"])')" = "False" ]; then break 2; fi
+    REQ=$(echo "$ST" | python3 -c 'import sys,json;q=json.load(sys.stdin).get("question");print(q["req_id"] if q else "")');
+    [ -n "$REQ" ] && break; sleep 3;
+  done
+  [ -z "$REQ" ] && break
+  ASKED=$((ASKED+1))
+  if api POST "/api/v1/questions/$REQ" '{"answers":["red"]}' | grep -q '"ok":true'; then ANSWERED=$((ANSWERED+1)); fi
 done
-[ -n "$REQ" ] && pass "question.asked raised" || fail "question.asked"
-if [ -n "$REQ" ]; then
-  api POST "/api/v1/questions/$REQ" '{"answers":["red"]}' | grep -q '"ok":true' && pass "answer accepted" || fail "answer"
-fi
+[ "$ASKED" -ge 1 ] && pass "question.asked raised" || fail "question.asked"
+[ "$ANSWERED" -ge 1 ] && pass "answer accepted" || fail "answer"
 wait $P5 2>/dev/null
 # The blocking curl may time out on a slow model; poll the session instead.
 for i in $(seq 1 60); do

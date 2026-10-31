@@ -522,10 +522,14 @@ fn do_question(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result
         });
     }
     let answers = sc.gate.ask_question(&sc.session, qs).map_err(ToolError::Msg)?;
-    Ok(Outcome {
-        output: format!("user answered: {}", answers.join(" | ")),
-        truncated: false,
-    })
+    // Echo the question alongside the answer so the model connects its
+    // tool call to this result instead of re-asking.
+    let mut out = String::new();
+    for (i, (q, a)) in list.iter().zip(answers.iter()).enumerate() {
+        let t = q.get("text").and_then(|t| t.as_str()).unwrap_or("?");
+        out.push_str(&format!("Q{} {} → user answered: {}\n", i + 1, t, a));
+    }
+    Ok(Outcome { output: format!("user answered:\n{out}").trim_end().to_string(), truncated: false })
 }
 
 fn do_websearch(reg: &Registry, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
