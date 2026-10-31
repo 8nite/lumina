@@ -409,6 +409,51 @@ mod tests {
         let cfg = Config::load(Some(f.path().into())).unwrap();
         assert_eq!(cfg.permissions_bash.get("git status*").unwrap(), "allow");
     }
+
+    #[test]
+    fn token_url_google_blocked() {
+        let f = write_tmp("[providers.g]\nprotocol=\"copilot\"\nbase_url=\"https://api.githubcopilot.com\"\ntoken_url=\"https://generativelanguage.googleapis.com/x\"\n");
+        let err = Config::load(Some(f.path().into())).unwrap_err();
+        assert!(err.to_string().contains("Google"), "{err}");
+    }
+
+    #[test]
+    fn credential_env_blocklist() {
+        for env in ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"] {
+            let body = format!("[providers.g]\nprotocol=\"ollama\"\napi_key_env=\"{env}\"\n");
+            let f = write_tmp(&body);
+            let err = Config::load(Some(f.path().into())).unwrap_err();
+            assert!(err.to_string().contains("blocked"), "{err}");
+        }
+    }
+
+    #[test]
+    fn api_key_cmd_google_path_denied() {
+        let f = write_tmp("[providers.g]\nprotocol=\"ollama\"\napi_key_cmd=\"get-gemini-key\"\n");
+        let err = Config::load(Some(f.path().into())).unwrap_err();
+        assert!(err.to_string().contains("Google"), "{err}");
+    }
+
+    #[test]
+    fn empty_and_responses_protocols_accepted() {
+        for proto in ["", "responses", "openai-responses", "anthropic-compatible"] {
+            let body = format!("[providers.g]\nprotocol=\"{proto}\"\n");
+            let f = write_tmp(&body);
+            assert!(Config::load(Some(f.path().into())).is_ok(), "{proto}");
+        }
+    }
+
+    #[test]
+    fn websearch_disabled_and_ast_hook_parse() {
+        let f = write_tmp("[websearch]\ndisabled = true\n[kb]\nauto_commit_ast_hook = true\n");
+        let cfg = Config::load(Some(f.path().into())).unwrap();
+        assert!(cfg.websearch.disabled);
+        assert!(cfg.kb.auto_commit_ast_hook);
+        let f2 = write_tmp("");
+        let cfg2 = Config::load(Some(f2.path().into())).unwrap();
+        assert!(!cfg2.websearch.disabled);
+        assert!(!cfg2.kb.auto_commit_ast_hook);
+    }
 }
 
 #[cfg(test)]

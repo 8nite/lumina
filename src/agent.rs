@@ -315,7 +315,7 @@ impl Runner {
                         // the loop; the model can re-read files if it needs more).
                         let mut out = o.output;
                         let mut note = String::new();
-                        if out.len() > 4000 {
+                        if o.truncated || out.len() > 4000 {
                             let total = out.len();
                             out.truncate(4000);
                             note = format!("\n[truncated {total} chars to 4000]");
@@ -572,6 +572,30 @@ impl Runner {
         store.add_turn(session_id, "assistant", &format!("Prior context summary ({n} turns compacted):\n{summary}"))?;
         let _ = cfg; // compat flags are read at prompt time, not compaction time
         Ok(format!("compacted {n} turns"))
+    }
+}
+
+#[cfg(test)]
+mod specs_tests {
+    use super::*;
+
+    #[test]
+    fn tool_specs_include_lsp_alias() {
+        let specs = Runner::tool_specs();
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"lsp"), "{names:?}");
+        assert!(names.contains(&"grep"), "{names:?}");
+    }
+
+    #[test]
+    fn tool_specs_filtered_hides_websearch() {
+        let specs = Runner::tool_specs_filtered(true);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"websearch"), "{names:?}");
+        assert!(names.contains(&"webfetch"), "{names:?}");
+        let all_specs = Runner::tool_specs_filtered(false);
+        let all: Vec<&str> = all_specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(all.contains(&"websearch"), "{all:?}");
     }
 }
 

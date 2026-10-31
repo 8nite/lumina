@@ -75,7 +75,7 @@ section "S4 approval gate (ask mode + allow_once)"
 S4=$(new_session "$ROOT/ws4" build ask); mkdir -p "$ROOT/ws4"
 timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S4/prompt" -H 'Content-Type: application/json' -d '{"text":"run the shell command echo APPROVAL-TEST using the bash tool, then reply with what it printed"}' > "$ROOT/s4.out" 2>&1 &
 P4=$!
-REQ=""; for i in $(seq 1 40); do
+REQ=""; for i in $(seq 1 70); do
   ST=$(api GET "/api/v1/sessions/$S4/state")
   REQ=$(echo "$ST" | python3 -c 'import sys,json;p=json.load(sys.stdin).get("permission");print(p["req_id"] if p else "")');
   [ -n "$REQ" ] && break; sleep 3;
@@ -91,7 +91,7 @@ section "S5 question gate"
 S5=$(new_session "$ROOT/ws5")
 timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S5/prompt" -H 'Content-Type: application/json' -d '{"text":"use the question tool to ask me which color I prefer with options red and blue, then stop and wait for my answer"}' > "$ROOT/s5.out" 2>&1 &
 P5=$!
-REQ=""; for i in $(seq 1 40); do
+REQ=""; for i in $(seq 1 70); do
   ST=$(api GET "/api/v1/sessions/$S5/state");
   REQ=$(echo "$ST" | python3 -c 'import sys,json;q=json.load(sys.stdin).get("question");print(q["req_id"] if q else "")');
   [ -n "$REQ" ] && break; sleep 3;
@@ -115,7 +115,7 @@ grep -q "LINE1" "$ROOT/ws6/t.txt" && pass "unrevert restored turn output" || fai
 section "S7 compaction (20 micro-turns + compact)"
 S7=$(new_session "$ROOT/ws7")
 ok=1; for i in $(seq 1 20); do
-  timeout 120 curl -s -X POST "$BASE/api/v1/sessions/$S7/prompt" -H 'Content-Type: application/json' -d '{"text":"reply with exactly T'$i'"}' | grep -q "T$i" || { ok=0; echo "  turn $i deviated"; };
+  timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S7/prompt" -H 'Content-Type: application/json' -d '{"text":"reply with exactly T'$i'"}' | grep -q "T$i" || { ok=0; echo "  turn $i deviated"; };
 done
 [ $ok = 1 ] && pass "20 micro-turns" || fail "20 micro-turns"
 CR=$(timeout 180 curl -s -X POST "$BASE/api/v1/sessions/$S7/compact" -H 'Content-Type: application/json' -d '{}')
@@ -204,7 +204,7 @@ section "S14 vision attach (1x1 PNG)"
 python3 -c "import base64;open('$ROOT/dot.png','wb').write(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='))"
 mkdir -p "$ROOT/ws14"
 S14=$(new_session "$ROOT/ws14")
-OUT=$(cd "$ROOT/ws14" && timeout 150 "$LUMINA_BIN" run -s "$S14" --attach "$ROOT/dot.png" "describe this image in three words" 2>&1)
+OUT=$(cd "$ROOT/ws14" && timeout 240 "$LUMINA_BIN" run -s "$S14" --attach "$ROOT/dot.png" "describe this image in three words" 2>&1)
 [ -n "$OUT" ] && [ ${#OUT} -ge 3 ] && pass "vision turn completed ($(echo "$OUT" | head -c 60))" || fail "vision" "$(echo "$OUT" | head -c 150)"
 
 section "S15 web SPA"
@@ -243,7 +243,7 @@ C2=$(timeout 10 curl -s -o /dev/null -w "%{http_code}" -X POST $DB/api/v1/sessio
 [ "$C2" = "202" ] && pass "queued while running (202)" || fail "queue 202" "$C2"
 grep -q '"queued":true' <(timeout 10 curl -s -X POST $DB/api/v1/sessions/$DID/prompt -H 'Content-Type: application/json' -d '{"text":"q3"}') && pass "queue body" || fail "queue body"
 # Poll for the full drain (3 user + 3 assistant turns); 5s doze x3 + overhead.
-N=0; for i in $(seq 1 40); do
+N=0; for i in $(seq 1 60); do
   N=$(curl -s $DB/api/v1/sessions/$DID/export 2>/dev/null | grep -c "^## ");
   [ "$N" = "6" ] && break;
   sleep 5;

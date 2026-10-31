@@ -10,6 +10,8 @@ for p in $(pgrep -x lumina-rs); do kill -9 "$p" 2>/dev/null; done
 sleep 1
 mkdir -p "$(dirname "$LUMINA_DB")" "$(dirname "$LOG")"
 cd "$HOME" || exit 1
+# NOTE: keep `nohup … &` as its own simple command so $! is the daemon PID
+# (chaining with && would capture a subshell instead).
 LUMINA_DB="${LUMINA_DB:-$HOME/.local/share/lumina-rs/lumina.db}" \
 LUMINA_DEBUG_SSE="${LUMINA_DEBUG_SSE:-}" \
   nohup "$BIN" serve --port 7432 >>"$LOG" 2>&1 &

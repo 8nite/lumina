@@ -466,3 +466,111 @@ mod fence_tests {
         assert_eq!(decide(&p), Decision::Deny);
     }
 }
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+
+    fn ws() -> PathBuf {
+        PathBuf::from("/repo")
+    }
+
+    fn eval(tool: &str, target: &str) -> Eval {
+        Eval {
+            agent: Agent::Build,
+            mode: PermissionMode::Bypass,
+            tool: tool.into(),
+            target: target.into(),
+            workspace: ws(),
+            destructive: false,
+            bash_rules: Default::default(),
+            allow_tooling_write: false,
+        }
+    }
+
+    #[test]
+    fn credential_widened_lists() {
+        // Go CredentialFileNames parity: .env.local, .npmrc, id_rsa, vault, secrets.
+        for t in [
+            ".env.local",
+            ".env.production",
+            ".npmrc",
+            ".pypirc",
+            "id_rsa",
+            "id_ed25519",
+            "vault",
+            "secrets",
+            "token.json",
+            "vault_exec",
+        ] {
+            assert!(is_credential_path(t), "{t}");
+        }
+        // Cluster / identity subtrees and shadow files.
+        assert!(is_credential_path("/home/u/.kube/config"));
+        assert!(is_credential_path("/home/u/.ssh/id_rsa"));
+        assert!(is_credential_path("/etc/shadow"));
+        assert!(is_credential_path("gshadow"));
+        // Innocent paths stay allowed.
+        assert!(!is_credential_path("main.go"));
+        assert!(!is_credential_path("README.md"));
+    }
+
+    #[test]
+    fn google_widened_blocklist() {
+        for t in [
+            "https://generativelanguage.googleapis.com/v1",
+            "https://aiplatform.googleapis.com/x",
+            "https://vertexai.example.com/y",
+            "https://example.com/google-workspace/z",
+            "https://fonts.googleapis.com/css",
+            "cmd --from-literal=password",
+        ] {
+            assert!(is_google_target(t), "{t}");
+            assert_eq!(decide(&eval("bash", t)), Decision::Deny, "{t}");
+        }
+        // Note: bare google.com / bard.google are config-level URL blocks
+        // (is_google_url), not tool-target denies — Go IsGoogleTarget parity.
+        assert!(!is_google_target("https://bard.google/x"));
+        assert!(!is_google_target("https://api.github.com"));
+    }
+
+    #[test]
+    fn destructive_bash_detector() {
+        for c in [
+            "rm -rf /tmp/x",
+            "git push --force origin main",
+            "git reset --hard HEAD",
+            "mkfs /dev/sda",
+            ":(){ :|:& };:",
+            "dd if=/dev/zero of=/dev/sda",
+        ] {
+            assert!(is_destructive_bash(c), "{c}");
+        }
+        assert!(!is_destructive_bash("go test ./..."));
+        assert!(!is_destructive_bash("ls -la"));
+    }
+
+    #[test]
+    fn plan_rejects_shell_metachar() {
+        // Go IsReadOnlyBash parity: metachar disqualifies even "read-only" prefixes.
+        let mk = |target: &str| Eval {
+            agent: Agent::Plan,
+            mode: PermissionMode::Bypass,
+            tool: "bash".into(),
+            target: target.into(),
+            workspace: ws(),
+            destructive: false,
+            bash_rules: Default::default(),
+            allow_tooling_write: false,
+        };
+        assert_eq!(decide(&mk("git status --porcelain")), Decision::Allow);
+        for bad in [
+            "echo hi > plan.md",
+            "git status; rm x",
+            "ls | grep foo",
+            "git log && touch p",
+        ] {
+            assert_eq!(decide(&mk(bad)), Decision::Deny, "{bad}");
+        }
+    }
+}

@@ -478,10 +478,14 @@ fn copilot_headers() -> Vec<(&'static str, String)> {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent("lumina/0.1.0")
-        .build()
-        .expect("reqwest client")
+    static ONCE: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("lumina/0.1.0")
+            .build()
+            .expect("reqwest client")
+    })
+    .clone()
 }
 
 fn auth_headers(def: &ProviderDef) -> reqwest::header::HeaderMap {
@@ -1193,6 +1197,29 @@ mod tests {
         assert!(valid_effort("auto") && !valid_effort("ultra"));
         assert_eq!(effort_budget("low"), 1024);
         assert_eq!(effort_budget(""), 0);
+    }
+
+    #[test]
+    fn effort_label_renders_auto() {
+        assert_eq!(effort_label(""), "auto");
+        assert_eq!(effort_label("auto"), "auto");
+        assert_eq!(effort_label(" XHIGH "), "xhigh");
+        assert_eq!(effort_label("MAX"), "max");
+        assert_eq!(effort_label("bogus"), "auto");
+    }
+
+    #[test]
+    fn empty_protocol_maps_to_openai_compatible() {
+        let d = ProviderDef {
+            protocol: String::new(),
+            base_url: "http://x".into(),
+            api_key: String::new(),
+            github_token: String::new(),
+            token_url: String::new(),
+        };
+        assert_eq!(d.kind(), "openai-compatible");
+        let d2 = ProviderDef { protocol: "responses".into(), ..d.clone() };
+        assert_eq!(d2.kind(), "openai-responses");
     }
 
     #[test]

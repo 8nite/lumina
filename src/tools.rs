@@ -78,11 +78,6 @@ impl Registry {
         Self { kb_query: None, bundle: None, websearch_provider: String::new(), plugins: None, subagent: None, disabled_tools: HashSet::new() }
     }
 
-
-    pub fn names() -> &'static [&'static str] {
-        &["read", "edit", "write", "bash", "shell", "grep", "lsp", "glob", "kb_query", "memory_write", "skill", "question", "websearch", "webfetch", "mcp", "subagent", "todowrite", "patch"]
-    }
-
     pub fn call(
         &self,
         sc: &SecCtx,
@@ -909,5 +904,21 @@ mod extended_tests {
         sc.depth = 1;
         let err = reg.call(&sc, "subagent", &args(&[("task", "hi")])).unwrap_err();
         assert!(matches!(err, ToolError::Msg(_)));
+    }
+
+    #[test]
+    fn shell_and_lsp_aliases_dispatch() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "hello\n").unwrap();
+        let reg = Registry::new();
+        // shell runs like bash.
+        let out = reg.call(&ctx2(d.path()), "shell", &args(&[("command", "echo hi")])).unwrap();
+        assert!(out.output.contains("hi"), "{}", out.output);
+        // lsp greps like grep.
+        let out = reg.call(&ctx2(d.path()), "lsp", &args(&[("pattern", "hello")])).unwrap();
+        assert!(out.output.contains("a.txt"), "{}", out.output);
+        // tool_target mirrors the alias.
+        assert_eq!(tool_target("shell", &args(&[("command", "echo hi")])), "echo hi");
+        assert_eq!(tool_target("lsp", &args(&[("pattern", "hello")])), "hello");
     }
 }
