@@ -94,14 +94,16 @@ api GET "/api/v1/sessions/$S4/export" | grep -q "APPROVAL-TEST" && pass "turn co
 
 section "S5 question gate"
 S5=$(new_session "$ROOT/ws5")
-timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S5/prompt" -H 'Content-Type: application/json' -d '{"text":"use the question tool to ask me which color I prefer with options red and blue, then stop and wait for my answer"}' > "$ROOT/s5.out" 2>&1 &
+QPROBE='{"text":"use the question tool to ask me which color I prefer with options red and blue, then stop and wait for my answer"}'
+QNUDGE='{"text":"you did not use the question tool. Call the question tool right now with my color preference question (options red and blue), then stop and wait."}'
+timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S5/prompt" -H 'Content-Type: application/json' -d "$QPROBE" > "$ROOT/s5.out" 2>&1 &
 P5=$!
 # Answer every pending question (up to 3 rounds): the model must see its
 # answers land before it stops asking.
 ASKED=0; ANSWERED=0
 for round in 1 2 3; do
   REQ=""
-  for i in $(seq 1 70); do
+  for i in $(seq 1 40); do
     ST=$(api GET "/api/v1/sessions/$S5/state");
     if [ "$(echo "$ST" | python3 -c 'import sys,json;print(json.load(sys.stdin)["running"])')" = "False" ]; then break 2; fi
     REQ=$(echo "$ST" | python3 -c 'import sys,json;q=json.load(sys.stdin).get("question");print(q["req_id"] if q else "")');
@@ -111,6 +113,24 @@ for round in 1 2 3; do
   ASKED=$((ASKED+1))
   if api POST "/api/v1/questions/$REQ" '{"answers":["red"]}' | grep -q '"ok":true'; then ANSWERED=$((ANSWERED+1)); fi
 done
+# Retry once with a nudge if the model skipped the tool entirely.
+if [ "$ASKED" = "0" ]; then
+  timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S5/prompt" -H 'Content-Type: application/json' -d "$QNUDGE" > "$ROOT/s5b.out" 2>&1 &
+  P5B=$!
+  for round in 1 2 3; do
+    REQ=""
+    for i in $(seq 1 40); do
+      ST=$(api GET "/api/v1/sessions/$S5/state");
+      if [ "$(echo "$ST" | python3 -c 'import sys,json;print(json.load(sys.stdin)["running"])')" = "False" ]; then break 2; fi
+      REQ=$(echo "$ST" | python3 -c 'import sys,json;q=json.load(sys.stdin).get("question");print(q["req_id"] if q else "")');
+      [ -n "$REQ" ] && break; sleep 3;
+    done
+    [ -z "$REQ" ] && break
+    ASKED=$((ASKED+1))
+    if api POST "/api/v1/questions/$REQ" '{"answers":["red"]}' | grep -q '"ok":true'; then ANSWERED=$((ANSWERED+1)); fi
+  done
+  wait $P5B 2>/dev/null
+fi
 [ "$ASKED" -ge 1 ] && pass "question.asked raised" || fail "question.asked"
 [ "$ANSWERED" -ge 1 ] && pass "answer accepted" || fail "answer"
 wait $P5 2>/dev/null

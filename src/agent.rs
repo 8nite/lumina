@@ -151,7 +151,11 @@ impl Runner {
             }
         }
         for t in store.turns(session_id)? {
-            // Replay persisted history (skip the user turn just stored — re-added below).
+            // Replay persisted history, skipping the user turn just stored
+            // above (re-added below) to avoid sending it twice.
+            if t.id == user_turn.id {
+                continue;
+            }
             if t.role == "user" || t.role == "assistant" {
                 messages.push(llm::Message { role: t.role, content: t.text, thinking: String::new() });
             }
