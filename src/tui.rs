@@ -173,9 +173,13 @@ impl App {
                 self.set_status("cleared");
             }
             "help" => self.push_msg("system", HELP.into()),
-            "compact" | "thinking" | "undo" | "redo" | "evolve" | "init" | "connect" => {
-                self.set_status(&format!("/{cmd} not yet ported in Rust M3 (lands with M5/M6)"));
+            "compact" | "thinking" | "undo" | "redo" | "init" | "connect" => {
+                self.set_status(&format!("/{cmd} not yet ported in Rust (lands with M6)"));
             }
+            "evolve" => match self.sdk.evolve() {
+                Ok(r) => self.push_msg("system", format!("evolve: {r}")),
+                Err(e) => self.set_status(&format!("evolve: {e}")),
+            },
             _ => self.set_status(&format!("unknown /{cmd} — try /help")),
         }
     }

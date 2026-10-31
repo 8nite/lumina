@@ -10,6 +10,7 @@ mod agent;
 mod approve;
 mod config;
 mod copilot;
+mod harness;
 mod kb;
 mod llm;
 mod pty;
@@ -305,6 +306,11 @@ async fn main() -> MainResult {
             } else {
                 println!("{text}");
             }
+            Ok(())
+        }
+        Some(Cmd::Evolve { session: _ }) => {
+            let ws = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            println!("{}", harness::offline_pass(&ws).map_err(|e| format!("{e}"))?);
             Ok(())
         }
         Some(_) => {

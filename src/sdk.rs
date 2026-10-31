@@ -224,6 +224,12 @@ impl Sdk {
         Ok(v.get("context").and_then(|c| c.as_str()).unwrap_or("").to_string())
     }
 
+    pub fn evolve(&self) -> Result<String, SdkError> {
+        let v: serde_json::Value =
+            Self::check(self.req(reqwest::Method::POST, "/api/v1/harness/evolve").send()?)?.json()?;
+        Ok(v.get("result").and_then(|r| r.as_str()).unwrap_or("accepted").to_string())
+    }
+
     pub fn export(&self, id: &str) -> Result<String, SdkError> {
         let res = Self::check(self.req(reqwest::Method::GET, &format!("/api/v1/sessions/{id}/export")).send()?)?;
         Ok(res.text()?)

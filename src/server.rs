@@ -95,8 +95,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/device/poll", get(auth_device_poll))
         .route("/api/v1/kb/query", axum::routing::post(kb_query))
         .route("/api/v1/kb/", get(kb_browse))
-        .route("/api/v1/harness", get(todo))
-        .route("/api/v1/harness/evolve", axum::routing::post(todo))
+        .route("/api/v1/harness", get(harness_info))
+        .route("/api/v1/harness/evolve", axum::routing::post(harness_evolve))
         .fallback(spa_fallback)
         .with_state(state)
 }
@@ -634,6 +634,28 @@ async fn auth_device_poll(Query(q): Query<DevicePollQ>) -> impl IntoResponse {
         }
         Ok(crate::copilot::Poll::Pending) => Json(serde_json::json!({"pending": true})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn harness_info() -> impl IntoResponse {
+    Json(serde_json::json!({"components": crate::harness::COMPONENTS}))
+}
+
+async fn harness_evolve(State(st): State<AppState>) -> impl IntoResponse {
+    st.emit(serde_json::json!({"type": "harness.evolve.started"}));
+    let ws = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    // Blocking git worktree ops: run off the async executor.
+    let out = tokio::task::spawn_blocking(move || crate::harness::offline_pass(&ws)).await;
+    match out {
+        Ok(Ok(msg)) => {
+            st.emit(serde_json::json!({"type": "harness.evolve.completed", "result": msg}));
+            Json(serde_json::json!({"status": "completed", "result": msg})).into_response()
+        }
+        Ok(Err(e)) => {
+            st.emit(serde_json::json!({"type": "harness.evolve.failed", "error": e.to_string()}));
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("evolve task: {e}")}))).into_response(),
     }
 }
 
