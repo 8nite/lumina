@@ -267,7 +267,7 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get('Content-Length', 0)); self.rfile.read(n); time.sleep(8)
         b = b'{"done": true}\n'
-        self.send_response(200); self.send_header('Content-Type: application/json')
+        self.send_response(200); self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
     def log_message(self, *a): pass
 import sys
