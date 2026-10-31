@@ -11,7 +11,12 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+};
+use tokio::sync::broadcast;
 
 use crate::{agent::Runner, llm::Router as LlmRouter, store::Store};
 
@@ -25,15 +30,24 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub router: Arc<LlmRouter>,
     pub auth_token: String,
+    pub compat: (bool, bool),
+    pub events: broadcast::Sender<serde_json::Value>,
 }
 
 impl AppState {
-    pub fn new(store: Store, router: LlmRouter) -> Self {
+    pub fn new(store: Store, router: LlmRouter, compat: (bool, bool)) -> Self {
+        let (events, _) = broadcast::channel(256);
         Self {
             store: Arc::new(store),
             router: Arc::new(router),
             auth_token: std::env::var("LUMINA_TOKEN").unwrap_or_default(),
+            compat,
+            events,
         }
+    }
+
+    fn emit(&self, v: serde_json::Value) {
+        let _ = self.events.send(v);
     }
 }
 
@@ -65,17 +79,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/sessions/:id/unrevert", axum::routing::post(todo))
         .route("/api/v1/permissions/:id", axum::routing::post(todo))
         .route("/api/v1/questions/:id", axum::routing::post(todo))
-        .route("/api/v1/files", get(todo))
-        .route("/api/v1/git/diff", get(todo))
-        .route("/api/v1/git/branch", get(todo))
+        .route("/api/v1/files", get(files))
+        .route("/api/v1/git/diff", get(git_diff))
+        .route("/api/v1/git/branch", get(git_branch))
         .route("/api/v1/pty", get(todo))
-        .route("/api/v1/providers", get(todo))
-        .route("/api/v1/router", get(todo).put(todo))
-        .route("/api/v1/models", get(todo))
+        .route("/api/v1/providers", get(providers))
+        .route("/api/v1/router", get(router_info).put(router_set))
+        .route("/api/v1/models", get(models))
         .route("/api/v1/auth/device/start", get(todo))
         .route("/api/v1/auth/device/poll", get(todo))
-        .route("/api/v1/kb/query", axum::routing::post(todo))
-        .route("/api/v1/kb/", get(todo))
+        .route("/api/v1/kb/query", axum::routing::post(kb_query))
+        .route("/api/v1/kb/", get(kb_browse))
         .route("/api/v1/harness", get(todo))
         .route("/api/v1/harness/evolve", axum::routing::post(todo))
         .fallback(spa_fallback)
@@ -223,16 +237,24 @@ async fn prompt(
     }
     let effort = crate::llm::normalize_effort(&b.effort).to_string();
     let runner = Runner::new();
-    // Store/Router are internally synchronized (single-writer SQLite, RwLock
-    // overrides); no outer lock is held across the turn loop. M2 moves this
-    // onto a per-session task queue with SSE progress.
+    // Store/Router are internally synchronized; no outer lock is held across
+    // the turn loop. Deltas stream to SSE subscribers via the event broker.
+    st.emit(serde_json::json!({"type": "turn.started", "session": id}));
+    let tx = st.events.clone();
+    let sid = id.clone();
     let out = runner
-        .run_prompt(&st.store, &st.router, &id, &b.text, &effort, |_, _| {})
+        .run_prompt(&st.store, &st.router, &id, &b.text, &effort, st.compat, |d, t| {
+            let _ = tx.send(serde_json::json!({"type": "turn.delta", "session": sid, "delta": d, "thinking": t}));
+        })
         .await;
     match out {
-        Ok(text) => Json(serde_json::json!({"session": id, "text": text})).into_response(),
+        Ok(text) => {
+            st.emit(serde_json::json!({"type": "turn.completed", "session": id}));
+            Json(serde_json::json!({"session": id, "text": text})).into_response()
+        }
         Err(e) => {
             let s = e.to_string();
+            st.emit(serde_json::json!({"type": "turn.failed", "session": id, "error": s}));
             if s.contains("not found") {
                 (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": s}))).into_response()
             } else {
@@ -295,14 +317,207 @@ async fn openapi() -> impl IntoResponse {
     }))
 }
 
-async fn events() -> Sse<impl futures_util::Stream<Item = Result<axum::response::sse::Event, axum::Error>>> {
-    // M2 wires the real broadcast broker; keep the route + headers correct now.
-    let stream = futures_util::stream::once(async {
-        Ok(axum::response::sse::Event::default()
-            .event("hello")
-            .data("{\"status\":\"events land in M2\"}"))
+async fn events(
+    State(st): State<AppState>,
+) -> Sse<impl futures_util::Stream<Item = Result<axum::response::sse::Event, axum::Error>>> {
+    let rx = st.events.subscribe();
+    let stream = futures_util::stream::unfold(rx, |mut rx| async {
+        loop {
+            match rx.recv().await {
+                Ok(v) => {
+                    let ev = axum::response::sse::Event::default()
+                        .event(v.get("type").and_then(|t| t.as_str()).unwrap_or("message"))
+                        .data(v.to_string());
+                    return Some((Ok(ev), rx));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return None,
+            }
+        }
     });
-    Sse::new(stream)
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+#[derive(Deserialize)]
+struct FilesQ {
+    #[serde(default)]
+    path: String,
+}
+
+/// Workspace file tree (dir entries) or capped file preview.
+async fn files(Query(q): Query<FilesQ>) -> impl IntoResponse {
+    let base = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let target = if q.path.is_empty() { base.clone() } else { base.join(&q.path) };
+    if target.is_dir() {
+        let mut entries: Vec<serde_json::Value> = std::fs::read_dir(&target)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| {
+                        serde_json::json!({
+                            "name": e.file_name().to_string_lossy(),
+                            "dir": e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        return Json(serde_json::json!({"path": q.path, "entries": entries})).into_response();
+    }
+    match std::fs::read_to_string(&target) {
+        Ok(text) => {
+            let capped: String = text.chars().take(32_000).collect();
+            Json(serde_json::json!({"path": q.path, "content": capped, "truncated": text.len() > capped.len()})).into_response()
+        }
+        Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+fn git_out(args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+async fn git_diff() -> impl IntoResponse {
+    match git_out(&["diff", "--stat", "HEAD"]) {
+        Ok(stat) => Json(serde_json::json!({"stat": stat})).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn git_branch() -> impl IntoResponse {
+    match git_out(&["branch", "--show-current"]) {
+        Ok(b) => Json(serde_json::json!({"branch": b.trim()})).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// Configured providers (never secrets — names/protocols/URLs only).
+async fn providers(State(st): State<AppState>) -> impl IntoResponse {
+    let r = st.router.clone();
+    let list: Vec<serde_json::Value> = {
+        let mut v: Vec<_> = r
+            .providers
+            .iter()
+            .map(|(name, p)| serde_json::json!({"name": name, "protocol": p.protocol, "base_url": p.base_url}))
+            .collect();
+        v.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        v
+    };
+    Json(serde_json::json!({"providers": list})).into_response()
+}
+
+async fn router_info(State(st): State<AppState>) -> impl IntoResponse {
+    let r = &*st.router;
+    Json(serde_json::json!({
+        "fast": r.model_for("fast", "build"),
+        "executor": r.model_for("executor", "build"),
+        "planner": r.model_for("planner", "plan"),
+        "improver": r.model_for("improver", "build"),
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct RouterSet {
+    role: String,
+    model: String,
+}
+
+async fn router_set(State(st): State<AppState>, Json(b): Json<RouterSet>) -> impl IntoResponse {
+    if !["fast", "executor", "planner", "improver"].contains(&b.role.as_str()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "bad role"}))).into_response();
+    }
+    st.router.set_model(&b.role, &b.model);
+    st.emit(serde_json::json!({"type": "config.updated", "role": b.role, "model": b.model}));
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+#[derive(Deserialize)]
+struct ModelsQ {
+    #[serde(default)]
+    provider: String,
+}
+
+async fn models(State(st): State<AppState>, Query(q): Query<ModelsQ>) -> impl IntoResponse {
+    let r = st.router.clone();
+    if q.provider.is_empty() {
+        let names: Vec<&String> = {
+            let mut v: Vec<&String> = r.providers.keys().collect();
+            v.sort();
+            v
+        };
+        return Json(serde_json::json!({"providers": names})).into_response();
+    }
+    let Some(def) = r.providers.get(&q.provider).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
+    };
+    match crate::llm::list_models(&def).await {
+        Ok(models) => Json(serde_json::json!({"provider": q.provider, "models": models})).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct KbQueryBody {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    budget: usize,
+    #[serde(default)]
+    directory: String,
+}
+
+async fn kb_query(Json(b): Json<KbQueryBody>) -> impl IntoResponse {
+    let ws = if b.directory.is_empty() {
+        std::env::current_dir().unwrap_or_else(|_| ".".into())
+    } else {
+        PathBuf::from(b.directory)
+    };
+    match crate::kb::query(&ws, &b.query, b.budget) {
+        Ok(text) => Json(serde_json::json!({"query": b.query, "context": text})).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// Browse ./memory/*.md + graphify-out docs (?path= to read one).
+async fn kb_browse(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
+    let base = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    if let Some(p) = q.get("path") {
+        // Contain reads to memory/ + graphify-out/ (credential fence applies at the tool layer).
+        let abs = base.join(p);
+        let first: String = std::path::Path::new(p)
+            .iter()
+            .next()
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ok_prefix = first == "memory" || first == "graphify-out";
+        if !ok_prefix {
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "path must be under memory/ or graphify-out/"}))).into_response();
+        }
+        return match std::fs::read_to_string(&abs) {
+            Ok(text) => Json(serde_json::json!({"path": p, "content": text.chars().take(32_000).collect::<String>()})).into_response(),
+            Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        };
+    }
+    let mut files = Vec::new();
+    for dir in ["memory", "memory/graphify-out", "graphify-out"] {
+        let d = base.join(dir);
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            if e.path().extension().map(|x| x == "md" || x == "json" || x == "html").unwrap_or(false) {
+                files.push(format!("{dir}/{}", e.file_name().to_string_lossy()));
+            }
+        }
+    }
+    files.sort();
+    Json(serde_json::json!({"files": files})).into_response()
 }
 
 async fn todo() -> impl IntoResponse {

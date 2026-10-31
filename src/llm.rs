@@ -710,3 +710,70 @@ mod tests {
         assert_eq!(r.model_for("fast", "build"), "o/m");
     }
 }
+
+/// One live model (OpenRouter-style `context_length`; plain OpenAI has none → 0).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelMeta {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub context_window: u32,
+}
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// Live model listing for pickers (`lumina models`, TUI /model, web picker).
+/// Metadata failures mean "unknown" — never fail a turn over listing.
+pub async fn list_models(def: &ProviderDef) -> Result<Vec<ModelMeta>, LlmError> {
+    match def.kind() {
+        "openai-compatible" => {
+            let url = format!("{}/models", def.base_url.trim_end_matches('/'));
+            let res = client().get(&url).headers(auth_headers(def)).send().await?;
+            if !res.status().is_success() {
+                return Err(LlmError::Msg(format!("models {url}: {}", res.status())));
+            }
+            let v: serde_json::Value = res.json().await?;
+            let mut out = Vec::new();
+            if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                for m in arr {
+                    let id = m.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                    if id.is_empty() {
+                        continue;
+                    }
+                    out.push(ModelMeta {
+                        name: id.clone(),
+                        id,
+                        context_window: m
+                            .get("context_length")
+                            .or_else(|| m.get("context_window"))
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0) as u32,
+                    });
+                }
+            }
+            out.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(out)
+        }
+        "ollama" => {
+            let url = format!("{}/api/tags", def.base_url.trim_end_matches('/'));
+            let res = client().get(&url).send().await?;
+            if !res.status().is_success() {
+                return Err(LlmError::Msg(format!("models {url}: {}", res.status())));
+            }
+            let v: serde_json::Value = res.json().await?;
+            let mut out = Vec::new();
+            if let Some(arr) = v.get("models").and_then(|d| d.as_array()) {
+                for m in arr {
+                    let name = m.get("name").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                    if !name.is_empty() {
+                        out.push(ModelMeta { id: name.clone(), name, context_window: 0 });
+                    }
+                }
+            }
+            out.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(out)
+        }
+        _ => Ok(Vec::new()),
+    }
+}

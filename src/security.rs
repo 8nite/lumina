@@ -121,8 +121,14 @@ pub fn decide(e: &Eval) -> Decision {
         return Decision::Deny;
     }
     let tool = e.tool.as_str();
-    let is_read = matches!(tool, "read" | "glob" | "grep" | "kb_query" | "skill" | "lsp");
-    let is_edit = matches!(tool, "edit" | "write" | "patch");
+    let is_read = matches!(
+        tool,
+        "read" | "read_file" | "glob" | "grep" | "kb_query" | "skill" | "lsp" | "question"
+    );
+    let is_edit = matches!(
+        tool,
+        "edit" | "edit_file" | "write" | "write_file" | "patch" | "memory_write" | "todowrite"
+    );
     let is_bash = tool == "bash";
 
     // Plan structural fence (even under bypass).

@@ -4,7 +4,7 @@
 
 use crate::{
     llm::{self, Chunk, Request, Router, ToolSpec},
-    rules::RuleSet,
+    rules::Bundle,
     security::{Agent, PermissionMode},
     store::Store,
     tools::{Registry, SecCtx},
@@ -48,24 +48,25 @@ impl Runner {
             ToolSpec { name: "bash".into(), description: "Run a shell command in the workspace.".into(), schema: obj(&["command", "timeout_ms"]) },
             ToolSpec { name: "grep".into(), description: "Regex-search workspace files.".into(), schema: obj(&["pattern", "include"]) },
             ToolSpec { name: "glob".into(), description: "List workspace paths by glob.".into(), schema: obj(&["pattern"]) },
+            ToolSpec { name: "kb_query".into(), description: "Query Markdown+graphify memory before grepping code. Prefer for durable knowledge.".into(), schema: obj(&["query", "budget"]) },
+            ToolSpec { name: "memory_write".into(), description: "Save a durable fact to ./memory/<topic>.md (deduped, secrets rejected).".into(), schema: obj(&["topic", "content"]) },
+            ToolSpec { name: "skill".into(), description: "Load a full SKILL.md body by name (only name+description are advertised).".into(), schema: obj(&["name"]) },
         ]
     }
 
-    fn system_prompt(bundle: &RuleSet, agent: Agent) -> String {
-        let mut s = String::from(
-            "You are Lumina, a local-first coding agent. Answer with tool calls when action helps; otherwise reply directly.\n",
-        );
+    fn system_prompt(bundle: &Bundle, agent: Agent) -> String {
+        let mut s = bundle.system_prompt.clone();
+        s.push_str("\nYou are Lumina, a local-first coding agent. Answer with tool calls when action helps; otherwise reply directly.\n");
         if agent == Agent::Plan {
             s.push_str("PLAN MODE: research and blueprint only. Never edit source files; scoped writes to plan.md or .lumina/plans/*.md only.\n");
         }
-        for (path, body) in &bundle.layers {
-            s.push_str(&format!("\n--- rule {} ---\n{}\n", path.display(), body));
-        }
+        s.push_str("Tool guidance: prefer kb_query over grep for durable knowledge; batch independent reads; quote file:line references.\n");
+        s.push_str(&bundle.skills_block());
         s
     }
 
     /// Run one user turn to completion. `on_event` receives streaming deltas
-    /// (used by SSE in M2+; headless `run` ignores it).
+    /// (SSE broker in server mode; headless `run` ignores it).
     pub async fn run_prompt(
         &self,
         store: &Store,
@@ -73,6 +74,7 @@ impl Runner {
         session_id: &str,
         text: &str,
         effort: &str,
+        compat: (bool, bool),
         mut on_event: impl FnMut(&str, &str) + Send,
     ) -> Result<String, AgentError> {
         let sess = store
@@ -86,7 +88,7 @@ impl Runner {
             "auto-approve" => PermissionMode::AutoApprove,
             _ => PermissionMode::Bypass,
         };
-        let bundle = crate::rules::discover(&workspace, true);
+        let bundle = Bundle::load(&workspace, compat.0, compat.1);
         store.add_turn(session_id, "user", text)?;
 
         let mut messages = vec![llm::Message {
@@ -102,7 +104,12 @@ impl Runner {
         }
         messages.push(llm::Message { role: "user".into(), content: text.into(), thinking: String::new() });
 
-        let reg = Registry;
+        let reg = Registry {
+            kb_query: Some(std::sync::Arc::new(|ws, q, b| {
+                crate::kb::query(ws, q, b).map_err(|e| e.to_string())
+            })),
+            bundle: Some(bundle),
+        };
         let sc = SecCtx { workspace: workspace.clone(), agent, mode, headless: true };
         let agent_name = sess.agent.clone();
         let model = sess.model.clone();
@@ -183,7 +190,7 @@ mod tests {
 
     #[test]
     fn plan_system_prompt_fences() {
-        let bundle = RuleSet { layers: vec![] };
+        let bundle = Bundle::default();
         let s = Runner::system_prompt(&bundle, Agent::Plan);
         assert!(s.contains("PLAN MODE"), "{s}");
         let s = Runner::system_prompt(&bundle, Agent::Build);

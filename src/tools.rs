@@ -2,10 +2,14 @@
 //! Mirrors `internal/tools` tool surface (M1: no subagents, no MCP — those
 //! claim their own milestones). Every call is gated by `security::decide`.
 
-use crate::security::{self, Agent, Decision, PermissionMode};
+use crate::{
+    rules::Bundle,
+    security::{self, Agent, Decision, PermissionMode},
+};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use thiserror::Error;
@@ -37,11 +41,23 @@ pub struct Outcome {
     pub truncated: bool,
 }
 
-pub struct Registry;
+pub struct Registry {
+    /// Attached KB engine (agent wires `kb::query` here; absent → clean error).
+    pub kb_query: Option<KbQueryFn>,
+    /// Loaded skill/agent/command bundle for the `skill` tool.
+    pub bundle: Option<Bundle>,
+}
+
+/// `kb::query` adapter: (workspace, query, budget) -> context text.
+pub type KbQueryFn = Arc<dyn Fn(&Path, &str, usize) -> Result<String, String> + Send + Sync>;
 
 impl Registry {
+    pub fn new() -> Self {
+        Self { kb_query: None, bundle: None }
+    }
+
     pub fn names() -> &'static [&'static str] {
-        &["read", "edit", "write", "bash", "grep", "glob"]
+        &["read", "edit", "write", "bash", "grep", "glob", "kb_query", "memory_write", "skill"]
     }
 
     pub fn call(
@@ -77,6 +93,9 @@ impl Registry {
             "bash" => do_bash(sc, args),
             "grep" => do_grep(sc, args),
             "glob" => do_glob(sc, args),
+            "kb_query" => do_kb_query(self, sc, args),
+            "memory_write" => do_memory_write(sc, args),
+            "skill" => do_skill(self, args),
             _ => Err(ToolError::Msg(format!("unknown tool {name}"))),
         }
     }
@@ -92,9 +111,15 @@ fn tool_target(name: &str, args: &HashMap<String, serde_json::Value>) -> String 
     };
     match name {
         "read" | "edit" | "write" => s(&["path", "file", "target"]),
+        "memory_write" => {
+            let t = s(&["topic", "name"]);
+            if t.is_empty() { String::new() } else { format!("memory/{t}") }
+        }
         "bash" => s(&["command", "cmd"]),
         "grep" => s(&["pattern", "query"]),
         "glob" => s(&["pattern", "glob"]),
+        "skill" => s(&["name", "skill"]),
+        "kb_query" => s(&["query", "q"]),
         _ => String::new(),
     }
 }
@@ -329,7 +354,7 @@ mod tests {
     #[test]
     fn read_write_roundtrip() {
         let d = tempfile::tempdir().unwrap();
-        let reg = Registry;
+        let reg = Registry::new();
         let sc = ctx(d.path(), Agent::Build, PermissionMode::Bypass);
         reg.call(&sc, "write", &args(&[("path", "a.txt"), ("content", "hi")])).unwrap();
         let out = reg.call(&sc, "read", &args(&[("path", "a.txt")])).unwrap();
@@ -340,7 +365,7 @@ mod tests {
     fn plan_cannot_edit_source() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("x.rs"), "old").unwrap();
-        let reg = Registry;
+        let reg = Registry::new();
         let sc = ctx(d.path(), Agent::Plan, PermissionMode::Bypass);
         let err = reg.call(&sc, "edit", &args(&[("path", "x.rs"), ("old_string", "old"), ("new_string", "new")])).unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
@@ -349,7 +374,7 @@ mod tests {
     #[test]
     fn headless_ask_becomes_approval_error() {
         let d = tempfile::tempdir().unwrap();
-        let reg = Registry;
+        let reg = Registry::new();
         let sc = ctx(d.path(), Agent::Build, PermissionMode::Ask);
         let err = reg.call(&sc, "bash", &args(&[("command", "ls")])).unwrap_err();
         assert!(matches!(err, ToolError::ApprovalRequired(_)), "{err}");
@@ -364,9 +389,53 @@ mod tests {
     #[test]
     fn escape_denied() {
         let d = tempfile::tempdir().unwrap();
-        let reg = Registry;
+        let reg = Registry::new();
         let sc = ctx(d.path(), Agent::Build, PermissionMode::Bypass);
         let err = reg.call(&sc, "read", &args(&[("path", "../secret")])).unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
+    }
+}
+
+fn do_kb_query(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+    let Some(f) = &reg.kb_query else {
+        return Err(ToolError::Msg("kb_query: engine not attached".into()));
+    };
+    let q = str_arg(args, &["query", "q"]);
+    let budget = args.get("budget").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
+    f(&sc.workspace, &q, budget)
+        .map(|s| {
+            let truncated = s.len() > 6000;
+            Outcome { output: s, truncated }
+        })
+        .map_err(ToolError::Msg)
+}
+
+fn do_memory_write(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+    let topic = str_arg(args, &["topic", "name"]);
+    let content = str_arg(args, &["content", "body"]);
+    crate::kb::memory_write(&sc.workspace, &topic, &content)
+        .map(|s| Outcome { output: s, truncated: false })
+        .map_err(|e| ToolError::Msg(e.to_string()))
+}
+
+fn do_skill(reg: &Registry, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+    let name = str_arg(args, &["name", "skill"]);
+    if name.is_empty() {
+        return Err(ToolError::Msg("skill: missing name".into()));
+    }
+    let Some(b) = &reg.bundle else {
+        return Err(ToolError::Msg("skill: bundle not attached".into()));
+    };
+    match b.skills.iter().find(|s| s.name == name) {
+        Some(sk) => std::fs::read_to_string(&sk.path)
+            .map(|body| {
+                let truncated = body.len() > 8000;
+                Outcome { output: body, truncated }
+            })
+            .map_err(|e| ToolError::Msg(format!("skill {name}: {e}"))),
+        None => {
+            let avail: Vec<&str> = b.skills.iter().map(|s| s.name.as_str()).collect();
+            Err(ToolError::Msg(format!("skill {name:?} not found. Available: {}", avail.join(", "))))
+        }
     }
 }

@@ -8,6 +8,7 @@
 
 mod agent;
 mod config;
+mod kb;
 mod llm;
 mod rules;
 mod security;
@@ -143,7 +144,8 @@ async fn main() -> MainResult {
             }
             let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
             let router = llm::Router::new(&cfg).map_err(|e| format!("router: {e}"))?;
-            let app = server::router(server::AppState::new(store, router));
+            let compat = (cfg.compat.import_global_rules, cfg.compat.import_global_skills);
+            let app = server::router(server::AppState::new(store, router, compat));
             let addr = format!("{host}:{port}");
             tracing::info!(%addr, agent = %cfg.defaults.agent, "lumina serve (rust M1)");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -177,8 +179,9 @@ async fn main() -> MainResult {
                 std::process::exit(64);
             }
             let runner = Runner::new();
+            let compat = (cfg.compat.import_global_rules, cfg.compat.import_global_skills);
             let answer = runner
-                .run_prompt(&store, &router, &sess.id, &text, &llm::normalize_effort(&effort), |_, _| {})
+                .run_prompt(&store, &router, &sess.id, &text, &llm::normalize_effort(&effort), compat, |_, _| {})
                 .await
                 .map_err(|e| format!("{e}"))?;
             if dflt_format == "json" {
@@ -189,6 +192,7 @@ async fn main() -> MainResult {
             Ok(())
         }
         Some(Cmd::Session { args }) => cmd_session(&args),
+        Some(Cmd::Kb { args }) => cmd_kb(&args),
         Some(Cmd::Models { provider }) => {
             let router = llm::Router::new(&cfg).map_err(|e| format!("router: {e}"))?;
             let names: Vec<String> = match provider {
@@ -219,6 +223,46 @@ async fn main() -> MainResult {
         Some(_) => {
             eprintln!("not yet ported in Rust M1 (see plan.md milestones); Go binary still owns this subcommand");
             std::process::exit(66);
+        }
+    }
+}
+
+fn cmd_kb(args: &[String]) -> MainResult {
+    let ws = cwd();
+    let wpath = PathBuf::from(&ws);
+    match args.first().map(|s| s.as_str()) {
+        Some("query") => {
+            let q = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            print!("{}", kb::query(&wpath, q, 4000).map_err(|e| format!("{e}"))?);
+            Ok(())
+        }
+        Some("update") => {
+            let (Some(topic), Some(note)) = (args.get(1), args.get(2)) else {
+                eprintln!("usage: lumina kb update <topic> \"<note>\"");
+                std::process::exit(64);
+            };
+            println!("{}", kb::memory_write(&wpath, topic, note).map_err(|e| format!("{e}"))?);
+            Ok(())
+        }
+        Some("reflect") => {
+            print!("{}", kb::reflect(&wpath));
+            Ok(())
+        }
+        Some("status") => {
+            for rel in ["memory/graphify-out/graph.json", "graphify-out/graph.json"] {
+                let p = wpath.join(rel);
+                if p.exists() {
+                    let g = kb::Graph::load(&p).map_err(|e| format!("{e}"))?;
+                    println!("{rel}: {} nodes, {} edges", g.nodes.len(), g.edges.len());
+                } else {
+                    println!("{rel}: missing");
+                }
+            }
+            Ok(())
+        }
+        _ => {
+            eprintln!("usage: lumina kb [query \"<q>\"|update <topic> \"<note>\"|reflect|status]");
+            std::process::exit(64);
         }
     }
 }
