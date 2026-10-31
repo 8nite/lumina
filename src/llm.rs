@@ -8,6 +8,10 @@ use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+/// Per-request LLM ceiling: a silent gateway stream fails the turn instead
+/// of hanging it forever (the drain loop only ends on a terminal chunk).
+pub const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[derive(Debug, Error)]
 pub enum LlmError {
     #[error("llm: {0}")]
@@ -106,6 +110,18 @@ pub fn valid_effort(s: &str) -> bool {
     )
 }
 
+/// Render "" as "auto" for pills and pickers (Go EffortLabel parity).
+pub fn effort_label(s: &str) -> &str {
+    match normalize_effort(s) {
+        "" => "auto",
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        _ => "max",
+    }
+}
+
 /// Anthropic thinking budget ladder (must be >= 1024 when set).
 pub fn effort_budget(effort: &str) -> u32 {
     match normalize_effort(effort) {
@@ -133,6 +149,7 @@ impl ProviderDef {
     fn kind(&self) -> &str {
         match self.protocol.as_str() {
             "" | "openai-compatible" => "openai-compatible",
+            "openai-responses" | "responses" => "openai-responses",
             "anthropic-compatible" => "anthropic-compatible",
             "ollama" => "ollama",
             other => other,
@@ -392,6 +409,7 @@ impl Router {
         }
         let w = match def.kind() {
             "openai-compatible" | "copilot" => self.openai_window(&def, &mid).await,
+            "anthropic-compatible" | "openai-responses" | "responses" => self.openai_window(&def, &mid).await,
             "ollama" => ollama_window(&def, &mid).await,
             _ => 0,
         };
@@ -434,6 +452,8 @@ impl Router {
         };
         match def.kind() {
             "openai-compatible" => openai_models(&def, &[]).await,
+            "openai-responses" | "responses" => openai_models(&def, &[]).await,
+            "anthropic-compatible" => openai_models(&def, &[]).await,
             "copilot" => {
                 let sess = self.copilot_session(provider, &def).await?;
                 let mut tmp = def.clone();
@@ -512,11 +532,15 @@ async fn chat_openai(
     extra_headers: &[(&str, String)],
 ) -> Result<Usage, LlmError> {
     let url = format!("{}/chat/completions", def.base_url.trim_end_matches('/'));
+    // Vision rides the LAST user message only (Go parity); earlier user
+    // turns stay text so the model doesn't re-see stale images every round.
+    let last_user_idx = req.messages.iter().rposition(|m| m.role == "user");
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
-        .map(|m| {
-            if req.images.is_empty() || m.role != "user" {
+        .enumerate()
+        .map(|(i, m)| {
+            if req.images.is_empty() || Some(i) != last_user_idx {
                 return serde_json::json!({"role": m.role, "content": m.content});
             }
             // Vision shape: text part + one image_url part per attachment.
@@ -529,13 +553,22 @@ async fn chat_openai(
             serde_json::json!({"role": m.role, "content": parts})
         })
         .collect();
-    let body = serde_json::json!({
+    // Go parity: only send tools/max_tokens/reasoning_effort when set.
+    let mut body = serde_json::json!({
         "model": req.model,
         "messages": messages,
-        "tools": openai_tools(&req.tools),
         "stream": true,
         "stream_options": {"include_usage": true},
     });
+    if req.max_tokens > 0 {
+        body["max_tokens"] = serde_json::json!(req.max_tokens);
+    }
+    if !normalize_effort(&req.reasoning_effort).is_empty() {
+        body["reasoning_effort"] = serde_json::json!(normalize_effort(&req.reasoning_effort));
+    }
+    if !req.tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(openai_tools(&req.tools));
+    }
     let mut http = client().post(&url).headers(auth_headers(def));
     for (k, v) in extra_headers {
         http = http.header(*k, v.clone());
@@ -858,6 +891,10 @@ pub struct ModelMeta {
     pub name: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub context_window: u32,
+    /// Provider-advertised reasoning ladder for this model; empty = unknown,
+    /// fall back to the hardcoded ladder (Go SupportedEfforts parity).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_efforts: Vec<String>,
 }
 fn is_zero(n: &u32) -> bool {
     *n == 0
@@ -890,8 +927,18 @@ async fn openai_models(def: &ProviderDef, extra: &[(&str, String)]) -> Result<Ve
                 context_window: m
                     .get("context_length")
                     .or_else(|| m.get("context_window"))
+                    .or_else(|| m.get("max_context_window"))
                     .and_then(|n| n.as_u64())
                     .unwrap_or(0) as u32,
+                supported_efforts: m
+                    .get("supported_efforts")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
     }
@@ -911,7 +958,7 @@ async fn ollama_models(def: &ProviderDef) -> Result<Vec<ModelMeta>, LlmError> {
         for m in arr {
             let name = m.get("name").and_then(|i| i.as_str()).unwrap_or("").to_string();
             if !name.is_empty() {
-                out.push(ModelMeta { id: name.clone(), name, context_window: 0 });
+                out.push(ModelMeta { id: name.clone(), name, context_window: 0, supported_efforts: Vec::new() });
             }
         }
     }
@@ -959,7 +1006,9 @@ async fn chat_responses(
     let url = format!("{}/responses", def.base_url.trim_end_matches('/'));
     let mut instructions = String::new();
     let mut input = Vec::new();
-    for m in &req.messages {
+    // Vision rides the LAST user message only (Go parity).
+    let last_user_idx = req.messages.iter().rposition(|m| m.role == "user" && m.role != "system" && m.role != "tool");
+    for (i, m) in req.messages.iter().enumerate() {
         if m.role == "system" {
             if !instructions.is_empty() {
                 instructions.push('\n');
@@ -971,7 +1020,7 @@ async fn chat_responses(
             continue; // Responses replays via encrypted reasoning, not tool role
         }
         // Vision shape on the last user message when images are attached.
-        if !req.images.is_empty() && m.role == "user" {
+        if !req.images.is_empty() && Some(i) == last_user_idx {
             let mut parts = vec![serde_json::json!({"type": "input_text", "text": m.content})];
             for im in &req.images {
                 let mt = if im.media_type.is_empty() { "image/png" } else { &im.media_type };
@@ -984,6 +1033,11 @@ async fn chat_responses(
         }
     }
     let mut body = serde_json::json!({"model": req.model, "stream": true, "input": input});
+    if std::env::var("LUMINA_DEBUG_SSE").is_ok() {
+        if let Ok(b) = serde_json::to_string(&body) {
+            eprintln!("[responses-req] model={} msgs={} tools={} bytes={} head={:.300}", req.model, req.messages.len(), req.tools.len(), b.len(), b);
+        }
+    }
     if !instructions.is_empty() {
         body["instructions"] = serde_json::json!(instructions);
     }
@@ -996,11 +1050,13 @@ async fn chat_responses(
                 "parameters": if t.schema.is_null() { serde_json::json!({"type":"object"}) } else { t.schema.clone() }})
         ).collect::<Vec<_>>());
     }
+    // One routing session for both gateway headers (Go parity: single sid).
+    let sid = uuid::Uuid::new_v4().to_string();
     let res = client()
         .post(&url)
         .headers(auth_headers(def))
-        .header("x-lumina-session", uuid::Uuid::new_v4().to_string())
-        .header("x-opencode-session", uuid::Uuid::new_v4().to_string())
+        .header("x-lumina-session", &sid)
+        .header("x-opencode-session", &sid)
         .json(&body)
         .send()
         .await?;
@@ -1248,5 +1304,83 @@ mod responses_tests {
 
     fn llm_message(role: &str, content: &str) -> Message {
         Message { role: role.into(), content: content.into(), thinking: String::new() }
+    }
+}
+
+#[cfg(test)]
+mod mixed_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Fake SSE server replaying a fixed script, fed line-by-line.
+    fn serve_script(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else { return };
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                let mut b = [0u8; 1];
+                if s.read(&mut b).is_err() {
+                    return;
+                }
+                head.push(b[0]);
+            }
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        });
+        (format!("http://{addr}"), h)
+    }
+
+    #[tokio::test]
+    async fn delta_text_plus_tool_call_survive() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"working\"}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"x\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\\\"a\"}\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\"}\n\n",
+        );
+        let (base, h) = serve_script(body);
+        let def = ProviderDef {
+            protocol: "openai-responses".into(),
+            base_url: base,
+            api_key: String::new(),
+            github_token: String::new(),
+            token_url: String::new(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = Request {
+            model: "m".into(),
+            messages: vec![Message { role: "user".into(), content: "hi".into(), thinking: String::new() }],
+            tools: vec![],
+            max_tokens: 0,
+            reasoning_effort: String::new(),
+            images: vec![],
+        };
+        chat_responses(&def, req, tx).await.expect("stream");
+        let mut text = String::new();
+        let mut calls = 0;
+        let mut done = false;
+        while let Some(c) = rx.recv().await {
+            text.push_str(&c.delta);
+            calls += c.tool_calls.len();
+            if c.done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(text, "working", "delta text must survive alongside tool calls");
+        assert_eq!(calls, 1, "tool call must survive alongside delta text");
+        h.join().unwrap();
     }
 }

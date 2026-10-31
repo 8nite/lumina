@@ -489,3 +489,12 @@ mod claim_tests {
         assert!(s.claim_turn(&sess.id, "daemon-c", -1)); // stale: taken over
     }
 }
+
+impl Store {
+    /// Release every in-flight turn slot (daemon boot: a fresh process owns
+    /// no live turns, so any leftover claim is a crash artifact).
+    pub fn clear_all_claims(&self) -> Result<usize, StoreError> {
+        let db = self.db.lock().unwrap();
+        Ok(db.execute("UPDATE sessions SET inflight_owner='', inflight_since=0 WHERE inflight_owner != ''", [])? as usize)
+    }
+}

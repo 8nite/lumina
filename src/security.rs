@@ -29,12 +29,20 @@ pub enum Decision {
 }
 
 const CREDENTIAL_FILES: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.production",
     "auth.json",
     "lumina.json",
     "credentials.json",
-    ".env",
+    ".npmrc",
+    ".pypirc",
+    "id_rsa",
+    "id_ed25519",
     ".pem",
     ".key",
+    "vault",
+    "secrets",
 ];
 const CREDENTIAL_SUBSTRINGS: &[&str] = &[
     ".env",
@@ -46,6 +54,10 @@ const CREDENTIAL_SUBSTRINGS: &[&str] = &[
     "private_key",
     ".pem",
     ".key",
+    "vault_exec",
+    "token.json",
+    "id_rsa",
+    "id_ed25519",
 ];
 
 pub fn is_credential_path(target: &str) -> bool {
@@ -54,15 +66,50 @@ pub fn is_credential_path(target: &str) -> bool {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(&lower);
+    // Cluster / identity trees: the whole subtree is sensitive (Go parity).
+    for frag in ["/.kube/", "/.ssh/", "/.aws/", "/.gnupg/", "/etc/ssh/", "/etc/pki/"] {
+        if lower.contains(frag) {
+            return true;
+        }
+    }
+    if lower.ends_with("/.kube")
+        || lower.ends_with("/.ssh")
+        || lower.ends_with("/.aws")
+        || lower.ends_with("/.gnupg")
+    {
+        return true;
+    }
+    if base == "shadow" || base == "gshadow" || base == "master.passwd" {
+        return true;
+    }
     if CREDENTIAL_FILES.contains(&base) {
         return true;
     }
-    CREDENTIAL_SUBSTRINGS.iter().any(|s| lower.contains(s))
+    CREDENTIAL_SUBSTRINGS
+        .iter()
+        .any(|s| base.contains(s) || lower.contains(s))
 }
 
 pub fn is_google_target(target: &str) -> bool {
     let u = target.to_lowercase();
-    u.contains("googleapis.com") || u.contains("google.com") || u.contains("gemini")
+    for b in [
+        "googleapis.com",
+        "generativelanguage",
+        "gemini",
+        "google-workspace",
+        "fonts.googleapis",
+        "vertexai",
+        "aiplatform",
+    ] {
+        if u.contains(b) {
+            return true;
+        }
+    }
+    // Literal secret injection flags are always denied (Go parity).
+    if target.contains("--from-literal=") {
+        return true;
+    }
+    false
 }
 
 /// `plan` may only write `plan.md` or `.lumina/plans/*.md` inside the workspace.
@@ -147,13 +194,46 @@ pub fn is_tooling_doc(target: &str) -> bool {
 }
 
 /// Read-only shell allowlist for plan mode (inspection only, never mutating).
+/// Any shell metacharacter (redirection, pipes, chaining, substitution)
+/// disqualifies the command (Go parity).
 fn is_readonly_bash(cmd: &str) -> bool {
+    let t = cmd.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.contains([';', '|', '&', '$', '`', '>', '<', '\n', '\r']) {
+        return false;
+    }
     let c = cmd.trim_start();
     for p in [
         "git status", "git diff", "git log", "git show", "git branch", "ls", "pwd", "echo ", "cat ",
-        "head ", "tail ", "wc ",
+        "head ", "tail ", "wc ", "find ", "go test", "pnpm test",
     ] {
         if c.starts_with(p) || c == p.trim_end() {
+            // Destructive operators disqualify even "read-only" prefixes.
+            if t.contains("rm ") || t.contains("--force") || t.contains("--hard") {
+                return false;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// rm -rf / force-push / hard-reset style commands (Go parity: caller sets
+/// Eval.destructive, but plan fence + tests use this directly).
+pub fn is_destructive_bash(cmd: &str) -> bool {
+    let lc = cmd.to_lowercase();
+    for p in [
+        "rm -rf",
+        "rm --recursive --force",
+        "git push --force",
+        "git reset --hard",
+        "mkfs",
+        ":(){",
+        "dd if=",
+    ] {
+        if lc.contains(p) {
             return true;
         }
     }

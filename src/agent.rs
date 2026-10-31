@@ -36,10 +36,16 @@ pub struct Runner {
 
 impl Runner {
     pub fn new() -> Self {
-        Self { max_steps: 16, approval: None, plugins: None }
+        // Auto-continue ceiling: must match Go hardCap (120). The old 16
+        // ended long tasks with a silent stop that forced `continue`.
+        Self { max_steps: 120, approval: None, plugins: None }
     }
 
     fn tool_specs() -> Vec<ToolSpec> {
+        Self::tool_specs_filtered(false)
+    }
+
+    fn tool_specs_filtered(hide_websearch: bool) -> Vec<ToolSpec> {
         let obj = |props: &[&str]| {
             serde_json::json!({
                 "type": "object",
@@ -52,27 +58,32 @@ impl Runner {
             ToolSpec { name: "write".into(), description: "Create or overwrite a workspace file.".into(), schema: obj(&["path", "content"]) },
             ToolSpec { name: "bash".into(), description: "Run a shell command in the workspace.".into(), schema: obj(&["command", "timeout_ms"]) },
             ToolSpec { name: "grep".into(), description: "Regex-search workspace files.".into(), schema: obj(&["pattern", "include"]) },
+            ToolSpec { name: "lsp".into(), description: "Code intelligence: symbols/refs (grep-backed alias).".into(), schema: obj(&["pattern", "include"]) },
             ToolSpec { name: "glob".into(), description: "List workspace paths by glob.".into(), schema: obj(&["pattern"]) },
-            ToolSpec { name: "kb_query".into(), description: "Query Markdown+graphify memory before grepping code. Prefer for durable knowledge.".into(), schema: obj(&["query", "budget"]) },
+            ToolSpec { name: "kb_query".into(), description: "Query Markdown+graphify memory before grepping code. Prefer for durable knowledge.".into(), schema: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}, "budget": {"type": "integer"}}}) },
             ToolSpec { name: "memory_write".into(), description: "Save a durable fact to ./memory/<topic>.md (deduped, secrets rejected).".into(), schema: obj(&["topic", "content"]) },
             ToolSpec { name: "skill".into(), description: "Load a full SKILL.md body by name (only name+description are advertised).".into(), schema: obj(&["name"]) },
-            ToolSpec { name: "question".into(), description: "Ask the user a clarifying question with options (interactive sessions only).".into(), schema: obj(&["questions"]) },
+            ToolSpec { name: "question".into(), description: "Ask the user a clarifying question with options (interactive sessions only).".into(), schema: serde_json::json!({"type": "object", "properties": {"questions": {"type": "array", "items": {"type": "object", "properties": {"text": {"type": "string"}, "options": {"type": "array", "items": {"type": "string"}}}, "required": ["text"]}}}, "required": ["questions"]}) },
             ToolSpec { name: "websearch".into(), description: "Search the web for current info (needs a provider key; pick with [websearch] provider).".into(), schema: obj(&["query", "provider"]) },
             ToolSpec { name: "webfetch".into(), description: "Fetch one HTTP(S) URL as markdown/text/HTML (cap 100KB).".into(), schema: obj(&["url", "format"]) },
             ToolSpec { name: "mcp".into(), description: "Call a local MCP tool (stdio/SSE; see .lumina/mcp.json).".into(), schema: obj(&["server", "tool", "args"]) },
             ToolSpec { name: "subagent".into(), description: "Launch a scoped subagent (general|explore). Subagents cannot delegate further.".into(), schema: obj(&["task", "agent"]) },
-            ToolSpec { name: "todowrite".into(), description: "Track task progress as a todo list.".into(), schema: obj(&["todos"]) },
+            ToolSpec { name: "todowrite".into(), description: "Track task progress as a todo list.".into(), schema: serde_json::json!({"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string"}}, "required": ["content"]}}}}) },
             ToolSpec { name: "patch".into(), description: "Apply a unified diff (---/+++ with @@ hunks) with exact context matching.".into(), schema: obj(&["patch"]) },
         ]
+        .into_iter()
+        .filter(|t| !(hide_websearch && t.name == "websearch"))
+        .collect()
     }
 
     fn system_prompt(bundle: &Bundle, agent: Agent) -> String {
         let mut s = bundle.system_prompt.clone();
         s.push_str("\nYou are Lumina, a local-first coding agent. Answer with tool calls when action helps; otherwise reply directly.\n");
+        s.push_str("Persistence: continue the ORIGINAL user request until fully complete (all edits applied, tests/build pass). Do NOT stop with a status summary, do NOT ask the user to say 'continue', and do NOT end with 'what I found' when fixes were requested — finish the work, then reply with the completed result.\n");
         if agent == Agent::Plan {
             s.push_str("PLAN MODE: research and blueprint only. Never edit source files; scoped writes to plan.md or .lumina/plans/*.md only.\n");
         }
-        s.push_str("Tool guidance: prefer kb_query over grep for durable knowledge; batch independent reads; quote file:line references.\n");
+        s.push_str("Tool guidance: prefer kb_query over grep for durable knowledge; batch independent reads; quote file:line references. After tool results arrive, keep going until done; call more tools if anything remains.\n");
         s.push_str(&bundle.skills_block());
         s
     }
@@ -193,6 +204,7 @@ impl Runner {
         } else {
             sess.model.clone()
         };
+        let hide_websearch = cfg.websearch.disabled;
         let final_text = self
             .loop_until_done(
                 router,
@@ -207,6 +219,7 @@ impl Runner {
                 store,
                 session_id,
                 &user_turn.id,
+                hide_websearch,
             )
             .await?;
         store.add_turn(session_id, "assistant", &final_text)?;
@@ -227,15 +240,17 @@ impl Runner {
         store: &Store,
         session_id: &str,
         user_turn_id: &str,
+        hide_websearch: bool,
     ) -> Result<String, AgentError> {
         let mut last_text = String::new();
+        let mut last_nonempty = String::new();
         let mut snapshotted = false;
-        for _ in 0..self.max_steps {
+        for round in 0..self.max_steps {
             let (tx, mut rx) = mpsc::unbounded_channel::<Chunk>();
             let req = Request {
                 model: model.into(),
                 messages: messages.clone(),
-                tools: Self::tool_specs(),
+                tools: Self::tool_specs_filtered(hide_websearch),
                 max_tokens: 0,
                 reasoning_effort: effort.into(),
                 images: images.to_vec(),
@@ -245,7 +260,13 @@ impl Runner {
             let router2 = router.clone();
             let role2 = role.to_string();
             let agent2 = agent_name.to_string();
-            let handle = tokio::spawn(async move { router2.chat_stream(&role2, &agent2, req, tx).await });
+            // A silent gateway stream fails the turn instead of hanging the drain.
+        let handle = tokio::spawn(async move {
+            match tokio::time::timeout(crate::llm::STREAM_TIMEOUT, router2.chat_stream(&role2, &agent2, req, tx)).await {
+                Ok(inner) => inner,
+                Err(_) => Err(crate::llm::LlmError::Msg("llm: stream timed out (no response for 600s)".into())),
+            }
+        });
             let mut calls = Vec::new();
             while let Some(c) = rx.recv().await {
                 if !c.delta.is_empty() || !c.thinking.is_empty() {
@@ -266,6 +287,10 @@ impl Runner {
                 return Ok(last_text);
             }
             // Execute requested tools, feed results back as user messages.
+            if std::env::var("LUMINA_DEBUG_SSE").is_ok() {
+                let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                eprintln!("[agent] iter calls: {names:?}");
+            }
             // Shadow-Git pre-image: snapshot before the first mutating tool
             // runs, so /undo restores the pre-turn tree (best-effort).
             if !snapshotted && calls.iter().any(|tc| is_mutating(&tc.name)) {
@@ -302,10 +327,29 @@ impl Runner {
                 on_event("", &rendered);
                 messages.push(llm::Message { role: "user".into(), content: format!("[tool result {}]\n{rendered}", tc.name), thinking: String::new() });
             }
-            messages.push(llm::Message { role: "assistant".into(), content: last_text.clone(), thinking: String::new() });
+            // Continuation nudge: the model must not stop with a partial
+            // summary while work remains. Checkpoint every 8 rounds so long
+            // tasks restate done-vs-remaining and keep going.
+            if (round + 1) % 8 == 0 {
+                messages.push(llm::Message { role: "user".into(), content: "Checkpoint: briefly note what is done vs remaining, then CONTINUE until the original request is fully done (all edits applied, tests/build pass). Do NOT stop with a status summary or ask the user to say 'continue'; call more tools if anything remains, else give the final completed answer.".into(), thinking: String::new() });
+            } else {
+                messages.push(llm::Message { role: "user".into(), content: "Continue the task until the original request is fully complete; call more tools if anything remains, else give the final completed answer. Do NOT end with a partial summary when work is still pending.".into(), thinking: String::new() });
+            }
+            // Skip empty assistant echoes so the model doesn't pattern-match
+            // its own filler ("I'll query...") into a retry loop.
+            if !last_text.trim().is_empty() {
+                messages.push(llm::Message { role: "assistant".into(), content: last_text.clone(), thinking: String::new() });
+                last_nonempty = last_text.clone();
+            }
             last_text.clear();
         }
-        Ok(last_text)
+        // Exhausted ceiling with tools still pending: return the last real
+        // model text plus an explicit resume pointer instead of an empty
+        // turn (empty turns read as silent stops and force `continue`).
+        if last_nonempty.trim().is_empty() {
+            return Ok("Tool budget exhausted after 120 tool rounds with work still pending. Say `continue` to resume: the next turn should list exactly what remains and the precise next tool calls (names + arguments).".to_string());
+        }
+        Ok(last_nonempty)
     }
 }
 
@@ -373,7 +417,7 @@ async fn run_subtask(
     ];
     let model = if def.model.is_empty() { String::new() } else { def.model.clone() };
     let mut last = String::new();
-    for _ in 0..6 {
+    for _ in 0..32 {
         let (txs, mut rxs) = mpsc::unbounded_channel::<Chunk>();
         let req = Request {
             model: model.clone(),
@@ -384,7 +428,12 @@ async fn run_subtask(
             images: vec![],
         };
         let router2 = router.clone();
-        let handle = tokio::spawn(async move { router2.chat_stream("executor", "build", req, txs).await });
+        let handle = tokio::spawn(async move {
+            match tokio::time::timeout(crate::llm::STREAM_TIMEOUT, router2.chat_stream("executor", "build", req, txs)).await {
+                Ok(inner) => inner,
+                Err(_) => Err(crate::llm::LlmError::Msg("llm: stream timed out (no response for 600s)".into())),
+            }
+        });
         let mut calls = Vec::new();
         while let Some(c) = rxs.recv().await {
             if !c.delta.is_empty() {
@@ -497,7 +546,12 @@ impl Runner {
                 images: vec![],
             };
             let router2 = router.clone();
-            let handle = tokio::spawn(async move { router2.chat_stream("fast", "build", req, tx).await });
+            let handle = tokio::spawn(async move {
+            match tokio::time::timeout(crate::llm::STREAM_TIMEOUT, router2.chat_stream("fast", "build", req, tx)).await {
+                Ok(inner) => inner,
+                Err(_) => Err(crate::llm::LlmError::Msg("llm: stream timed out (no response for 600s)".into())),
+            }
+        });
             let mut text = String::new();
             while let Some(c) = rx.recv().await {
                 text.push_str(&c.delta);

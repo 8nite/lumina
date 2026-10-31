@@ -80,7 +80,7 @@ impl Registry {
 
 
     pub fn names() -> &'static [&'static str] {
-        &["read", "edit", "write", "bash", "grep", "glob", "kb_query", "memory_write", "skill", "question", "websearch", "webfetch", "mcp", "subagent", "todowrite", "patch"]
+        &["read", "edit", "write", "bash", "shell", "grep", "lsp", "glob", "kb_query", "memory_write", "skill", "question", "websearch", "webfetch", "mcp", "subagent", "todowrite", "patch"]
     }
 
     pub fn call(
@@ -156,8 +156,8 @@ impl Registry {
             "read" => do_read(sc, &args),
             "edit" => do_edit(sc, &args),
             "write" => do_write(sc, &args),
-            "bash" => do_bash(self, sc, &args),
-            "grep" => do_grep(sc, &args),
+            "bash" | "shell" => do_bash(self, sc, &args),
+            "grep" | "lsp" => do_grep(sc, &args),
             "glob" => do_glob(sc, &args),
             "kb_query" => do_kb_query(self, sc, &args),
             "memory_write" => do_memory_write(sc, &args),
@@ -210,8 +210,8 @@ fn tool_target(name: &str, args: &HashMap<String, serde_json::Value>) -> String 
             let t = s(&["topic", "name"]);
             if t.is_empty() { String::new() } else { format!("memory/{t}") }
         }
-        "bash" => s(&["command", "cmd"]),
-        "grep" => s(&["pattern", "query"]),
+        "bash" | "shell" => s(&["command", "cmd"]),
+        "grep" | "lsp" => s(&["pattern", "query"]),
         "glob" => s(&["pattern", "glob"]),
         "skill" => s(&["name", "skill"]),
         "kb_query" => s(&["query", "q"]),
@@ -226,13 +226,14 @@ fn tool_target(name: &str, args: &HashMap<String, serde_json::Value>) -> String 
 }
 
 fn is_destructive(cmd: &str) -> bool {
-    let c = cmd.to_lowercase();
-    c.contains("rm -rf")
-        || c.contains("git push --force")
-        || c.contains("git push -f")
-        || c.contains("git reset --hard")
-        || c.contains("mkfs")
-        || c.contains(":(){")
+    // Delegate to the security floor (Go IsDestructiveBash parity).
+    crate::security::is_destructive_bash(cmd)
+}
+
+fn int_arg(args: &HashMap<String, serde_json::Value>, key: &str, d: u64) -> u64 {
+    args.get(key)
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+        .unwrap_or(d)
 }
 
 fn str_arg(args: &HashMap<String, serde_json::Value>, keys: &[&str]) -> String {
@@ -466,7 +467,7 @@ fn do_kb_query(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::V
         return Err(ToolError::Msg("kb_query: engine not attached".into()));
     };
     let q = str_arg(args, &["query", "q"]);
-    let budget = args.get("budget").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
+    let budget = int_arg(args, "budget", 4000) as usize;
     f(&sc.workspace, &q, budget)
         .map(|s| {
             let truncated = s.len() > 6000;
@@ -548,7 +549,7 @@ fn do_webfetch(args: &HashMap<String, serde_json::Value>) -> Result<Outcome, Too
     let url = str_arg(args, &["url"]);
     let format = str_arg(args, &["format"]);
     let format = if format.is_empty() { "markdown" } else { &format };
-    let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000).min(120_000);
+    let timeout_ms = int_arg(args, "timeout_ms", 30_000).min(120_000);
     crate::websearch::fetch(&url, format, std::time::Duration::from_millis(timeout_ms))
         .map(|(s, t)| Outcome { output: s, truncated: t })
         .map_err(|e| ToolError::Msg(e.to_string()))

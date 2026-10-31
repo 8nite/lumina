@@ -247,6 +247,8 @@ async fn main() -> MainResult {
                 }
             }
             let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
+            // Crash recovery: a fresh daemon owns no live turns.
+            let _ = store.clear_all_claims();
             let router = llm::Router::new(&cfg).map_err(|e| format!("router: {e}"))?;
             let app = server::router(server::AppState::new(store, router, cfg.clone(), config_path()));
             let addr = format!("{host}:{port}");
@@ -526,6 +528,8 @@ async fn ensure_daemon(base: &str, cfg: &config::Config) -> MainResult {
         return Err(format!("no daemon at {base} (set LUMINA_TOKEN for remote attach)").into());
     }
     let store = store::Store::open(None).map_err(|e| format!("store: {e}"))?;
+    // Crash recovery: a fresh daemon owns no live turns.
+    let _ = store.clear_all_claims();
     let router = llm::Router::new(cfg).map_err(|e| format!("router: {e}"))?;
     let app = server::router(server::AppState::new(store, router, cfg.clone(), config_path()));
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;

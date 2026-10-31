@@ -64,6 +64,9 @@ pub struct ProviderConfig {
     pub api_key_env: String,
     #[serde(default)]
     pub api_key_cmd: String,
+    /// Copilot token-exchange endpoint override (GHES). Go parity.
+    #[serde(default)]
+    pub token_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -95,6 +98,9 @@ impl RouterConfig {
 pub struct WebSearchConfig {
     #[serde(default)]
     pub provider: String,
+    /// Kill-switch: when true the websearch tool is removed (Go parity).
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -103,6 +109,9 @@ pub struct KbConfig {
     pub idle_debounce_minutes: u64,
     #[serde(default)]
     pub standing_ops: bool,
+    /// Rebuild workspace AST graph on git commit (Go parity; honored by hooks).
+    #[serde(default)]
+    pub auto_commit_ast_hook: bool,
 }
 fn default_idle() -> u64 {
     15
@@ -198,11 +207,18 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         const PROTOCOLS: &[&str] = &[
+            "",
             "openai-compatible",
             "openai-responses",
+            "responses",
             "anthropic-compatible",
             "ollama",
             "copilot",
+        ];
+        const CREDENTIAL_ENV_BLOCKLIST: &[&str] = &[
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
         ];
         for (name, p) in &self.providers {
             if !PROTOCOLS.contains(&p.protocol.as_str()) {
@@ -215,6 +231,28 @@ impl Config {
                 return Err(ConfigError::Msg(format!(
                     "config: provider {name:?}: Google endpoints are blocked (zero-Google rule)"
                 )));
+            }
+            if is_google_url(&p.token_url) {
+                return Err(ConfigError::Msg(format!(
+                    "config: provider {name:?} token_url: Google endpoints are blocked"
+                )));
+            }
+            if CREDENTIAL_ENV_BLOCKLIST.contains(&p.api_key_env.as_str()) {
+                return Err(ConfigError::Msg(format!(
+                    "config: provider {name:?} uses blocked Google credential env {:?}",
+                    p.api_key_env
+                )));
+            }
+            if !p.api_key_cmd.is_empty() {
+                let lc = p.api_key_cmd.to_lowercase();
+                if lc.contains("gemini")
+                    || lc.contains("google-workspace")
+                    || lc.contains("google_workspace")
+                {
+                    return Err(ConfigError::Msg(format!(
+                        "config: provider {name:?} api_key_cmd touches a Google path"
+                    )));
+                }
             }
         }
         let ws = self.websearch.provider.trim().to_lowercase();
@@ -257,7 +295,24 @@ impl Config {
 
 pub fn is_google_url(url: &str) -> bool {
     let u = url.to_lowercase();
-    u.contains("googleapis.com") || u.contains("google.com") || u.contains("gemini")
+    for b in [
+        "googleapis.com",
+        "google.com",
+        "gstatic.com",
+        "fonts.googleapis.com",
+        "fonts.gstatic.com",
+        "generativelanguage",
+        "aiplatform",
+        "vertexai",
+        "gemini",
+        "google-workspace",
+        "bard.google",
+    ] {
+        if u.contains(b) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Hot-swap a tier model and persist it to the config file when one is

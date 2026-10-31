@@ -404,6 +404,7 @@ pub fn reflect(workspace: &Path) -> String {
 /// wikilink read. Returns budgeted context text for the agent.
 pub fn query(workspace: &Path, q: &str, budget: usize) -> Result<String, KbError> {
     let budget = if budget == 0 { 4000 } else { budget };
+    let lq_words: Vec<String> = q.to_lowercase().split_whitespace().map(|w| w.to_string()).collect();
     let mut out = String::from("## reflect\n");
     out.push_str(&reflect(workspace));
     let graph_paths = [
@@ -435,9 +436,51 @@ pub fn query(workspace: &Path, q: &str, budget: usize) -> Result<String, KbError
             break;
         }
     }
-    // Recursive [[wikilink]] resolution from top seeds.
+    // Recursive [[wikilink]] resolution from graph seeds, plus fallbacks
+    // when the graph is missing or silent (note filenames matching query
+    // words + every [[link]] in MEMORY.md — the index is only useful if
+    // something follows its pointers).
     let mem = workspace.join("memory");
-    for s in seeds.iter().take(4) {
+    let mut fb: Vec<String> = Vec::new();
+    if seeds.is_empty() {
+        if let Ok(rd) = std::fs::read_dir(&mem) {
+            let mut names: Vec<String> = rd
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            for n in names {
+                if !n.ends_with(".md") {
+                    continue;
+                }
+                let stem = n.trim_end_matches(".md").to_lowercase();
+                if stem == "memory" || stem.is_empty() {
+                    continue;
+                }
+                if lq_words.iter().any(|w| {
+                    let w = w.as_str();
+                    !w.is_empty() && (stem.contains(w) || w.contains(&stem))
+                }) {
+                    fb.push(stem);
+                }
+                if fb.len() >= 6 {
+                    break;
+                }
+            }
+        }
+        if let Ok(body) = std::fs::read_to_string(mem.join("MEMORY.md")) {
+            for link in wikilinks(&body) {
+                if fb.len() >= 8 {
+                    break;
+                }
+                if !fb.contains(&link) {
+                    fb.push(link);
+                }
+            }
+        }
+    }
+    let all_seeds: Vec<String> = seeds.iter().cloned().chain(fb).take(8).collect();
+    for s in all_seeds.iter().take(6) {
         for (name, body) in resolve_wikilinks(&mem, s, 6) {
             let chunk = format!("\n### [[{name}]]\n{body}\n");
             if out.len() + chunk.len() > budget + 2000 {
@@ -611,5 +654,23 @@ mod sweeper_tests {
         assert_eq!(r2.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(s.run("ws", || { ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst); Ok(()) }).is_ok());
         assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[test]
+    fn no_graph_still_reads_notes() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path();
+        std::fs::create_dir_all(ws.join("memory")).unwrap();
+        std::fs::write(ws.join("memory/MEMORY.md"), "# idx\n\n- [[fruit]]\n").unwrap();
+        std::fs::write(ws.join("memory/fruit.md"), "the magic fruit is kiwi\n").unwrap();
+        // No graphify-out anywhere: seeds must come from MEMORY.md links.
+        let out = query(ws, "magic fruit", 4000).unwrap();
+        assert!(out.contains("kiwi"), "{out}");
+        assert!(out.contains("[[fruit]]"), "{out}");
     }
 }
