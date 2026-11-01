@@ -153,14 +153,20 @@ export const api = {
   prompt: async (id: string, text: string, images?: PromptAttachment[], effort?: string, delivery?: string) => {
     // Retry-safe submit: a 504/proxy timeout usually means the turn STARTED
     // server-side but the response was lost (the daemon drains detached, so
-    // the turn continues). Blindly re-POSTing would steer duplicate text
-    // into the running turn, so on a retryable failure check /state first:
-    // running → return accepted and wait on SSE; idle → cool down + resubmit.
-    const body = { text, images: images || [], effort: effort || '', delivery: delivery || '' };
+    // the turn continues). Every attempt reuses one client-generated
+    // request_id, which the daemon dedups — even an inconclusive /state
+    // probe can't steer duplicate text into the running turn (7614829e).
+    // On a retryable failure check /state first: running → return accepted
+    // and wait on SSE; idle → cool down + resubmit with the same key.
+    const requestId =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const body = { text, images: images || [], effort: effort || '', delivery: delivery || '', request_id: requestId };
     const path = `/api/v1/sessions/${id}/prompt`;
     for (let attempt = 0; ; attempt++) {
       try {
-        return await req<{ status: string; position?: number }>('POST', path, body, 0);
+        return await req<{ status: string; position?: number; deduped?: boolean }>('POST', path, body, 0);
       } catch (e) {
         const retryable = /: (429|502|503|504)\b/.test(String(e)) || e instanceof TypeError;
         if (!retryable || attempt >= 3) throw e;
@@ -168,7 +174,8 @@ export const api = {
           const st = await req<SessionState>('GET', `/api/v1/sessions/${id}/state`, undefined, 2);
           if (st.running) return { status: 'accepted' };
         } catch {
-          /* state check failed; fall through to resubmit */
+          /* state check failed; resubmit with the same request_id — the
+             daemon dedups it if the original POST landed */
         }
         await sleep(cooldownMs(attempt, null));
       }

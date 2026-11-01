@@ -76,6 +76,10 @@ export default function App() {
   const [turnError, setTurnError] = useState<string | null>(null);
   const [changed, setChanged] = useState<{ files: string[]; stat: string } | null>(null);
   const lastPrompt = useRef('');
+  // Submit single-flight: double-Enter/double-tap while a POST is in
+  // flight must not send the same prompt twice (the daemon also dedups
+  // retries by request_id; this stops the second POST at the source).
+  const sendInflight = useRef(false);
   // Synchronous mirror of queued: the SSE callback re-subscribes per
   // session but still sees stale state, so delivery reads the ref and
   // publishes both updates outside of any updater (updaters must be pure).
@@ -709,6 +713,9 @@ export default function App() {
   };
 
   const send = async (delivery: 'steer' | 'queue' = 'steer', overrideText?: string) => {
+    if (sendInflight.current) return;
+    sendInflight.current = true;
+    try {
     const text = (overrideText ?? input).trim();
     if (!text && attachments.length === 0) return;
     setInput('');
@@ -780,6 +787,9 @@ export default function App() {
       setWorking(false);
       setTurnStart(null);
       alert(String(err));
+    }
+    } finally {
+      sendInflight.current = false;
     }
   };
 

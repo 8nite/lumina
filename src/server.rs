@@ -39,6 +39,10 @@ pub struct AppState {
     pub plugins: PluginCache,
     pub sweeper: KbSweeper,
     pub cfg_path: Option<PathBuf>,
+    /// Retry idempotency keys: `{session}\n{request_id}` → first-seen time.
+    /// A client resubmit after a lost response must not steer/queue the
+    /// same text twice (stuck session 7614829e).
+    pub seen_prompts: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 impl AppState {
@@ -70,6 +74,7 @@ impl AppState {
             plugins: PluginCache::new(),
             sweeper: KbSweeper::new(),
             cfg_path,
+            seen_prompts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -316,6 +321,31 @@ pub(crate) struct QueuedPrompt {
     images: Vec<crate::llm::ImageAttachment>,
 }
 
+/// Retry idempotency window: same span as the cross-daemon turn claim.
+const IDEM_TTL_SECS: u64 = 600;
+
+/// Returns true when this (session, request_id) was already submitted
+/// within the window — the caller must NOT steer/queue again. Prunes
+/// expired entries on each call so the map stays bounded.
+fn already_seen(
+    map: &mut HashMap<String, std::time::Instant>,
+    session_id: &str,
+    request_id: &str,
+    now: std::time::Instant,
+) -> bool {
+    map.retain(|_, &mut t| {
+        now.checked_duration_since(t)
+            .map(|d| d.as_secs() < IDEM_TTL_SECS)
+            .unwrap_or(true)
+    });
+    let key = format!("{session_id}\n{request_id}");
+    if map.contains_key(&key) {
+        return true;
+    }
+    map.insert(key, now);
+    false
+}
+
 #[derive(Deserialize)]
 struct PromptBody {
     #[serde(default)]
@@ -327,6 +357,11 @@ struct PromptBody {
     /// Ignored when the session is idle (Go parity).
     #[serde(default)]
     delivery: String,
+    /// Client-generated idempotency key (one per submit; retries reuse it).
+    /// A resubmit with a seen key returns the live status without
+    /// steering/queueing the text again.
+    #[serde(default)]
+    request_id: String,
     /// Attached images (8MB cap each, vision-capable models only).
     #[serde(default)]
     images: Vec<ImageIn>,
@@ -386,6 +421,28 @@ async fn prompt(
     }
     let effort = crate::llm::normalize_effort(&b.effort).to_string();
     let delivery = if b.delivery.trim().is_empty() { "steer".to_string() } else { b.delivery.trim().to_string() };
+    // Retry idempotency: a resubmit with a seen request_id (client retry
+    // after a lost response) returns the live status without steering or
+    // queueing the text again. Checked before the claim so a duplicate
+    // never refreshes it either.
+    let request_id = b.request_id.trim().to_string();
+    if !request_id.is_empty() {
+        let dup = already_seen(
+            &mut st.seen_prompts.lock().unwrap(),
+            &id,
+            &request_id,
+            std::time::Instant::now(),
+        );
+        if dup {
+            let running = st.running.lock().unwrap().contains(&id);
+            let status = if running { "steered" } else { "accepted" };
+            return (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({"status": status, "session_id": id, "deduped": true})),
+            )
+                .into_response();
+        }
+    }
     let _ = st.store.touch(&id);
     // Cross-daemon turn claim: 409 when another daemon holds the turn
     // (mirrors Go ClaimTurn: free, ours, or stale >10min).
@@ -669,7 +726,7 @@ pub fn openapi_spec() -> serde_json::Value {
             "/api/v1/sessions": "list (?directory=, ?latest=1) / create",
             "/api/v1/sessions/{id}": "fetch / patch agent,permission,model,title",
             "/api/v1/sessions/{id}/state": "resync: session + running + pending permission/question",
-            "/api/v1/sessions/{id}/prompt": "submit turn",
+            "/api/v1/sessions/{id}/prompt": "submit turn (request_id dedups client retries)",
             "/api/v1/sessions/{id}/fork": "branch at turn",
             "/api/v1/sessions/{id}/export": "transcript (?sanitize=1)",
             "/api/v1/sessions/{id}/revert": "shadow-git undo (?turn=)",
@@ -1406,6 +1463,19 @@ async fn spa_fallback(uri: axum::http::Uri) -> impl IntoResponse {
 #[cfg(test)]
 mod models_hook_tests {
     use super::*;
+
+    #[test]
+    fn prompt_idempotency_dedups_within_ttl() {
+        let t0 = std::time::Instant::now();
+        let mut map = HashMap::new();
+        assert!(!already_seen(&mut map, "s1", "k1", t0), "first submit passes");
+        assert!(already_seen(&mut map, "s1", "k1", t0), "immediate resubmit dedups");
+        assert!(!already_seen(&mut map, "s1", "k2", t0), "different key passes");
+        assert!(!already_seen(&mut map, "s2", "k1", t0), "different session passes");
+        let later = t0 + std::time::Duration::from_secs(IDEM_TTL_SECS + 1);
+        assert!(!already_seen(&mut map, "s1", "k1", later), "expired key passes again");
+        assert_eq!(map.len(), 1, "expired entries pruned, got {map:?}");
+    }
 
     fn meta(id: &str, window: u32) -> crate::llm::ModelMeta {
         crate::llm::ModelMeta {

@@ -117,3 +117,22 @@ Err path persisted nothing (turn.failed is SSE-only). Fix in
 Tests: `drive_one_retries_transient_failure` (500 then green),
 `drive_one_persists_failure_note` (500 always → 2 attempts + note).
 81bdb764 quit-early case: fix request ended after 11 explore calls, zero edits, duplicated filler. Added no-progress gate (looks_like_work, 2 forced rounds, silent release) + TurnRelease Drop guard so a panicking drain never wedges the session. Backend-continuation audit: detached drain survives browser close; approval/question bounded 600s.
+d3539f35: turn died on model-call error with no transcript trace. drive_one now retries once after 5s then persists Turn failed note with resume pointer. Daemon stderr kept at .lumina/daemon.log.
+
+## Fourth case (7614829e, 2026-11-01): same prompt submitted twice
+
+Two exact user prompts at 15:02:27 and 15:04:53 with no final assistant
+turn between them; `/state` still `running:true`. The other `user` rows
+are persisted tool results, not repeats. The second submit arrived
+during the active run and was steered into it (default
+`delivery=steer`; same-owner `claim_turn` refreshes `inflight_since`).
+Likely automatic source: `web/src/api/client.ts` `api.prompt()` retried
+a 429/502/503/504 after an inconclusive `/state` probe and re-POSTed the
+same text (same flaw in `src/sdk.rs` `submit_delivery`); transcript
+cannot prove retry vs manual resend. Fix: request-id idempotency —
+client/SDK mint one `request_id` per submit and reuse it across retries;
+daemon keeps `{session, request_id}` 600s and answers a resubmit with the
+live status (`steered`/`accepted` + `deduped:true`) without touching the
+inbox, claim, or queue. `web/src/App.tsx` `send()` additionally
+single-flights concurrent submits. Test:
+`prompt_idempotency_dedups_within_ttl`.

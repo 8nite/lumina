@@ -1,11 +1,11 @@
-# Graph Report - memory  (2026-11-01, refreshed inline incl. stuck-session fix)
+# Graph Report - memory  (2026-11-01, refreshed inline incl. stuck-session fix + drive_one retry)
 
 ## Corpus Check
 - 28 files · ~7300 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 129 nodes · 178 links · 4 communities
+- 134 nodes · 179 links · 4 communities
 - Extraction: 89% EXTRACTED · 8% INFERRED · 0% AMBIGUOUS · INFERRED: 11 edges (avg confidence: 0.83)
 - Token cost: 0 input · 0 output
 

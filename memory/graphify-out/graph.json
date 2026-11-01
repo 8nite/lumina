@@ -1110,7 +1110,7 @@
    "contributor": null,
    "file_type": "concept",
    "norm_label": "tui default effort xhigh",
-   "rationale": "TUI default effort ''→xhigh in Go New(), Rust App, and web; /effort auto still resets to provider default; matrix tests updated.",
+   "rationale": "TUI default effort ''\u2192xhigh in Go New(), Rust App, and web; /effort auto still resets to provider default; matrix tests updated.",
    "source_file": "resync-variants.md",
    "source_location": "resync-variants.md:14",
    "source_url": null
@@ -2031,6 +2031,21 @@
    "rationale": "persisted [tool result] rows reuse user role; isToolTurn must precede role===user check in SessionView or they render as chat bubbles instead of collapsing.",
    "source_file": "stuck-session-fix.md",
    "source_location": "stuck-session-fix.md:timeline-ordering",
+   "source_url": null
+  },
+  {
+   "id": "stuck_drive_one_retry",
+   "label": "drive_one Retry + Persisted Failure Note (d3539f35)",
+   "author": null,
+   "captured_at": "2026-11-01",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": null,
+   "file_type": "concept",
+   "norm_label": "drive one retry persisted failure note",
+   "rationale": "round-N model-call failure retried once after 5s cooldown, then persisted as Turn failed assistant turn with resume pointer so mid-work deaths leave a transcript trace; daemon stderr kept at .lumina/daemon.log.",
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:third-case",
    "source_url": null
   }
  ],
@@ -3782,6 +3797,16 @@
    "confidence_score": 1.0,
    "source_file": "stuck-session-fix.md",
    "source_location": "stuck-session-fix.md:16",
+   "weight": 1.0
+  },
+  {
+   "source": "stuck_drive_one_retry",
+   "target": "stuck_no_progress_gate",
+   "relation": "extends",
+   "confidence": "EXTRACTED",
+   "confidence_score": 1.0,
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:third-case",
    "weight": 1.0
   }
  ],

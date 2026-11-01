@@ -342,10 +342,20 @@ impl Sdk {
     /// Transient gateway failures (429/502/503/504, transport timeouts) cool
     /// down and retry; when the turn already started server-side (state
     /// running) the retry is skipped and the caller waits on SSE instead of
-    /// steering duplicate text.
+    /// steering duplicate text. Every attempt reuses one client-generated
+    /// request_id so even an inconclusive state probe can't duplicate the
+    /// submit — the daemon dedups seen keys (stuck session 7614829e).
     pub fn submit_delivery(&self, id: &str, text: &str, effort: &str, delivery: &str) -> Result<SubmitOut, SdkError> {
+        let request_id = format!(
+            "sdk-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            std::process::id()
+        );
         for attempt in 0..=3 {
-            match self.submit_once(id, text, effort, delivery) {
+            match self.submit_once(id, text, effort, delivery, &request_id) {
                 Ok(out) => return Ok(out),
                 Err(e) if Self::retryable(&e) && attempt < 3 => {
                     // Lost response but live turn: don't resubmit (would
@@ -371,10 +381,10 @@ impl Sdk {
         }
     }
 
-    fn submit_once(&self, id: &str, text: &str, effort: &str, delivery: &str) -> Result<SubmitOut, SdkError> {
+    fn submit_once(&self, id: &str, text: &str, effort: &str, delivery: &str, request_id: &str) -> Result<SubmitOut, SdkError> {
         let res = Self::check(
             self.req(reqwest::Method::POST, &format!("/api/v1/sessions/{id}/prompt"))
-                .json(&serde_json::json!({"text": text, "effort": effort, "delivery": delivery}))
+                .json(&serde_json::json!({"text": text, "effort": effort, "delivery": delivery, "request_id": request_id}))
                 .send()?,
         )?;
         let v: serde_json::Value = res.json()?;
