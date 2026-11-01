@@ -374,6 +374,22 @@ export function SessionView(props: {
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-4 py-6" data-scrollable>
         <div className="mx-auto w-full max-w-[880px] space-y-4">
           {props.turns.map((t, i) => {
+            // Persisted tool outputs are stored as `user` turns ([tool result …]):
+            // check tool first so they collapse instead of rendering as chat bubbles.
+            if (isToolTurn(t)) {
+              // Group head renders the whole consecutive run; the rest
+              // of the run returns null to avoid double-rendering.
+              if (i > 0 && isToolTurn(props.turns[i - 1])) return null;
+              const group: { idx: number; t: Turn }[] = [];
+              for (let j = i; j < props.turns.length && isToolTurn(props.turns[j]); j++) {
+                group.push({ idx: j, t: props.turns[j] });
+              }
+              return (
+                <div key={i} className="space-y-2">
+                  <ToolGroup tools={group} />
+                </div>
+              );
+            }
             if (t.role === 'user') {
               const run = [t.agent, shortModel(t.model), fmtTime(t.created_at)].filter(Boolean).join(' · ');
               return (
@@ -391,20 +407,6 @@ export function SessionView(props: {
                   >
                     Undo
                   </button>
-                </div>
-              );
-            }
-            if (isToolTurn(t)) {
-              // Group head renders the whole consecutive run; the rest
-              // of the run returns null to avoid double-rendering.
-              if (i > 0 && isToolTurn(props.turns[i - 1])) return null;
-              const group: { idx: number; t: Turn }[] = [];
-              for (let j = i; j < props.turns.length && isToolTurn(props.turns[j]); j++) {
-                group.push({ idx: j, t: props.turns[j] });
-              }
-              return (
-                <div key={i} className="space-y-2">
-                  <ToolGroup tools={group} />
                 </div>
               );
             }
