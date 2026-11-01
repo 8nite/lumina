@@ -352,6 +352,27 @@ fn hostname_simple() -> String {
     std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "host".into())
 }
 
+/// Panic-proof turn release: the prompt drain task must never leak the
+/// cross-daemon claim or the same-daemon `running` entry. A leaked pair
+/// steers every later prompt into a dead drain — a permanently wedged
+/// session that no browser refresh can heal (backend owns the work, so the
+/// backend must guarantee release). Drop runs on normal completion and on
+/// task-panic unwind alike.
+struct TurnRelease {
+    store: Arc<Store>,
+    running: Arc<Mutex<HashSet<String>>>,
+    id: String,
+    owner: String,
+}
+impl Drop for TurnRelease {
+    fn drop(&mut self) {
+        self.store.release_turn(&self.id, &self.owner);
+        if let Ok(mut r) = self.running.lock() {
+            r.remove(&self.id);
+        }
+    }
+}
+
 async fn prompt(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -436,6 +457,10 @@ async fn prompt(
     let st2 = st.clone();
     let id2 = id.clone();
     tokio::spawn(async move {
+        // Guaranteed release (TurnRelease): a panic anywhere below still
+        // frees the claim and the running entry instead of wedging the
+        // session with a dead drain.
+        let _release = TurnRelease { store: st2.store.clone(), running: st2.running.clone(), id: id2.clone(), owner };
         let first = drive_one(&st2, &runner, &id2, first_q).await;
         // The request may be gone (disconnect); the drain continues anyway.
         let _ = first_tx.send(first);
@@ -465,8 +490,7 @@ async fn prompt(
             let Some(q) = next else { break };
             let _ = drive_one(&st2, &runner2, &id2, q).await;
         }
-        st2.store.release_turn(&id2, &owner);
-        st2.running.lock().unwrap().remove(&id2);
+        // TurnRelease drops here: claim + running entry freed on every path.
     });
     // Cap the blocking wait below typical proxy/gateway timeouts (60s):
     // slow turns return 202 and finish over SSE instead of surfacing as a
@@ -1401,6 +1425,31 @@ mod models_hook_tests {
         assert_eq!(core[2].name, "c-model");
         assert_eq!(core[2].context_window, 0);
         assert!(core[2].supported_efforts.is_empty());
+    }
+
+    /// Backend-continuation guarantee: dropping the drain guard frees the
+    /// cross-daemon claim and the same-daemon `running` entry even on
+    /// panic-unwind paths — a dead drain must never wedge the session.
+    #[test]
+    fn turn_release_guard_frees_claim_and_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Arc::new(Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap());
+        let ws = dir.path().display().to_string();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let running = Arc::new(Mutex::new(HashSet::new()));
+        running.lock().unwrap().insert(sess.id.clone());
+        assert!(store.claim_turn(&sess.id, "owner-a", 600));
+        {
+            let _release = TurnRelease {
+                store: store.clone(),
+                running: running.clone(),
+                id: sess.id.clone(),
+                owner: "owner-a".into(),
+            };
+        }
+        assert!(!running.lock().unwrap().contains(&sess.id), "running entry must clear on drop");
+        assert!(store.claim_turn(&sess.id, "owner-b", 600), "claim must free on drop");
     }
 }
 

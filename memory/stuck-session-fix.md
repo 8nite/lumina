@@ -66,3 +66,36 @@ region) and the web spinner outlived the turn.
   `127.0.0.1:4089` (other apps bind `:7432`).
 
 See [[long-session-fixes]].
+
+## Second case (81bdb764, 2026-11-01): quit-early, opposite shape
+
+20s turn, 11 explore calls (glob×3 same tree, bash ls×2, grep, read×2,
+kb_query), zero edits, then the SAME filler twice (interim + final:
+"Fixing the missing completion glow — testing it live.") and
+`running:false`. Task untouched. Same model as 56d41a74
+(`opencode_go/muse-spark-1.3-contributor`), so not a model difference —
+the verify gate can't fire without mutations. Fix: no-progress gate in
+`src/agent.rs` (`looks_like_work` keyword heuristic, exempts plan mode +
+diagnostic verbs like chk/check/investigate; max 2 forced action rounds,
+silent release — no pointer, no breakage risk without changes).
+Tests: `looks_like_work_matches_fix_requests_not_diagnostics`,
+`no_progress_gate_forces_action_rounds_then_releases`,
+`non_work_finish_passes_without_nag`.
+
+## Backend-continuation audit (browser closed → turn continues)
+
+Verified in code, 2026-11-01: turn runs in a detached `tokio::spawn`
+drain (`src/server.rs` prompt: spawn happens before any await, oneshot
+result is `let _`-ignored) — client disconnect/abort cannot cancel it.
+`emit` ignores send errors; SSE `events()` drop only ends that client's
+stream (`Lagged => continue` is display-only). Approval/question waits
+are bounded 600s (`src/approve.rs`) — Ask mode + closed browser errors
+into the transcript, turn continues. Frontend `prompt()` has no
+AbortController and already assumes server-side continuation (retry
+checks `/state` first). Real gap found + fixed: drain-task panic
+skipped `release_turn` + `running.remove` → every later prompt steered
+into a dead drain (permanent wedge). Fix: `TurnRelease` Drop guard in
+`src/server.rs` (test: `turn_release_guard_frees_claim_and_running`).
+Noted, unchanged: daemon restart mid-turn → 409s until the 600s stale
+claim window (per-process owner uuid, Go parity); transcript persists
+per round so `continue` resumes.

@@ -95,6 +95,7 @@ impl Runner {
         let mut s = bundle.system_prompt.clone();
         s.push_str("\nYou are Lumina, a local-first coding agent. Answer with tool calls when action helps; otherwise reply directly.\n");
         s.push_str("Persistence: continue the ORIGINAL user request until fully complete (all edits applied, tests/build pass). Do NOT stop with a status summary, do NOT ask the user to say 'continue', and do NOT end with 'what I found' when fixes were requested — finish the work, then reply with the completed result.\n");
+        s.push_str("Fix/build/change requests are not done with zero edits: make the change (then verify it) or state exactly what is missing or blocked — ending with a status summary and no edits is not done.\n");
         s.push_str("Verify every code change in the same turn: a turn that ran edit/write/patch must also run a passing test/build/typecheck command (cargo test, pnpm build, tsc, …) before replying done — an edit without a green verification run is not done.\n");
         if agent == Agent::Plan {
             s.push_str("PLAN MODE: research and blueprint only. Never edit source files; scoped writes to plan.md or .lumina/plans/*.md only.\n");
@@ -235,6 +236,10 @@ impl Runner {
             sess.model.clone()
         };
         let hide_websearch = cfg.websearch.disabled;
+        // No-progress gate input (stuck session 81bdb764: a fix request
+        // ended after 11 explore calls with zero edits and duplicated
+        // filler). Plan mode is research-only by design, so it is exempt.
+        let work_requested = agent != Agent::Plan && looks_like_work(&user_text);
         let (final_text, usage) = self
             .loop_until_done(
                 router,
@@ -252,6 +257,7 @@ impl Runner {
                 session_id,
                 &user_turn.id,
                 hide_websearch,
+                work_requested,
             )
             .await?;
         // (All assistant turns are persisted inside the loop as they stream,
@@ -276,6 +282,7 @@ impl Runner {
         session_id: &str,
         user_turn_id: &str,
         hide_websearch: bool,
+        work_requested: bool,
     ) -> Result<(String, crate::llm::Usage), AgentError> {
         let mut last_text = String::new();
         // Thinking never reaches the transcript through the pump below
@@ -299,6 +306,13 @@ impl Runner {
         let mut mutated = false;
         let mut verified = false;
         let mut verify_rounds = 0usize;
+        // No-progress gate (stuck session 81bdb764: a fix request ended
+        // after 11 explore calls with zero edits and duplicated filler —
+        // the verify gate above can't fire without mutations). Ending a
+        // work request with no edit/write/patch forces up to 2 action
+        // rounds, then releases as-is (no breakage risk without changes,
+        // so no pointer — unlike the unverified tail below).
+        let mut progress_rounds = 0usize;
         // Same-file re-read ledger: paging one file with different
         // offsets evades the identical-call key above (the stuck session
         // re-read SessionView.tsx 10x). Nudge once per file per turn.
@@ -356,6 +370,18 @@ impl Runner {
                     messages.push(llm::Message { role: "user".into(), content: demand.to_string(), thinking: String::new() });
                     let _ = store.add_turn(session_id, "user", demand);
                     on_stage("verifying…");
+                    continue;
+                }
+                // No-progress gate: the model wants to end a work request
+                // with zero edits (explore-only rounds + a status summary).
+                // Force up to two action rounds instead; a false positive
+                // costs at most two extra rounds, then the turn releases.
+                if !mutated && work_requested && progress_rounds < 2 {
+                    progress_rounds += 1;
+                    let demand = "No changes made yet: this request asks to fix/build/change something, but the turn ran no edit/write/patch. Act now (make the change, then verify it) or state precisely what is missing or blocked — do NOT end with another status summary and zero edits.";
+                    messages.push(llm::Message { role: "user".into(), content: demand.to_string(), thinking: String::new() });
+                    let _ = store.add_turn(session_id, "user", demand);
+                    on_stage("acting…");
                     continue;
                 }
                 // Empty-final guard: silence after real work gets one more
@@ -773,6 +799,21 @@ fn is_verify_command(cmd: &str) -> bool {
     lower.contains("pnpm") && (lower.contains("build") || lower.contains("test"))
 }
 
+/// No-progress gate input: does this request ask for a change? Substring
+/// match on the lowered text. Deliberately excludes diagnostic verbs
+/// (`check`, `chk`, `investigate`, `what changed`) — a read-only question
+/// correctly ends with zero edits, and nagging it would burn rounds.
+/// A false positive costs at most two extra rounds, then the turn releases.
+fn looks_like_work(text: &str) -> bool {
+    const HINTS: &[&str] = &[
+        "fix", "bug", "broken", "doesn", "not work", "fail", "error",
+        "implement", "repair", "refactor", "migrat", "push",
+        "wire", "missing", "wrong", "add",
+    ];
+    let lower = text.to_lowercase();
+    HINTS.iter().any(|h| lower.contains(h))
+}
+
 /// Resume pointer carried by turns whose code edits never saw a passing
 /// verification run — the next `continue` must verify until green.
 const UNVERIFIED_POINTER: &str = "Note: this turn's edits were never verified (no passing test/build run) — say `continue` to verify: run the relevant tests/build and fix failures until green.";
@@ -1141,6 +1182,20 @@ mod loop_key_tests {
         assert!(!is_verify_command("git diff --stat HEAD"), "diff is not verification");
         assert!(!is_verify_command("echo done"), "echo is not verification");
     }
+
+    #[test]
+    fn looks_like_work_matches_fix_requests_not_diagnostics() {
+        assert!(looks_like_work("fix the orange glow"));
+        assert!(looks_like_work("session doesnt turn orange, u can try"));
+        assert!(looks_like_work("add a collapse toggle"));
+        assert!(looks_like_work("push the branch"));
+        assert!(!looks_like_work("chk the logs and see whats the issue"));
+        assert!(!looks_like_work("what changed in the last commit"));
+        assert!(!looks_like_work("check the weather"));
+        assert!(!looks_like_work("are we finished?"));
+        assert!(!looks_like_work("read a.txt"));
+        assert!(!looks_like_work("say nothing"));
+    }
 }
 
 #[cfg(test)]
@@ -1425,6 +1480,126 @@ mod guard_tests {
         assert!(out.text.contains("never verified"), "released turn must carry the pointer, got {out:?}");
         let turns = store.turns(&sess.id).unwrap();
         assert!(turns.iter().any(|t| t.text.contains("Unverified changes")), "gate demand must hit the transcript");
+    }
+
+    /// Scripted gateway serving fixed payloads in order (one POST per round).
+    fn scripted_e2e(
+        payloads: Vec<&'static str>,
+    ) -> (Router, crate::config::Config, std::sync::Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            for p in payloads {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    let mut b = [0u8; 1];
+                    if s.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                let head_str = String::from_utf8_lossy(&head);
+                let len = head_str
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if len > 0 && s.read_exact(&mut body).is_err() {
+                    return;
+                }
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    p.len(),
+                    p
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let mut providers = HashMap::new();
+        providers.insert(
+            "testprov".into(),
+            crate::config::ProviderConfig {
+                protocol: "openai-compatible".into(),
+                base_url: format!("http://{addr}"),
+                api_key_env: String::new(),
+                api_key_cmd: String::new(),
+                token_url: String::new(),
+            },
+        );
+        let cfg = crate::config::Config {
+            router: crate::config::RouterConfig {
+                fast: String::new(),
+                executor: "testprov/echo".into(),
+                planner: String::new(),
+                improver: String::new(),
+            },
+            providers,
+            ..Default::default()
+        };
+        let router = Router::new(&cfg).unwrap();
+        (router, cfg, hits)
+    }
+
+    /// No-progress gate: a fix request ending with zero edits forces action
+    /// rounds (cap 2), then releases as-is — no breakage risk, so unlike
+    /// the verify gate there is no pointer.
+    #[tokio::test]
+    async fn no_progress_gate_forces_action_rounds_then_releases() {
+        let read_call = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n";
+        let (router, cfg, hits) = scripted_e2e(vec![
+            read_call,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"looks broken, checking\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"still checking\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"blocked: need the css file\"}}]}\n\n",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, "fix the orange glow", "", &[], |_, _| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 4, "explore + 2 refused finishes + release");
+        assert!(out.text.contains("blocked: need the css file"), "released with the final text, got {out:?}");
+        let turns = store.turns(&sess.id).unwrap();
+        assert_eq!(
+            turns.iter().filter(|t| t.text.contains("No changes made yet")).count(),
+            2,
+            "both action demands must hit the transcript"
+        );
+    }
+
+    /// Non-work requests (no keywords) end with text untouched — the gate
+    /// must not nag read-only questions.
+    #[tokio::test]
+    async fn non_work_finish_passes_without_nag() {
+        let (router, cfg, hits) = scripted_e2e(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"sunny\"}}]}\n\n",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, "check the weather", "", &[], |_, _| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "no guard round trip for plain answers");
+        assert_eq!(out.text, "sunny");
     }
 }
 
