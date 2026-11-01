@@ -130,12 +130,12 @@ export function Composer(props: {
           )}
         </div>
         <div className="relative">
-          <button onClick={() => { if (open !== 'model') props.onOpenModels?.(); setOpen(open === 'model' ? null : 'model'); }} className="v2-row flex max-w-48 items-center gap-1 truncate px-1.5 py-0.5 text-[var(--v2-text-base)]" title={props.model || 'loading…'}>
+          <button onClick={() => { if (open !== 'model') { props.onOpenModels?.(); setCustom(''); } setOpen(open === 'model' ? null : 'model'); }} className="v2-row flex max-w-48 items-center gap-1 truncate px-1.5 py-0.5 text-[var(--v2-text-base)]" title={props.model || 'loading…'}>
             <span className="truncate">{props.model ? (props.model.split('/').pop() || props.model) : 'loading…'}</span> <span className="text-[11px] text-[var(--v2-text-faint)]">▾</span>
           </button>
           {open === 'model' && (
             <div className={menu} style={{ border: '1px solid var(--v2-border-base)' }}>
-              {props.modelOptions.map((m) => (
+              {props.modelOptions.filter((m) => m.toLowerCase().includes(custom.trim().toLowerCase())).map((m) => (
                 <button key={m} className="v2-row block w-full truncate rounded-[6px] px-2 py-1.5 text-left text-[var(--v2-text-base)]"
                   onClick={() => { props.onModel(m); setOpen(null); }} title={m}>
                   {m}
@@ -144,7 +144,7 @@ export function Composer(props: {
               <div className="flex items-center gap-1 p-1">
                 <input
                   className="w-full rounded-[6px] border border-[var(--v2-border-base)] bg-transparent px-2 py-1 text-xs outline-none placeholder:text-[var(--v2-text-faint)]"
-                  placeholder="provider/model…"
+                  placeholder="filter or provider/model…"
                   value={custom}
                   onChange={(e) => setCustom(e.target.value)}
                   onKeyDown={(e) => {

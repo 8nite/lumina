@@ -1,7 +1,7 @@
 //! Harness² recursive self-improvement: 8 editable components on
 //! `refs/lumina/harness`, Level-1 Propose → Probe → Compose in git-worktree
 //! sandboxes, and the Level-2 graphify-indexed Improvement Library.
-//! Quality-Floor gating blocks non-improving edits. Mirrors `internal/harness`.
+//! Quality-Floor gating blocks non-improving edits.
 
 use std::{
     collections::HashMap,

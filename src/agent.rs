@@ -1,5 +1,5 @@
 //! Agentic turn loop: prompt → stream → tool calls → repeat.
-//! Mirrors `internal/agent`: sessions, subagents, compaction, checkpoints.
+//! Sessions, subagents, compaction, checkpoints.
 use crate::{
     approve::ApprovalGate,
     llm::{self, Chunk, ImageAttachment, Request, Router, ToolSpec},
@@ -277,6 +277,11 @@ impl Runner {
         hide_websearch: bool,
     ) -> Result<(String, crate::llm::Usage), AgentError> {
         let mut last_text = String::new();
+        // Thinking never reaches the transcript through the pump below
+        // (only deltas join last_text), so accumulate it here: each tool
+        // round persists its segment as a `thinking` turn, and the
+        // remainder joins the final answer (Go parity).
+        let mut thinking_buf = String::new();
         let mut usage = crate::llm::Usage::default();
         let mut last_nonempty = String::new();
         let mut snapshotted = false;
@@ -313,6 +318,7 @@ impl Runner {
                 if !c.delta.is_empty() || !c.thinking.is_empty() {
                     on_event(&c.delta, &c.thinking);
                     last_text.push_str(&c.delta);
+                    thinking_buf.push_str(&c.thinking);
                 }
                 if !c.tool_calls.is_empty() {
                     calls = c.tool_calls;
@@ -334,6 +340,12 @@ impl Runner {
                 // backend round trip for a turn that did nothing.
                 if last_text.trim().is_empty() && did_work {
                     on_stage("summarizing\u{2026}");
+                    let capped_thinking: String = thinking_buf.chars().take(4000).collect();
+                    if !capped_thinking.trim().is_empty() {
+                        let resolved = store.vault.resolve(session_id, &capped_thinking).map_err(AgentError::Msg)?;
+                        store.add_turn(session_id, "thinking", &resolved)?;
+                        thinking_buf.clear();
+                    }
                     return Ok((
                         self.empty_final_text(router, agent_name, model, effort, messages, store, session_id)
                             .await,
@@ -341,6 +353,12 @@ impl Runner {
                     ));
                 }
                 let final_text = std::mem::take(&mut last_text);
+                // Persist trailing reasoning as its own closing dialog.
+                let capped_thinking: String = thinking_buf.chars().take(4000).collect();
+                if !capped_thinking.trim().is_empty() {
+                    let resolved = store.vault.resolve(session_id, &capped_thinking).map_err(AgentError::Msg)?;
+                    store.add_turn(session_id, "thinking", &resolved)?;
+                }
                 // User transparency: stored transcript and return carry
                 // values; refs only ever faced the provider.
                 let final_text = store.vault.resolve(session_id, &final_text).map_err(AgentError::Msg)?;
@@ -475,6 +493,13 @@ impl Runner {
             // its own filler ("I'll query...") into a retry loop.
             // (Continuation nudges above are deterministic scaffolding:
             // re-added by the loop, never persisted.)
+            // Flush this round's reasoning as its own dialog (cap mirrors
+            // the 4KB tool-result cap into context).
+            let capped_thinking: String = thinking_buf.chars().take(4000).collect();
+            if !capped_thinking.trim().is_empty() {
+                let resolved = store.vault.resolve(session_id, &capped_thinking).map_err(AgentError::Msg)?;
+                store.add_turn(session_id, "thinking", &resolved)?;
+            }
             if !last_text.trim().is_empty() {
                 messages.push(llm::Message { role: "assistant".into(), content: store.vault.substitute(session_id, &last_text).map_err(AgentError::Msg)?, thinking: String::new() });
                 let interim = store.vault.resolve(session_id, &last_text).map_err(AgentError::Msg)?;
@@ -482,6 +507,7 @@ impl Runner {
                 last_nonempty = last_text.clone();
             }
             last_text.clear();
+            thinking_buf.clear();
         }
         // Exhausted ceiling with tools still pending: return the last real
         // model text plus an explicit resume pointer instead of an empty

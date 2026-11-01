@@ -33,7 +33,7 @@ export function HomeView(props: {
   const head = props.workspace.slice(0, props.workspace.length - last.length);
   const recent = props.sessions.slice(0, 8);
   return (
-    <div className="mx-auto flex w-full max-w-[720px] flex-1 flex-col justify-center px-4 py-8">
+    <div className="mx-auto flex w-full max-w-[880px] flex-1 flex-col justify-center px-4 py-8">
       <h1 className="v2-title mb-6 text-[15px]">New session</h1>
       <div className="mb-2 flex items-center gap-3 text-[13px]">
         <span className="w-5 text-center text-[var(--v2-text-faint)]">🗀</span>

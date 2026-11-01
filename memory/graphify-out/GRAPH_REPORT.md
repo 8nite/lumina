@@ -1,12 +1,12 @@
-# Graph Report - memory  (2026-11-01, refreshed inline incl. sticky-scroll)
+# Graph Report - memory  (2026-11-01, refreshed inline incl. zen-models)
 
 ## Corpus Check
 - 17 files · ~4200 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 99 nodes · 137 links · 4 communities
-- Extraction: 90% EXTRACTED · 10% INFERRED · 0% AMBIGUOUS · INFERRED: 7 edges (avg confidence: 0.84)
+- 102 nodes · 141 links · 4 communities
+- Extraction: 89% EXTRACTED · 8% INFERRED · 0% AMBIGUOUS · INFERRED: 11 edges (avg confidence: 0.83)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)
@@ -53,7 +53,7 @@ Nodes (7): Lumina plan.md Implementation (M0-M6), Go plus Web Verification Gate,
 
 ### Community 1 - "Memory Index and Live Wiring"
 Cohesion: 0.40
-Nodes (20): lumina Live Wiring, Lumina Memory Index, Steer Queue Inbox While Working, TUI Thinking Toggle plus Web Tool Pills, Turn Delta Tool Completed Streaming Events, Long-Session Hardening Pass, Per-Session Prompt Single-Flight, Terminal SSE plus Auto-Reconnect, Web Permission Modal Answers permission.asked, Live Context Gauge (turn.context), TUI Space Key Types, Provider-Sourced Context Window, Router Context Cache with Caps, Dual Routing Session Headers, Session State Resync Endpoint, TUI Resync Timeline Rebuild, Missed-Started Recovery, Effort Variant Picker, TUI Default Effort XHigh, Gateway Models Effort Note, Web Session-Gone Recovery, Web Model Refresh on Open
+Nodes (23): lumina Live Wiring, Lumina Memory Index, Steer Queue Inbox While Working, TUI Thinking Toggle plus Web Tool Pills, Turn Delta Tool Completed Streaming Events, Long-Session Hardening Pass, Per-Session Prompt Single-Flight, Terminal SSE plus Auto-Reconnect, Web Permission Modal Answers permission.asked, Live Context Gauge (turn.context), TUI Space Key Types, Provider-Sourced Context Window, Router Context Cache with Caps, Dual Routing Session Headers, Session State Resync Endpoint, TUI Resync Timeline Rebuild, Missed-Started Recovery, Effort Variant Picker, TUI Default Effort XHigh, Gateway Models Effort Note, Web Session-Gone Recovery, Web Model Refresh on Open, Zen limit.context Window, Zen reasoning.effort Ladder, Zen 28-Model Live Verification
 
 ### Community 2 - "Subagent Background Web Tools"
 Cohesion: 0.40

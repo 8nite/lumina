@@ -341,7 +341,7 @@ export function SessionView(props: {
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-4 py-6" data-scrollable>
-        <div className="mx-auto w-full max-w-[720px] space-y-4">
+        <div className="mx-auto w-full max-w-[880px] space-y-4">
           {props.turns.map((t, i) => {
             if (t.role === 'user') {
               const run = [t.agent, shortModel(t.model), fmtTime(t.created_at)].filter(Boolean).join(' · ');
@@ -374,6 +374,21 @@ export function SessionView(props: {
               return (
                 <div key={i} className="space-y-2">
                   <ToolGroup tools={group} />
+                </div>
+              );
+            }
+            // Thinking arrives as one dialog per pause (flushed live on
+            // pause/tool boundaries, persisted per round server-side).
+            if (t.role === 'thinking') {
+              return (
+                <div key={i}>
+                  <div className="mb-1 text-[12px] text-[var(--v2-text-faint)]">thinking</div>
+                  <div
+                    className="rounded-[8px] px-4 py-3 text-[13px] leading-5 text-[var(--v2-text-muted)] select-text"
+                    style={{ background: 'var(--v2-bg-base)', border: '1px dashed var(--v2-border-base)' }}
+                  >
+                    <LinkifiedText text={t.text} />
+                  </div>
                 </div>
               );
             }
@@ -444,7 +459,7 @@ export function SessionView(props: {
           )}
         </div>
       </div>
-      <div className="sticky bottom-0 z-10 mx-auto w-full max-w-[720px] px-4 pb-4" style={{ background: 'var(--v2-bg-base)' }}>
+      <div className="sticky bottom-0 z-10 mx-auto w-full max-w-[880px] px-4 pb-4" style={{ background: 'var(--v2-bg-base)' }}>
         {props.working && (
           <div ref={workRef} className="mb-2 max-h-[38vh] overflow-y-auto rounded-[8px] bg-[var(--v2-bg-base)] px-4 py-3"
             style={{ border: '1px solid var(--v2-border-base)' }}

@@ -1,10 +1,5 @@
-//! Lumina CLI (Rust port, M1).
-//! Parity target: `cmd/lumina/main.go` — TUI, run, serve, web, attach,
-//! session, plugin, kb, evolve, models, auth, pair, openapi.
-//!
-//! M1 implements: `serve` (axum + sessions/prompt/export), `run`, `session`,
-//! `models --provider`, `openapi --out`. TUI (`M3`), web auth/pair (`M4`),
-//! plugins/kb/evolve (`M2`/`M5`) exit 66 until their milestone.
+//! Lumina CLI: TUI, run, serve, web, attach, session, plugin, kb, evolve,
+//! models, auth, pair, openapi, vault.
 
 mod agent;
 mod approve;

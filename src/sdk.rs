@@ -1,5 +1,5 @@
 //! Typed blocking client for the daemon HTTP + SSE API.
-//! Mirrors `pkg/sdk` (Go). The TUI runs synchronously on its own thread, so
+//! The TUI runs synchronously on its own thread, so
 //! this uses `reqwest::blocking`; the daemon side stays fully async.
 
 use serde::{Deserialize, Serialize};

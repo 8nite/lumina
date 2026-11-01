@@ -1,5 +1,13 @@
 # Lumina — Architecture & Implementation Plan
 
+> **HISTORICAL (2026-11-01):** this plan was written for the Go implementation.
+> On branch `rust-revamp` the product ships as a Rust single binary in `src/`
+> (`axum` daemon, `ratatui` TUI, `rusqlite` store); `main` is still Go until
+> merge. Read stack-specific mentions below — `Go`, `Bubble Tea`,
+> `internal/*`, `cmd/lumina`, `pkg/sdk`, `//go:embed`, `go test` — as the
+> Rust equivalents listed in `AGENTS.md`. Architecture, behaviour and
+> guarantees described here still hold.
+
 > **Repository:** `8nite/lumina`  
 > **Summary:** A local-first, self-improving AI coding & open-world agent harness featuring a decoupled client–server daemon (`lumina serve`), Lumina-style Web UI + Terminal TUI frontends, **`Plan` ↔ `Build` primary agent modes (`Tab`)**, **Lumina-compatible JS/TS plugins + `AGENTS.md` rule hierarchy**, granular approval modes (`Shift+Tab`: `ask` / `auto-edit` / `auto-approve` / `bypass`), seamless session continuation (`-c` / `-s` / `fork` / `run`), vendor-neutral BYO-LLM routing, **Harness²** recursive self-improvement, and **Markdown + `graphify` Knowledge-Graph RAG** — with **zero Google services**.
 

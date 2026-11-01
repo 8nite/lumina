@@ -1,5 +1,5 @@
 //! Persistent sessions + turn trees in SQLite (WAL, single-writer mutex).
-//! Mirrors `internal/agent/store.go` schema (sessions/turns/approvals/traces).
+//! Schema (sessions/turns/approvals/traces).
 
 use regex::Regex;
 use rusqlite::{params, Connection};
@@ -323,6 +323,34 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Go-daemon-compatible transcript JSON for the web UI
+    /// (`GET /export?format=json`). Missing sessions error so the
+    /// handler keeps its 404 (the web client treats export-404 as
+    /// "session vanished server-side").
+    pub fn transcript_json(&self, session: &str, sanitize: bool) -> Result<serde_json::Value, StoreError> {
+        let s = self
+            .get_session(session)?
+            .ok_or_else(|| StoreError::Msg(format!("session {session} not found")))?;
+        let transcript: Vec<serde_json::Value> = self
+            .turns(session)?
+            .into_iter()
+            .map(|t| {
+                let text = if sanitize { sanitize_export(&t.text) } else { t.text };
+                serde_json::json!({
+                    "id": t.id,
+                    "role": t.role,
+                    "text": text,
+                    "created_at": t.created_at,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "id": s.id,
+            "sanitized": sanitize,
+            "transcript": transcript,
+        }))
+    }
 }
 
 fn patterns() -> &'static Vec<Regex> {
@@ -486,6 +514,28 @@ mod tests {
         let out = sanitize_export(t);
         assert!(!out.contains("sk-abc123"), "{out}");
         assert!(out.contains("REDACTED"));
+    }
+
+    #[test]
+    fn transcript_json_carries_thinking_in_order() {
+        let s = mem();
+        let a = s.create_session("/repo", "build", "bypass", "").unwrap();
+        s.add_turn(&a.id, "user", "fix it").unwrap();
+        s.add_turn(&a.id, "thinking", "first I will read the file").unwrap();
+        s.add_turn(&a.id, "tool", "read: src/main.rs").unwrap();
+        s.add_turn(&a.id, "thinking", "now I will patch it").unwrap();
+        s.add_turn(&a.id, "assistant", "done").unwrap();
+        let v = s.transcript_json(&a.id, false).unwrap();
+        let roles: Vec<&str> = v["transcript"].as_array().unwrap().iter().map(|t| t["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "thinking", "tool", "thinking", "assistant"]);
+        assert_eq!(v["id"], a.id);
+        assert!(s.transcript_json("no-such-session", false).is_err(), "missing session must error (handler 404)");
+        // Sanitize path redacts secrets but keeps roles.
+        s.add_turn(&a.id, "thinking", "key sk-abc123xyz789 here").unwrap();
+        let red = s.transcript_json(&a.id, true).unwrap();
+        let last = red["transcript"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["role"], "thinking");
+        assert!(!last["text"].as_str().unwrap().contains("sk-abc123"));
     }
 }
 

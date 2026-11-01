@@ -158,6 +158,13 @@
       "output_tokens": 0,
       "files": 2,
       "note": "host-agent inline refresh of web-ui-sticky-scroll.md (dedup + index) + rust-port.md source_file dedup (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T06:52:42.783889+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of opencode-zen-models.md (3 nodes, 4 links) + MEMORY.md index description (no-key flow)"
     }
   ],
   "total_input_tokens": 0,

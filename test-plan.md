@@ -1,5 +1,10 @@
 # Lumina Verification & Test Plan (`test-plan.md`)
 
+> **HISTORICAL (2026-11-01):** recorded against the Go implementation (`main`
+> is still Go). On branch `rust-revamp` the `go vet` / `go test` gates below
+> map to `cargo clippy --tests` / `cargo test` on the Rust tree in `src/`;
+> the test IDs and behaviours remain the reference matrix.
+
 Verification matrix for `8nite/lumina` against `plan.md` (§1–§14) and `AGENTS.md`.
 
 ## Test Environment & Isolation Rules

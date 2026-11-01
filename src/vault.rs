@@ -1,5 +1,5 @@
 //! Session secret vault: user-side transparency, LLM-side opacity.
-//! Mirrors `internal/agent/vault.go`: secret-shaped spans in outbound text
+//! Secret-shaped spans in outbound text
 //! become stable per-session `{placeholder_abc}` refs before the provider
 //! sees them; inbound refs rehydrate to values on the user-facing path.
 //! Memory-only: mappings die with the process, transcripts keep values.

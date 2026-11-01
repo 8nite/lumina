@@ -128,10 +128,23 @@ export const api = {
   dismissQuestion: (reqId: string) =>
     req<{ status: string }>('POST', `/api/v1/questions/${reqId}`, { dismissed: true }),
   export: (id: string) =>
-    req<{ transcript: { id: string; role: string; text: string; created_at?: string }[] }>(`GET`, `/api/v1/sessions/${id}/export`),
-  routerState: () => req<{ router: Record<string, string> }>('GET', '/api/v1/router'),
+    // `?format=json`: Rust serves the Go-shaped transcript JSON; the Go
+    // daemon ignores the unknown param and returns JSON either way.
+    req<{ transcript: { id: string; role: string; text: string; created_at?: string }[] }>(`GET`, `/api/v1/sessions/${id}/export?format=json`),
+  routerState: async () => {
+    const v = await req<Record<string, string> & { router?: Record<string, string> }>('GET', '/api/v1/router');
+    // Rust returns flat keys + nested `router`; Go returns nested only.
+    // Normalize to `{router: {...}}` for callers.
+    const nested = v.router && typeof v.router === 'object' ? v.router : {};
+    const flat: Record<string, string> = {};
+    for (const k of ['fast', 'executor', 'planner', 'improver']) {
+      const val = (v as Record<string, string>)[k];
+      if (typeof val === 'string' && val) flat[k] = val;
+    }
+    return { router: { ...flat, ...nested } };
+  },
   setRouter: (role: string, model: string) =>
-    req<{ status: string }>('PUT', '/api/v1/router', { [role]: model }),
+    req<{ status: string }>('PUT', '/api/v1/router', { role, model, [role]: model }),
   providers: () => req<{ providers: (string | { name: string; protocol?: string })[] }>('GET', '/api/v1/providers'),
   models: (provider: string) =>
     req<{ models: { id: string; name: string }[] }>(

@@ -1,5 +1,5 @@
 //! Lumina config: TOML loader + secret indirection + Google-domain block.
-//! Mirrors `internal/config/config.go` (M0 scope).
+//! Secrets only via `api_key_env` / `api_key_cmd`; plaintext keys are rejected.
 
 use serde::Deserialize;
 use std::{collections::HashMap, path::{Path, PathBuf}};

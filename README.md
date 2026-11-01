@@ -1,10 +1,11 @@
 # Lumina — local-first AI coding & open-world agent harness
 
-> **Rust-first:** the daemon + CLI + TUI live in `src/` (`make build` →
-> `bin/lumina`, `make test` → `cargo test`, 89 green). The React SPA in `web/`
-> is unchanged and embedded the same way. Go sources (`cmd/`, `internal/`,
-> `pkg/`) remain for reference (`make build-go` / `make test-go`). Both speak
-> the same daemon API (`GET /openapi.json`) and SQLite schema.
+> **Rust-only (branch `rust-revamp`):** the daemon + CLI + TUI live in `src/`
+> (`make build` → `bin/lumina`, `make test` → `cargo test`). The React SPA
+> in `web/` is embedded at build time. The Go tree (`cmd/`, `internal/`,
+> `pkg/`) was removed from this branch after a module-by-module parity
+> audit; every feature it had is in `src/` (see `memory/rust-port.md`).
+> `main` is still Go until this branch is tested and merged.
 
 See `plan.md` for the full architecture & implementation plan,
 and `test-plan.md` for the verification matrix (all suites PASS).
@@ -44,7 +45,7 @@ external_directory = "ask"
 [permissions.bash]           # glob-matched, first match wins
 "git status*" = "allow"
 "git diff*"   = "allow"
-"go test*"    = "allow"
+"cargo test*" = "allow"
 "*"           = "ask"
 
 [providers.local]
@@ -97,7 +98,7 @@ Env overrides: `LUMINA_CONFIG` (config path), `LUMINA_DB` (SQLite path),
 
 ## Terminal TUI (`lumina`)
 
-The TUI talks to the daemon exclusively through `pkg/sdk`. Keys:
+The TUI talks to the daemon exclusively through `src/sdk.rs`. Keys:
 
 - `Tab` / `Shift+Tab` — flip primary agent (`plan`/`build`) / cycle
   approval mode (`ask` → `auto-edit` → `auto-approve` → `bypass`)
@@ -145,7 +146,7 @@ any time with `lumina models --provider copilot`.
 |---|---|---|---|---|
 | Reads (`read`, `glob`, `grep`, `kb_query`) | allow | allow | allow | allow |
 | File edits | ask | allow | allow | allow |
-| Safe shell (`git status/diff`, `go test`) | allow | allow | allow | allow |
+| Safe shell (`git status/diff`, `cargo test`) | allow | allow | allow | allow |
 | General shell | ask | ask | allow | allow (no prompts) |
 | Destructive shell (`rm -rf`, `git push --force`) | ask | ask | ask | allow |
 | Credential files / Google domains | **deny** | **deny** | **deny** | **deny** |
@@ -284,9 +285,6 @@ context/delta/tool/completed/failed`, `permission.asked/resolved`, …).
 
 ## Layout
 
-- `cmd/lumina` — Go CLI: TUI, `run`, `serve`, `web`, `attach`, `session`, `plugin`, `kb`, `evolve`
-- `internal/*` — Go daemon packages (config, server, security, rules, plugins, llm, agent, tools, mcp, kb, harness, tui)
-- `pkg/sdk` — Go typed client for the daemon HTTP + SSE API
 - `src/` — **Rust daemon + CLI + TUI**: `main.rs` (CLI incl. `vault check`),
   `server.rs` (axum daemon), `security.rs` (fence), `config.rs`, `rules.rs`,
   `llm.rs` (streaming + router), `agent.rs` (turn loop, vault boundary, loop

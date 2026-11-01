@@ -1,12 +1,10 @@
 BINARY := lumina
-PKG := github.com/8nite/lumina
-GOFLAGS := CGO_ENABLED=0
 PREFIX ?= $(HOME)/.local
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 
-.PHONY: build dev test lint openapi-gen web-build clean install stop rust-build rust-test rust-release rust-lint build-go test-go
+.PHONY: build dev test lint openapi-gen web-build clean install stop rust-build rust-test rust-release rust-lint
 
-# Default: Rust single binary (Go sources remain for reference; use build-go/test-go).
+# Rust-only on this branch (Go tree deleted 2026-11-01; reference lives on main).
 build: rust-build
 
 test: rust-test
@@ -27,12 +25,6 @@ rust-release: web/dist
 rust-lint:
 	cargo clippy --tests
 
-build-go: web-build
-	$(GOFLAGS) go build -o bin/$(BINARY) ./cmd/lumina
-
-test-go: web/dist
-	$(GOFLAGS) go test ./...
-
 stop:
 	@-pkill -f "lumina serve" 2>/dev/null && echo "stopped running 'lumina serve'" || echo "no running 'lumina serve' found"
 
@@ -46,30 +38,14 @@ install: build
 dev:
 	cargo run -- serve
 
-
 # web/dist is gitignored; ensure the SPA exists before the daemon embeds it.
 web/dist:
 	pnpm --dir web install && pnpm --dir web build
 
-test-m0:
-	$(GOFLAGS) go test ./internal/config ./internal/rules ./internal/security ./internal/server
-
-test-m1:
-	$(GOFLAGS) go test ./internal/llm ./internal/agent ./internal/plugins ./internal/tools
-
-test-m2:
-	$(GOFLAGS) go test ./internal/kb
-
 lint: rust-lint
-
-lint-go:
-	go vet ./...
 
 openapi-gen:
 	cargo run --quiet -- openapi --out web/src/api/openapi.json
-
-openapi-gen-go:
-	go run ./cmd/lumina openapi --out web/src/api/openapi.json
 
 web-build:
 	pnpm --dir web install && pnpm --dir web build

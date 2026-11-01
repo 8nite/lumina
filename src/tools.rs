@@ -1432,7 +1432,7 @@ mod tests {
     #[test]
     fn destructive_bash_asks() {
         assert!(is_destructive("rm -rf /tmp/x"));
-        assert!(!is_destructive("go test ./..."));
+        assert!(!is_destructive("cargo test"));
     }
 
     #[test]

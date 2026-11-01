@@ -1,5 +1,5 @@
 //! GitHub device flow for Copilot (`lumina auth device`, TUI /connect).
-//! Mirrors `internal/llm/copilot_auth.go`: web auth via github.com device
+//! Web auth via github.com device
 //! codes, tokens in `~/.config/lumina/tokens/<provider>.json` (0600).
 
 use serde::{Deserialize, Serialize};

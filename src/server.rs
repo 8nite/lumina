@@ -1,5 +1,5 @@
 //! Daemon HTTP layer: axum router + SSE + embedded SPA.
-//! Mirrors `internal/server/server.go` route surface (M1: sessions, prompt,
+//! Route surface (M1: sessions, prompt,
 //! export, fork over rusqlite; events broker + PTY land in M2/M3).
 
 use axum::{
@@ -590,6 +590,18 @@ async fn export(
 ) -> impl IntoResponse {
     let sanitize = q.get("sanitize").map(|v| v == "1" || v == "true").unwrap_or(false);
     let store = &st.store;
+    // Go-daemon-compatible transcript JSON for the web UI
+    // (`?format=json`); markdown stays the default for the CLI + e2e.
+    if q.get("format").map(|v| v == "json").unwrap_or(false) {
+        return match store.transcript_json(&id, sanitize) {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        };
+    }
     match store.export_markdown(&id, sanitize) {
         Ok(md) => ([("content-type", "text/markdown")], md).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -734,34 +746,84 @@ async fn providers(State(st): State<AppState>) -> impl IntoResponse {
 
 async fn router_info(State(st): State<AppState>) -> impl IntoResponse {
     let r = &*st.router;
+    let fast = r.model_for("fast", "build");
+    let executor = r.model_for("executor", "build");
+    let planner = r.model_for("planner", "plan");
+    let improver = r.model_for("improver", "build");
+    // Flat keys (Rust SDK / e2e grep) + nested `router` (Go daemon / web
+    // client parity). Both shapes carry the same values.
     Json(serde_json::json!({
-        "fast": r.model_for("fast", "build"),
-        "executor": r.model_for("executor", "build"),
-        "planner": r.model_for("planner", "plan"),
-        "improver": r.model_for("improver", "build"),
+        "fast": fast,
+        "executor": executor,
+        "planner": planner,
+        "improver": improver,
+        "router": {
+            "fast": fast,
+            "executor": executor,
+            "planner": planner,
+            "improver": improver,
+        },
     }))
     .into_response()
 }
 
-#[derive(Deserialize)]
-struct RouterSet {
-    role: String,
-    model: String,
-}
-
-async fn router_set(State(st): State<AppState>, Json(b): Json<RouterSet>) -> impl IntoResponse {
-    if !["fast", "executor", "planner", "improver"].contains(&b.role.as_str()) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "bad role"}))).into_response();
+async fn router_set(State(st): State<AppState>, body: axum::body::Bytes) -> impl IntoResponse {
+    // Accept both shapes: Rust SDK `{"role","model"}` and web/Go SDK
+    // `{[role]: model}` (possibly multi-role). Reject only when nothing
+    // recognizable is present.
+    let v: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("bad json: {e}")}))).into_response();
+        }
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if let (Some(role), Some(model)) = (
+        v.get("role").and_then(|x| x.as_str()),
+        v.get("model").and_then(|x| x.as_str()),
+    ) {
+        pairs.push((role.to_string(), model.to_string()));
     }
-    st.router.set_model(&b.role, &b.model);
-    // Model-persist: hot-swap now, survive restarts via the config file.
-    if let Some(p) = &st.cfg_path {
-        if let Err(e) = crate::config::persist_router_model(p, &b.role, &b.model) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+    if let Some(obj) = v.as_object() {
+        for role in ["fast", "executor", "planner", "improver"] {
+            if let Some(m) = obj.get(role).and_then(|x| x.as_str()) {
+                if !pairs.iter().any(|(r, _)| r == role) {
+                    pairs.push((role.to_string(), m.to_string()));
+                }
+            }
+        }
+        // Also accept nested `{"router": {...}}` (Go round-trip shape).
+        if let Some(inner) = obj.get("router").and_then(|x| x.as_object()) {
+            for role in ["fast", "executor", "planner", "improver"] {
+                if let Some(m) = inner.get(role).and_then(|x| x.as_str()) {
+                    if !pairs.iter().any(|(r, _)| r == role) {
+                        pairs.push((role.to_string(), m.to_string()));
+                    }
+                }
+            }
         }
     }
-    st.emit(ev("config.updated", "", serde_json::json!({"role": b.role, "model": b.model})));
-    Json(serde_json::json!({"ok": true})).into_response()
+    if pairs.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing field `role`"}))).into_response();
+    }
+    for (role, model) in &pairs {
+        if !["fast", "executor", "planner", "improver"].contains(&role.as_str()) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "bad role"}))).into_response();
+        }
+    }
+    // Apply all pairs; emit + persist per role (last wins for response).
+    let mut last = pairs.last().cloned().unwrap();
+    for (role, model) in pairs {
+        st.router.set_model(&role, &model);
+        if let Some(p) = &st.cfg_path {
+            if let Err(e) = crate::config::persist_router_model(p, &role, &model) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+            }
+        }
+        st.emit(ev("config.updated", "", serde_json::json!({"role": role, "model": model})));
+        last = (role, model);
+    }
+    Json(serde_json::json!({"ok": true, "role": last.0, "model": last.1})).into_response()
 }
 
 #[derive(Deserialize)]

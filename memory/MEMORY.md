@@ -1,5 +1,5 @@
 ---
-date_modified: 2026-10-31
+date_modified: 2026-11-01
 tags: [index, memory, lumina]
 ---
 
@@ -20,4 +20,7 @@ tags: [index, memory, lumina]
 - [[resync-variants]] — session state resync endpoint + TUI rebuild, effort variant picker, identical-round loop guard.
 - [[loops-and-claims]] — per-call repeat ledger (3rd identical call) + cross-daemon turn claim (`inflight_owner`, 12 min stale takeover, 409).
 - [[rust-port]] — single-binary Rust port (M0/M1/M2): axum server + broker/hard-deny, BYO-LLM router, tool registry, native `graph.json` KB (`kb/query|update|reflect|status`), compat flags.
+- [[rust-migration]] — Go tree deleted from `rust-revamp` (2026-11-01): port-if-seen rule, pre-delete baselines, post-delete verification before merge.
 - [[web-ui-sticky-scroll]] — SessionView sticky-bottom autoscroll (80px threshold, transcript + working card pin, respects manual scroll-up).
+- [[opencode-zen-models]] — Opencode zen `/models` schema (`limit.context` window, `capabilities.reasoning.effort` ladder), parsed in `src/llm.rs`, live-verified on 28 models.
+- [[model-picker-filter]]

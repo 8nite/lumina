@@ -1,5 +1,5 @@
 //! opencode `*** Begin Patch ***` envelope (Add/Update/Delete/Move + `@@`
-//! context hunks). Mirrors `internal/tools/patch.go`: the multi-file
+//! context hunks). The multi-file
 //! counterpart to edit/write — one call can create, rewrite, move, and
 //! delete files atomically per hunk, failing with partial progress.
 use std::path::{Path, PathBuf};

@@ -1,5 +1,5 @@
 //! Local MCP client (stdio + SSE JSON-RPC): initialize → tools/list → tools/call.
-//! Mirrors `internal/mcp`. Google URLs are rejected at dial time.
+//! Google URLs are rejected at dial time.
 
 use serde::{Deserialize, Serialize};
 use std::{

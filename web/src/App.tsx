@@ -79,6 +79,22 @@ export default function App() {
     queuedRef.current = q;
     setQueued(q);
   };
+  // Unflushed live thinking: each pause (or tool boundary) moves the
+  // accumulated segment into the timeline as its own `thinking` dialog
+  // instead of one batch at turn end.
+  const thinkAccumRef = useRef('');
+  const thinkTimer = useRef<number | null>(null);
+  const flushThinking = useCallback(() => {
+    if (thinkTimer.current) {
+      clearTimeout(thinkTimer.current);
+      thinkTimer.current = null;
+    }
+    const seg = thinkAccumRef.current;
+    if (!seg.trim()) return;
+    thinkAccumRef.current = '';
+    setLiveThinking('');
+    setTurns((t) => [...t, { role: 'thinking', text: seg.slice(0, 4000), created_at: new Date().toISOString() }]);
+  }, []);
   // v2 shell state: vertical tabs sidebar + color scheme.
   const [sidebarOpen, setSidebarOpen] = useState(() => {
     try {
@@ -193,7 +209,7 @@ export default function App() {
       const ex = await api.export(sid);
       setTurns(
         (ex.transcript || [])
-          .filter((t) => t.role === 'user' || t.role === 'assistant' || t.role === 'tool' || t.role === 'tool_error')
+          .filter((t) => t.role === 'user' || t.role === 'assistant' || t.role === 'tool' || t.role === 'tool_error' || t.role === 'thinking')
           .map((t) => ({ role: t.role, text: t.text, created_at: t.created_at })),
       );
     } catch (e) {
@@ -255,9 +271,15 @@ export default function App() {
     api
       .routerState()
       .then((r) => {
-        const vals = Object.values(r.router || {}).filter(Boolean);
-        setModelOptions((prev) => Array.from(new Set([...vals, ...prev])));
-        if (!homeModelRef.current && vals.length) setHomeModel(vals[0]);
+        const router = r.router || {};
+        // Prefer executor (primary default model), then fast/planner/improver.
+        const preferred =
+          router.executor || router.fast || router.planner || router.improver || '';
+        const vals = Object.values(router).filter(Boolean) as string[];
+        setModelOptions((prev) =>
+          Array.from(new Set([preferred, ...vals, ...prev].filter(Boolean) as string[])),
+        );
+        if (!homeModelRef.current && preferred) setHomeModel(preferred);
       })
       .catch(() => {});
     api
@@ -307,6 +329,11 @@ export default function App() {
         setNow(Date.now());
         setLiveText('');
         setLiveThinking('');
+        thinkAccumRef.current = '';
+        if (thinkTimer.current) {
+          clearTimeout(thinkTimer.current);
+          thinkTimer.current = null;
+        }
         setLiveSteps([]);
         setStage('');
         setSummary(null);
@@ -335,7 +362,7 @@ export default function App() {
           api.export(sid).then((ex) => {
             if (sessionRef.current?.id !== sid) return;
             const exported = (ex.transcript || [])
-              .filter((t) => t.role === 'user' || t.role === 'assistant' || t.role === 'tool' || t.role === 'tool_error')
+              .filter((t) => t.role === 'user' || t.role === 'assistant' || t.role === 'tool' || t.role === 'tool_error' || t.role === 'thinking')
               .map((t) => ({ role: t.role, text: t.text, created_at: t.created_at }));
             // Stale-export guard: the daemon publishes turn.started before
             // its async Exec persists the user turn, so the export can be
@@ -374,7 +401,14 @@ export default function App() {
           });
         }
         if (d.delta) setLiveText((t) => (t + d.delta!).slice(-8000));
-        if (d.thinking) setLiveThinking((t) => (t + d.thinking!).slice(-4000));
+        if (d.thinking) {
+          thinkAccumRef.current += d.thinking;
+          setLiveThinking((t) => (t + d.thinking!).slice(-4000));
+          // A pause in thinking ends the dialog: flush it into the
+          // timeline 1.5s after the last thinking delta.
+          if (thinkTimer.current) clearTimeout(thinkTimer.current);
+          thinkTimer.current = window.setTimeout(() => void flushThinking(), 1500);
+        }
       }
       if (e.type === 'turn.progress' && forSession) {
         const d = (e.data || {}) as { stage?: string };
@@ -402,16 +436,23 @@ export default function App() {
             }
             return true;
           });
+          // Thinking pauses while tools run: flush the open segment as
+          // its own dialog before the tool row lands below it.
+          if (d.phase !== 'done') flushThinking();
+          if (d.phase === 'done') {
+            // Each finished tool call joins the conversation in place
+            // (parseTool format `name: body`); the working card keeps
+            // only still-running steps. turn.completed reconciles with
+            // the persisted transcript afterwards.
+            const body = ((d.target || '') + (d.preview ? '\n' + d.preview : '')).trim();
+            const rowText = `${d.tool}: ${body}`.slice(0, 4000);
+            setTurns((t) => [...t, { role: d.error ? 'tool_error' : 'tool', text: rowText, created_at: new Date().toISOString() }]);
+          }
           setLiveSteps((steps) => {
             const next = [...steps];
             if (d.phase === 'done') {
               const i = [...next].reverse().findIndex((s) => s.tool === d.tool && s.phase === 'start');
-              const step: LiveStep = {
-                tool: d.tool!, target: d.target || '',
-                phase: 'done', preview: d.preview, error: d.error, duration_ms: d.duration_ms,
-              };
-              if (i >= 0) next[next.length - 1 - i] = step;
-              else next.push(step);
+              if (i >= 0) next.splice(next.length - 1 - i, 1);
             } else {
               next.push({ tool: d.tool!, target: d.target || '', phase: 'start' });
             }
@@ -424,11 +465,15 @@ export default function App() {
         const d = (e.data || {}) as { text?: string; model?: string; duration_ms?: number; output_tokens?: number; input_tokens?: number; context_tokens?: number; max_tokens?: number };
         setSummary({ model: d.model, duration_ms: d.duration_ms, output_tokens: d.output_tokens, input_tokens: d.input_tokens, context_tokens: d.context_tokens, max_tokens: d.max_tokens });
         if (d.context_tokens) setCtx({ used: d.context_tokens, max: d.max_tokens || 0 });
+        // Flush trailing reasoning first: export replaces the timeline on
+        // success (server replays the same persisted segments in order),
+        // and the rows stay put when export is unreachable.
+        flushThinking();
         api.export(sid).then((ex) => {
           if (sessionRef.current?.id !== sid) return;
           setTurns(
             (ex.transcript || [])
-              .filter((t) => t.role === 'user' || t.role === 'assistant' || t.role === 'tool' || t.role === 'tool_error')
+              .filter((t) => t.role === 'user' || t.role === 'assistant' || t.role === 'tool' || t.role === 'tool_error' || t.role === 'thinking')
               .map((t) => ({ role: t.role, text: t.text, created_at: t.created_at })),
           );
         }).catch(() => {
@@ -441,7 +486,7 @@ export default function App() {
           setChanged({ files: r.files || [], stat: r.stat || '' });
         }).catch(() => {});
         setLiveText('');
-        setLiveThinking('');
+        flushThinking();
         setLiveSteps([]);
         setStage('');
         setWorking(false);
@@ -451,7 +496,7 @@ export default function App() {
         const d = (e.data || {}) as { error?: string };
         setTurnError(d.error || 'turn failed');
         setLiveText('');
-        setLiveThinking('');
+        flushThinking();
         setLiveSteps([]);
         setStage('');
         setSummary(null);
@@ -590,6 +635,11 @@ export default function App() {
     setWorking(false);
     setLiveText('');
     setLiveThinking('');
+    thinkAccumRef.current = '';
+    if (thinkTimer.current) {
+      clearTimeout(thinkTimer.current);
+      thinkTimer.current = null;
+    }
     setLiveSteps([]);
     setStage('');
     setSummary(null);
@@ -690,6 +740,11 @@ export default function App() {
     setWorking(false);
     setLiveText('');
     setLiveThinking('');
+    thinkAccumRef.current = '';
+    if (thinkTimer.current) {
+      clearTimeout(thinkTimer.current);
+      thinkTimer.current = null;
+    }
     setLiveSteps([]);
     setStage('');
     setSummary(null);

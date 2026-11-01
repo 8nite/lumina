@@ -1,7 +1,7 @@
 //! Markdown + graphify RAG engine: cold-start reflect, constrained-vocab
 //! expansion, native graph.json traversal (<2ms BFS/DFS/path/explain/god-nodes),
 //! recursive [[wikilink]] resolution, dedup-on-write memory synthesis, and the
-//! singleflight standing-ops sweeper. Mirrors `internal/kb`. Zero vector DBs.
+//! singleflight standing-ops sweeper. Zero vector DBs.
 
 use serde::{Deserialize, Serialize};
 use std::{

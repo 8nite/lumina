@@ -1,5 +1,5 @@
 //! Rule discovery: hierarchical AGENTS.md + instructions/skills/agents/commands.
-//! Mirrors `internal/rules/rules.go` (M0: discovery + merge order only).
+//! Discovery + merge order; reloaded on every turn.
 
 use std::{
     collections::HashMap,

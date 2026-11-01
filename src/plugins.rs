@@ -1,6 +1,6 @@
 //! Lumina-compatible JS/TS plugin host: on-demand Node v22 worker over a Unix
 //! domain socket (line-delimited JSON-RPC). The worker script is embedded at
-//! compile time (`plugins_host.mjs`, vendored from `internal/plugins/host.mjs`)
+//! compile time (`plugins_host.mjs`)
 //! and materialized to a temp file at runtime, so the Rust binary stays
 //! single-file with zero cost when no JS/TS plugins are configured.
 

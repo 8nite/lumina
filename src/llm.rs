@@ -1,6 +1,6 @@
 //! Vendor-neutral streaming LLM adapters + 3-tier router.
-//! Mirrors `internal/llm` (M1: openai-compatible, anthropic-compatible, ollama).
-//! Copilot/Responses protocols stay 501 until claimed by a later milestone.
+//! Protocols: openai-compatible, anthropic-compatible, ollama, copilot,
+//! openai-responses.
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -1108,7 +1108,10 @@ fn is_zero(n: &u32) -> bool {
 
 /// Live model listing for pickers (`lumina models`, TUI /model, web picker).
 /// Metadata failures mean "unknown" — never fail a turn over listing.
-/// OpenAI-style model listing (GET /models; OpenRouter `context_length`).
+/// OpenAI-style model listing (GET /models; OpenRouter `context_length`;
+/// opencode zen/go `limit.context` + `capabilities.reasoning.effort` per
+/// https://opencode.ai/docs/console/go "Fetch the full list ... from the
+/// models endpoint").
 async fn openai_models(def: &ProviderDef, extra: &[(&str, String)]) -> Result<Vec<ModelMeta>, LlmError> {
     let url = format!("{}/models", def.base_url.trim_end_matches('/'));
     let mut req = client().get(&url).headers(auth_headers(def));
@@ -1135,6 +1138,11 @@ async fn openai_models(def: &ProviderDef, extra: &[(&str, String)]) -> Result<Ve
                     .or_else(|| m.get("context_window"))
                     .or_else(|| m.get("max_context_window"))
                     .and_then(|n| n.as_u64())
+                    .or_else(|| {
+                        m.get("limit")
+                            .and_then(|l| l.get("context"))
+                            .and_then(|n| n.as_u64())
+                    })
                     .unwrap_or(0) as u32,
                 supported_efforts: m
                     .get("supported_efforts")
@@ -1143,6 +1151,18 @@ async fn openai_models(def: &ProviderDef, extra: &[(&str, String)]) -> Result<Ve
                         a.iter()
                             .filter_map(|e| e.as_str().map(|s| s.to_string()))
                             .collect()
+                    })
+                    .filter(|v: &Vec<String>| !v.is_empty())
+                    .or_else(|| {
+                        m.get("capabilities")
+                            .and_then(|c| c.get("reasoning"))
+                            .and_then(|r| r.get("effort"))
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
                     })
                     .unwrap_or_default(),
             });
@@ -1475,6 +1495,55 @@ mod tests {
         };
         assert_eq!(r.model_for("executor", "plan"), "o/m");
         assert_eq!(r.model_for("fast", "build"), "o/m");
+    }
+
+    /// Opencode zen/go `/models` shape (per https://opencode.ai/docs/console/go):
+    /// window lives at `limit.context`, the reasoning ladder at
+    /// `capabilities.reasoning.effort` — neither is `context_length` /
+    /// `supported_efforts`, which the parser used to require.
+    #[tokio::test]
+    async fn zen_models_parse_limit_and_efforts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut s, _)) = listener.accept() else { return };
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                let mut b = [0u8; 1];
+                if s.read_exact(&mut b).is_err() {
+                    return;
+                }
+                head.push(b[0]);
+            }
+            let body = r#"{"data":[
+                {"id":"muse-spark-1.3-contributor","name":"Muse Spark 1.3 Contributor","limit":{"context":1048576},"capabilities":{"reasoning":{"effort":["minimal","low","medium","high","xhigh"]}}},
+                {"id":"beam-free","name":"Beam Free","context_length":200000}
+            ]}"#;
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        });
+        let def = ProviderDef {
+            protocol: "openai-responses".into(),
+            base_url: format!("http://{addr}"),
+            api_key: String::new(),
+            github_token: String::new(),
+            token_url: String::new(),
+        };
+        let models = openai_models(&def, &[]).await.expect("models");
+        assert_eq!(models.len(), 2, "{models:?}");
+        // Sorted by id: beam-free first.
+        assert_eq!(models[0].id, "beam-free");
+        assert_eq!(models[0].context_window, 200000);
+        assert!(models[0].supported_efforts.is_empty());
+        assert_eq!(models[1].id, "muse-spark-1.3-contributor");
+        assert_eq!(models[1].context_window, 1048576, "{models:?}");
+        assert_eq!(models[1].supported_efforts, vec!["minimal", "low", "medium", "high", "xhigh"]);
     }
 }
 

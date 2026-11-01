@@ -1,5 +1,5 @@
 //! Immutable security floor: plan/build structural fence + 4-mode broker.
-//! Mirrors `internal/security/security.go` (M0 scope).
+//! Credential and Google hard-denies are evaluated first in every decision.
 //!
 //! Hard denies (credential files, Google targets) win over everything,
 //! including `bypass`. `plan` agent is read-only except scoped
@@ -349,7 +349,7 @@ pub struct Eval {
     pub allow_tooling_write: bool,
 }
 
-/// Glob-prefix bash rules: `"go test *" = "allow"`, `"*" = "ask"`.
+/// Glob-prefix bash rules: `"cargo test *" = "allow"`, `"*" = "ask"`.
 pub fn match_bash_rules(rules: &std::collections::HashMap<String, String>, cmd: &str) -> Option<Decision> {
     for (pattern, verdict) in rules {
         if pattern == "*" {
@@ -390,7 +390,7 @@ fn is_readonly_bash(cmd: &str) -> bool {
     let c = cmd.trim_start();
     for p in [
         "git status", "git diff", "git log", "git show", "git branch", "ls", "pwd", "echo ", "cat ",
-        "head ", "tail ", "wc ", "find ", "go test", "pnpm test",
+        "head ", "tail ", "wc ", "find ", "cargo test", "cargo check", "cargo clippy", "pnpm test",
     ] {
         if c.starts_with(p) || c == p.trim_end() {
             // Destructive operators disqualify even "read-only" prefixes.
@@ -733,7 +733,7 @@ mod parity_tests {
         ] {
             assert!(is_destructive_bash(c), "{c}");
         }
-        assert!(!is_destructive_bash("go test ./..."));
+        assert!(!is_destructive_bash("cargo test"));
         assert!(!is_destructive_bash("ls -la"));
     }
 
