@@ -51,6 +51,10 @@ region) and the web spinner outlived the turn.
   turn diff 5-file limit (`turnDiffFileLimit`). Intentional deviations:
   thinking always expanded sentence-per-line (explicit in-session user
   request), disclosure kept in row state not persisted.
+- Timeline ordering (769e50d, 2026-11-01): persisted tool outputs reuse
+  the `user` role (`[tool result …]`), so `isToolTurn` must be checked
+  before `role === 'user'` in `SessionView` or they render as chat
+  bubbles instead of collapsing into `ToolGroup`.
 - Kept the session's own hardening (workspace `normalize_workspace`,
   SDK/client retry + `/state` check, 50s prompt cap → 202 + SSE, effort
   step-down, web resync). `cargo test` 115 pass, `cargo clippy --tests`
@@ -99,3 +103,17 @@ into a dead drain (permanent wedge). Fix: `TurnRelease` Drop guard in
 Noted, unchanged: daemon restart mid-turn → 409s until the 600s stale
 claim window (per-process owner uuid, Go parity); transcript persists
 per round so `continue` resumes.
+
+## Third case (d3539f35, 2026-11-01): turn died mid-work, no trace
+
+Same orange-glow task, new binary WITH the no-progress gate. Gate
+fired correctly once (demand at 14:51:07, model explored 6 more tools),
+then the transcript ends with an interim fluff row and `running:false`
+— the round-10 model call failed (gateway/stream error) and drive_one's
+Err path persisted nothing (turn.failed is SSE-only). Fix in
+`src/server.rs` drive_one: one retry after 5s cool-down, then persist
+`Turn failed (<err>). Say continue to resume.` as an assistant turn +
+`tracing::warn!` (daemon stderr now kept at `.lumina/daemon.log`).
+Tests: `drive_one_retries_transient_failure` (500 then green),
+`drive_one_persists_failure_note` (500 always → 2 attempts + note).
+81bdb764 quit-early case: fix request ended after 11 explore calls, zero edits, duplicated filler. Added no-progress gate (looks_like_work, 2 forced rounds, silent release) + TurnRelease Drop guard so a panicking drain never wedges the session. Backend-continuation audit: detached drain survives browser close; approval/question bounded 600s.

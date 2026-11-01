@@ -213,6 +213,13 @@
       "output_tokens": 0,
       "files": 1,
       "note": "host-agent inline refresh of session-resume-workspace.md (dangling [[session-loop-guard-stall]] -> [[stuck-session-fix]] + orphan stash fragment removal) (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T14:50:55.844381+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 28,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 4 nodes added for stuck-session-fix.md"
     }
   ],
   "total_input_tokens": 0,

@@ -521,20 +521,34 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, q: QueuedPrompt) ->
     let sid2 = sid.clone();
     let tx3 = tx.clone();
     let sid3 = sid.clone();
-    let out = runner
-        .run_prompt(&st.store, &st.router, &st.cfg, id, &q.text, &q.effort, &q.images, |d, t| {
-            let _ = tx.send(ev("turn.delta", &sid, serde_json::json!({"delta": d, "thinking": t})));
-        }, |stage| {
-            let _ = tx2.send(ev("turn.progress", &sid2, serde_json::json!({"stage": stage})));
-        }, |tool| match tool {
-            crate::agent::ToolEvent::Start { name, target } => {
-                let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "start", "tool": name, "target": target})));
-            }
-            crate::agent::ToolEvent::Done { name, target, preview, error, duration_ms } => {
-                let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "done", "tool": name, "target": target, "preview": preview, "error": error, "duration_ms": duration_ms})));
-            }
-        })
+    let mut on_event = |d: &str, t: &str| {
+        let _ = tx.send(ev("turn.delta", &sid, serde_json::json!({"delta": d, "thinking": t})));
+    };
+    let mut on_stage = |stage: &str| {
+        let _ = tx2.send(ev("turn.progress", &sid2, serde_json::json!({"stage": stage})));
+    };
+    let mut on_tool = |tool: crate::agent::ToolEvent| match tool {
+        crate::agent::ToolEvent::Start { name, target } => {
+            let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "start", "tool": name, "target": target})));
+        }
+        crate::agent::ToolEvent::Done { name, target, preview, error, duration_ms } => {
+            let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "done", "tool": name, "target": target, "preview": preview, "error": error, "duration_ms": duration_ms})));
+        }
+    };
+    // Backend owns the work: a transient LLM/gateway failure must not
+    // silently kill the turn (stuck session d3539f35 ended mid-work with
+    // no transcript trace after the no-progress gate pushed it onward).
+    // One retry after a short cool-down, then a persisted failure note so
+    // `continue` resumes with context instead of a dead transcript.
+    let mut out = runner
+        .run_prompt(&st.store, &st.router, &st.cfg, id, &q.text, &q.effort, &q.images, &mut on_event, &mut on_stage, &mut on_tool)
         .await;
+    if out.is_err() {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        out = runner
+            .run_prompt(&st.store, &st.router, &st.cfg, id, &q.text, &q.effort, &q.images, &mut on_event, &mut on_stage, &mut on_tool)
+            .await;
+    }
     match out {
         Ok(outcome) => {
             let ms = started.elapsed().as_millis() as u64;
@@ -550,6 +564,10 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, q: QueuedPrompt) ->
         }
         Err(e) => {
             let s = e.to_string();
+            // Persist the failure where the transcript lives: SSE-only
+            // errors leave a dead transcript that reads as "agent gave up".
+            tracing::warn!(session = %id, error = %s, "turn failed after retry");
+            let _ = st.store.add_turn(id, "assistant", &format!("Turn failed ({s}). Say `continue` to resume."));
             st.emit(ev("turn.failed", id, serde_json::json!({"error": s})));
             standing_ops(st, id);
             Err(s)
@@ -1450,6 +1468,127 @@ mod models_hook_tests {
         }
         assert!(!running.lock().unwrap().contains(&sess.id), "running entry must clear on drop");
         assert!(store.claim_turn(&sess.id, "owner-b", 600), "claim must free on drop");
+    }
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Scripted gateway: each accepted POST gets the next canned response
+    /// (raw HTTP status line + body). Serves `plan.len()` connections.
+    fn scripted_gateway(plan: Vec<(&'static str, &'static str)>) -> (String, std::sync::Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            for (status, body) in plan {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    let mut b = [0u8; 1];
+                    if s.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                let head_str = String::from_utf8_lossy(&head);
+                let len = head_str
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut rest = vec![0u8; len];
+                if len > 0 && s.read_exact(&mut rest).is_err() {
+                    return;
+                }
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (addr, hits)
+    }
+
+    fn drive_state(payloads: Vec<(&'static str, &'static str)>) -> (AppState, Runner, String, std::sync::Arc<AtomicUsize>) {
+        let (addr, hits) = scripted_gateway(payloads);
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().display().to_string();
+        // tempdir must outlive the test: leak the path join like the
+        // agent harness leaks its DB path (Store holds no dir handle,
+        // sessions only carry the workspace string).
+        let ws_leak: &'static str = Box::leak(ws.into_boxed_str());
+        let db = std::path::Path::new(ws_leak).join("t.db");
+        let db_leak: &'static str = Box::leak(db.display().to_string().into_boxed_str());
+        // Keep the tempdir alive for the test (Store only carries paths).
+        std::mem::forget(dir);
+        let store = Store::open(Some(db_leak)).unwrap();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "testprov".into(),
+            crate::config::ProviderConfig {
+                protocol: "openai-compatible".into(),
+                base_url: format!("http://{addr}"),
+                api_key_env: String::new(),
+                api_key_cmd: String::new(),
+                token_url: String::new(),
+            },
+        );
+        let cfg = crate::config::Config {
+            router: crate::config::RouterConfig {
+                fast: String::new(),
+                executor: "testprov/echo".into(),
+                planner: String::new(),
+                improver: String::new(),
+            },
+            providers,
+            ..Default::default()
+        };
+        let router = crate::llm::Router::new(&cfg).unwrap();
+        let st = AppState::new(store, router, cfg, None);
+        let sess = st.store.create_session(ws_leak, "build", "bypass", "").unwrap();
+        (st, Runner::new(), sess.id, hits)
+    }
+
+    const FINISH: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n";
+
+    /// Transient gateway 500 then success: the turn recovers via the one
+    /// retry instead of dying with an empty transcript.
+    #[tokio::test]
+    async fn drive_one_retries_transient_failure() {
+        let (st, runner, id, hits) =
+            drive_state(vec![("500 Internal Server Error", ""), ("200 OK", FINISH)]);
+        let q = QueuedPrompt { text: "hi there".into(), effort: String::new(), images: Vec::new() };
+        let out = drive_one(&st, &runner, &id, q).await;
+        assert_eq!(out.unwrap(), "recovered", "retry must recover the turn");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one failed attempt plus one retry");
+    }
+
+    /// Persistent gateway failure: two attempts, then a failure note lands
+    /// in the transcript so `continue` resumes with context.
+    #[tokio::test]
+    async fn drive_one_persists_failure_note() {
+        let (st, runner, id, hits) =
+            drive_state(vec![("500 Internal Server Error", ""), ("500 Internal Server Error", "")]);
+        let q = QueuedPrompt { text: "hi there".into(), effort: String::new(), images: Vec::new() };
+        let out = drive_one(&st, &runner, &id, q).await;
+        assert!(out.is_err(), "persistent failure must still surface, got {out:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one retry, no loop");
+        let turns = st.store.turns(&id).unwrap();
+        let last = turns.last().unwrap();
+        assert_eq!(last.role, "assistant");
+        assert!(last.text.contains("Turn failed"), "failure note must persist, got {:?}", last.text);
+        assert!(last.text.contains("continue"), "note must carry the resume pointer");
     }
 }
 
