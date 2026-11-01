@@ -190,6 +190,12 @@ impl Cache {
             .or_insert_with(|| Arc::new(Host::new(discover(workspace, false))))
             .clone()
     }
+
+    /// Host for workspace-independent hooks (`models.list`): global
+    /// `~/.config/lumina/plugins` only, no workspace dirs.
+    pub fn global(&self) -> Arc<Host> {
+        self.host_for(Path::new(""))
+    }
 }
 
 
@@ -206,7 +212,10 @@ mod tests {
         std::fs::write(ws.join(".lumina/plugins/top.js"), "export default {}").unwrap();
         std::fs::write(ws.join(".lumina/plugins/foo/plugin.mjs"), "export default {}").unwrap();
         let found = discover(ws, false);
-        assert_eq!(found.len(), 2, "{found:?}");
+        // Scope to the temp workspace: the user's global plugins dir may hold
+        // real plugins (e.g. opencode-zen) and must not affect this test.
+        let ours: Vec<_> = found.iter().filter(|p| p.starts_with(ws)).collect();
+        assert_eq!(ours.len(), 2, "{found:?}");
         // Empty set short-circuits without spawning node.
         assert!(Host::new(vec![]).dispatch("config", &Value::Null, std::time::Duration::from_secs(1)).is_none());
     }
@@ -238,5 +247,121 @@ mod live_tests {
             .expect("worker should answer");
         let seen = out.get("patch").and_then(|p| p.get("args")).and_then(|a| a.get("seen"));
         assert_eq!(seen.and_then(|s| s.as_str()), Some("read"), "{out}");
+    }
+
+    /// The bundled opencode-zen plugin enriches an opencode provider's core
+    /// list with the Zen catalog (zen schema -> context_window/efforts),
+    /// matching Go ids to Zen twins via `canonical_id` and adding Zen-only
+    /// ids; core-only entries are kept. Failures keep the core list.
+    #[test]
+    fn opencode_zen_plugin_merges_zen_catalog() {
+        let plug = std::env::current_dir().unwrap().join("plugins/opencode-zen.mjs");
+        assert!(plug.is_file(), "bundled plugin missing: {}", plug.display());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            // Two fetches: Zen catalog (/zen) + raw Go catalog (/models).
+            for _ in 0..2 {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    let mut b = [0u8; 1];
+                    if s.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                // Same socket serves both catalogs: /zen -> Zen, else Go.
+                let is_zen = String::from_utf8_lossy(&head).contains("/zen");
+                let body = if is_zen {
+                    r#"{"data":[
+                        {"id":"muse-spark-1.3","name":"Muse Spark 1.3",
+                         "canonical_id":"meta/muse-spark-1.3",
+                         "limit":{"context":1048576},
+                         "capabilities":{"reasoning":{"effort":["low","high"]}}},
+                        {"id":"zen-only","name":"Zen Only","limit":{"context":2048}}
+                    ]}"#
+                } else {
+                    // Go twin shares the canonical id but carries no metadata
+                    // (core's generic parse drops it) — the plugin enriches it.
+                    r#"{"data":[
+                        {"id":"muse-spark-1.3-contributor","name":"Muse Spark",
+                         "canonical_id":"meta/muse-spark-1.3"}
+                    ]}"#
+                };
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        std::env::set_var("OPENCODE_ZEN_MODELS_URL", format!("http://{addr}/zen"));
+        let host = Host::new(vec![plug]);
+        let out = host
+            .dispatch(
+                "models.list",
+                &serde_json::json!({
+                    "provider": "opencode_go",
+                    "base_url": format!("http://{addr}"),
+                    "api_key_env": "",
+                    "api_key_cmd": "printf fake-key",
+                    "models": [
+                        {"id": "core-only", "name": "core-only"},
+                        {"id": "muse-spark-1.3-contributor", "name": "Muse Spark"},
+                    ],
+                }),
+                std::time::Duration::from_secs(20),
+            )
+            .expect("worker should answer");
+        std::env::remove_var("OPENCODE_ZEN_MODELS_URL");
+        let models = out
+            .get("patch")
+            .and_then(|p| p.get("models"))
+            .and_then(|m| m.as_array())
+            .expect("plugin must return models");
+        let ids: Vec<&str> = models.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str())).collect();
+        // Zen twin suppressed (unusable on the Go endpoint); Go id enriched.
+        assert_eq!(
+            ids,
+            vec!["core-only", "muse-spark-1.3-contributor", "zen-only"],
+            "{models:?}"
+        );
+        // Go id keeps its id but gains the Zen twin's metadata via canonical_id.
+        let spark = &models[1];
+        assert_eq!(spark.get("context_window").and_then(|n| n.as_u64()), Some(1048576));
+        assert_eq!(
+            spark.get("supported_efforts").and_then(|e| e.as_array()).map(|a| a.len()),
+            Some(2)
+        );
+        // Zen-only id added with its own metadata.
+        assert_eq!(models[2].get("id").and_then(|i| i.as_str()), Some("zen-only"));
+        assert_eq!(models[2].get("context_window").and_then(|n| n.as_u64()), Some(2048));
+    }
+
+    /// Non-opencode providers pass through untouched (empty patch).
+    #[test]
+    fn opencode_zen_plugin_ignores_other_providers() {
+        let plug = std::env::current_dir().unwrap().join("plugins/opencode-zen.mjs");
+        let host = Host::new(vec![plug]);
+        let out = host
+            .dispatch(
+                "models.list",
+                &serde_json::json!({
+                    "provider": "copilot",
+                    "base_url": "https://api.githubcopilot.com",
+                    "models": [{"id": "gpt-4o", "name": "gpt-4o"}],
+                }),
+                std::time::Duration::from_secs(20),
+            )
+            .expect("worker should answer");
+        let patch = out.get("patch").expect("patch envelope");
+        // Untouched: the worker echoes the payload, so models must equal input.
+        let models = patch.get("models").and_then(|m| m.as_array()).expect("echoed models");
+        assert_eq!(models.len(), 1, "{patch}");
+        assert_eq!(models[0].get("id").and_then(|i| i.as_str()), Some("gpt-4o"), "{patch}");
     }
 }

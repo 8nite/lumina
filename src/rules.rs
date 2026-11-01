@@ -1,4 +1,4 @@
-//! Rule discovery: hierarchical AGENTS.md + instructions/skills/agents/commands.
+//! Rule discovery: hierarchical AGENTS.md + rules/skills/agents/commands.
 //! Discovery + merge order; reloaded on every turn.
 
 use std::{
@@ -248,7 +248,7 @@ impl Bundle {
             let gp = home_dir().join(".config/lumina/AGENTS.md");
             let c = read_if_exists(&gp);
             add_layer(gp.display().to_string(), c);
-            for f in glob_files(&home_dir().join(".config/lumina/instructions/*.md").to_string_lossy()) {
+            for f in glob_files(&home_dir().join(".config/lumina/rules/*.md").to_string_lossy()) {
                 let c = read_if_exists(&f);
                 add_layer(f.display().to_string(), c);
             }
@@ -272,7 +272,7 @@ impl Bundle {
                     }
                 }
             }
-            for f in glob_files(&workspace.join(".lumina/instructions/*.md").to_string_lossy()) {
+            for f in glob_files(&workspace.join(".lumina/rules/*.md").to_string_lossy()) {
                 let c = read_if_exists(&f);
                 add_layer(f.display().to_string(), c);
             }
@@ -329,5 +329,21 @@ mod frontmatter_tests {
         assert_eq!(meta.get("tools.bash").map(|s| s.as_str()), Some("false"));
         assert_eq!(meta.get("tools.edit").map(|s| s.as_str()), Some("true"));
         assert_eq!(meta.get("name").map(|s| s.as_str()), Some("reviewer"));
+    }
+
+    #[test]
+    fn rules_dir_loads_as_layer() {
+        // opencode v2 plural-dir convention: .lumina/rules/*.md (was instructions/).
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path();
+        std::fs::create_dir_all(ws.join(".lumina/rules")).unwrap();
+        std::fs::write(ws.join(".lumina/rules/coding.md"), "Always run cargo fmt.").unwrap();
+        let b = Bundle::load(ws, false, false);
+        assert!(
+            b.layers.iter().any(|l| l.contains("rules")),
+            "layers: {:?}",
+            b.layers
+        );
+        assert!(b.system_prompt.contains("Always run cargo fmt."), "{}", b.system_prompt);
     }
 }

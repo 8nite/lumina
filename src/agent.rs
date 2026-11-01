@@ -95,6 +95,7 @@ impl Runner {
         let mut s = bundle.system_prompt.clone();
         s.push_str("\nYou are Lumina, a local-first coding agent. Answer with tool calls when action helps; otherwise reply directly.\n");
         s.push_str("Persistence: continue the ORIGINAL user request until fully complete (all edits applied, tests/build pass). Do NOT stop with a status summary, do NOT ask the user to say 'continue', and do NOT end with 'what I found' when fixes were requested — finish the work, then reply with the completed result.\n");
+        s.push_str("Verify every code change in the same turn: a turn that ran edit/write/patch must also run a passing test/build/typecheck command (cargo test, pnpm build, tsc, …) before replying done — an edit without a green verification run is not done.\n");
         if agent == Agent::Plan {
             s.push_str("PLAN MODE: research and blueprint only. Never edit source files; scoped writes to plan.md or .lumina/plans/*.md only.\n");
         }
@@ -289,6 +290,19 @@ impl Runner {
         // Per-call repeat ledger + identical-round streak (Go parity).
         // `task_output` polls are progress, not loops — exempt.
         let mut seen: HashMap<String, usize> = HashMap::new();
+        // Verify-after-fix gate (stuck session 56d41a74: 23 code
+        // mutations, 4 verify runs — later edits never verified and
+        // drifted). `mutated` flips on edit/write/patch, clears only via
+        // a passing verify command; the empty-finish path below refuses
+        // to end the turn while mutations sit unverified (max 2 forced
+        // rounds, then the tail carries an explicit resume pointer).
+        let mut mutated = false;
+        let mut verified = false;
+        let mut verify_rounds = 0usize;
+        // Same-file re-read ledger: paging one file with different
+        // offsets evades the identical-call key above (the stuck session
+        // re-read SessionView.tsx 10x). Nudge once per file per turn.
+        let mut read_counts: HashMap<String, usize> = HashMap::new();
         let mut prev_round_key = String::new();
         let mut repeat_streak = 0usize;
         for round in 0..self.max_steps {
@@ -333,6 +347,17 @@ impl Runner {
             usage.input += u.input;
             usage.output += u.output;
             if calls.is_empty() {
+                // Verify-after-fix gate: the model wants to end the turn
+                // with code mutations it never verified. Force up to two
+                // verification rounds instead of accepting a text summary.
+                if mutated && !verified && verify_rounds < 2 {
+                    verify_rounds += 1;
+                    let demand = "Unverified changes: this turn ran edit/write/patch but no passing test/build/typecheck command yet. Run the relevant verification now (e.g. `cargo test`, `pnpm --dir web build`) and fix failures until green; do NOT end with a text summary until verification passes. If verification is genuinely impossible in this workspace, state exactly what blocks it.";
+                    messages.push(llm::Message { role: "user".into(), content: demand.to_string(), thinking: String::new() });
+                    let _ = store.add_turn(session_id, "user", demand);
+                    on_stage("verifying…");
+                    continue;
+                }
                 // Empty-final guard: silence after real work gets one more
                 // tools-stripped round asking for done-vs-remaining, so the
                 // transcript never ends in silence. Pure-empty turns (no
@@ -361,7 +386,11 @@ impl Runner {
                 }
                 // User transparency: stored transcript and return carry
                 // values; refs only ever faced the provider.
-                let final_text = store.vault.resolve(session_id, &final_text).map_err(AgentError::Msg)?;
+                let mut final_text = store.vault.resolve(session_id, &final_text).map_err(AgentError::Msg)?;
+                if mutated && !verified {
+                    final_text.push_str("\n\n");
+                    final_text.push_str(UNVERIFIED_POINTER);
+                }
                 store.add_turn(session_id, "assistant", &final_text)?;
                 return Ok((final_text, usage));
             }
@@ -414,8 +443,18 @@ impl Runner {
                     .unwrap_or_default();
                 let target = crate::tools::tool_target(&tc.name, &args);
                 on_tool(ToolEvent::Start { name: tc.name.clone(), target: target.clone() });
+                // Hard cap: the 4th-read nudge below is advisory and the
+                // stuck session (56d41a74) re-read SessionView.tsx 10x
+                // anyway (224 reads, 0 nudge hits — the code postdates it).
+                // Block the 6th+ read of one path per turn so the loop must
+                // act instead of re-paging; edits reset the count below.
+                let blocked = read_repeat_blocked(&tc.name, &target, read_counts.get(&target).copied().unwrap_or(0));
+                let was_blocked = blocked.is_some();
                 let t0 = std::time::Instant::now();
-                let result = reg.call(sc, &tc.name, &args);
+                let result = match blocked {
+                    Some(msg) => Err(crate::tools::ToolError::Msg(msg)),
+                    None => reg.call(sc, &tc.name, &args),
+                };
                 let elapsed_ms = t0.elapsed().as_millis() as u64;
                 let (preview, is_err) = match &result {
                     Ok(o) => (tool_preview(&o.output), false),
@@ -428,6 +467,7 @@ impl Runner {
                     error: is_err,
                     duration_ms: elapsed_ms,
                 });
+                let result_ok = result.is_ok();
                 let rendered = match result {
                     Ok(o) => {
                         // Cap what flows back into context (full blobs stay out of
@@ -456,6 +496,44 @@ impl Runner {
                             "\n\nLoop guard: identical `{}` call already ran 3 times this turn with no new result. Do NOT call it again with the same arguments — change approach (different args or tool) or give the final text answer now.",
                             tool_label(&tc.name, &args)
                         ));
+                    }
+                }
+                // Same-file re-read: different offsets still mean no
+                // progress. Fires once per file (4th read) per turn.
+                if tc.name.eq_ignore_ascii_case("read") {
+                    let target = crate::tools::tool_target(&tc.name, &args);
+                    if !target.is_empty() {
+                        let n = read_counts.entry(target.clone()).or_insert(0);
+                        *n += 1;
+                        if !was_blocked {
+                            if let Some(nudge) = read_repeat_nudge(&target, *n) {
+                                rendered.push_str(&nudge);
+                            }
+                        }
+                    }
+                }
+                // Verify-after-fix tracking: a code mutation invalidates
+                // prior verification; only a passing verify command
+                // (bash runs a test/build/lint command and its output has
+                // no `[exit N]` failure marker) counts as verified.
+                // Re-read after a change is legitimate too: an
+                // edit/write/patch resets that path's re-read count.
+                if result_ok
+                    && (tc.name.eq_ignore_ascii_case("edit")
+                        || tc.name.eq_ignore_ascii_case("write")
+                        || tc.name.eq_ignore_ascii_case("patch"))
+                {
+                    mutated = true;
+                    verified = false;
+                    let target = crate::tools::tool_target(&tc.name, &args);
+                    if !target.is_empty() {
+                        read_counts.remove(&target);
+                    }
+                }
+                if tc.name.eq_ignore_ascii_case("bash") && result_ok && !rendered.contains("[exit ") {
+                    let cmd = crate::tools::tool_target(&tc.name, &args);
+                    if is_verify_command(&cmd) {
+                        verified = true;
                     }
                 }
                 on_event("", &rendered);
@@ -518,7 +596,11 @@ impl Runner {
             last_nonempty
         };
         // User transparency: resolve any refs the model echoed before storing.
-        let tail = store.vault.resolve(session_id, &tail).map_err(AgentError::Msg)?;
+        let mut tail = store.vault.resolve(session_id, &tail).map_err(AgentError::Msg)?;
+        if mutated && !verified {
+            tail.push_str("\n\n");
+            tail.push_str(UNVERIFIED_POINTER);
+        }
         store.add_turn(session_id, "assistant", &tail)?;
         Ok((tail, usage))
     }
@@ -626,6 +708,74 @@ fn tool_label(name: &str, args: &HashMap<String, serde_json::Value>) -> String {
         format!("{name}: {target}")
     }
 }
+
+/// Same-file re-read nudge: paging one file with different offsets evades
+/// the identical-call key. Fires once, on the 4th read of a path per turn.
+fn read_repeat_nudge(target: &str, n: usize) -> Option<String> {
+    if target.is_empty() || n != 4 {
+        return None;
+    }
+    Some(format!(
+        "\n\nLoop guard: `{target}` already read {n} times this turn. Do NOT re-page it — use grep/glob for the next fact, or batch the remaining reads in one round, then act."
+    ))
+}
+
+/// Hard cap behind the nudge: block the 6th+ read of one path per turn.
+/// `n_before` is the completed-read count so far; advisory nudges (4th)
+/// don't stop a stuck loop, so the 6th attempt never reaches the
+/// filesystem — it returns a short error naming the file instead.
+fn read_repeat_blocked(tool: &str, target: &str, n_before: usize) -> Option<String> {
+    if !tool.eq_ignore_ascii_case("read") || target.is_empty() || n_before < 5 {
+        return None;
+    }
+    Some(format!(
+        "read blocked: `{target}` already read {n} times this turn — act on what you have (grep/glob for the next fact, then edit) instead of re-reading it.",
+        n = n_before + 1
+    ))
+}
+
+/// Verify-after-fix gate: does this bash command run a test, build,
+/// typecheck, or lint suite whose green run proves a fix? Substring match
+/// on the lowered command; entries need enough context to avoid traps
+/// like `cat tsconfig.json` (no bare `tsc`).
+fn is_verify_command(cmd: &str) -> bool {
+    const VERIFY: &[&str] = &[
+        "cargo test",
+        "cargo clippy",
+        "cargo build",
+        "cargo check",
+        "tsc --noemit",
+        "tsc -b",
+        "tsc -p",
+        "vite build",
+        "next build",
+        "pnpm build",
+        "pnpm test",
+        "npm test",
+        "npm run build",
+        "npm run test",
+        "pytest",
+        "go test",
+        "make test",
+        "make build",
+        "make lint",
+        "jest",
+        "vitest",
+        "eslint",
+    ];
+    let lower = cmd.to_lowercase();
+    if VERIFY.iter().any(|v| lower.contains(v)) {
+        return true;
+    }
+    // `pnpm --dir <dir> <sub>` never contains "pnpm <sub>" contiguously
+    // (the session's own `pnpm --dir web build`); match the runner plus
+    // a build/test subcommand anywhere in the line.
+    lower.contains("pnpm") && (lower.contains("build") || lower.contains("test"))
+}
+
+/// Resume pointer carried by turns whose code edits never saw a passing
+/// verification run — the next `continue` must verify until green.
+const UNVERIFIED_POINTER: &str = "Note: this turn's edits were never verified (no passing test/build run) — say `continue` to verify: run the relevant tests/build and fix failures until green.";
 
 
 
@@ -956,6 +1106,41 @@ mod loop_key_tests {
         assert_eq!(tool_label("bash", &a(&[("command", "ls")])), "bash: ls");
         assert_eq!(tool_label("read", &a(&[])), "read");
     }
+
+    #[test]
+    fn reread_nudge_fires_once_on_fourth_read() {
+        assert!(read_repeat_nudge("web/src/App.tsx", 3).is_none());
+        let nudge = read_repeat_nudge("web/src/App.tsx", 4).expect("4th read nudges");
+        assert!(nudge.contains("web/src/App.tsx"), "{nudge}");
+        assert!(read_repeat_nudge("web/src/App.tsx", 5).is_none(), "fires once, not spam");
+        assert!(read_repeat_nudge("", 4).is_none());
+    }
+
+    #[test]
+    fn reread_block_fires_on_sixth_read() {
+        assert!(read_repeat_blocked("read", "web/src/App.tsx", 4).is_none(), "5th read still advisory-only");
+        let msg = read_repeat_blocked("read", "web/src/App.tsx", 5).expect("6th read blocks");
+        assert!(msg.contains("web/src/App.tsx"), "{msg}");
+        assert!(read_repeat_blocked("read", "web/src/App.tsx", 9).is_some(), "stays blocked, no re-page");
+        assert!(read_repeat_blocked("bash", "ls", 9).is_none(), "only reads are capped");
+        assert!(read_repeat_blocked("read", "", 9).is_none());
+    }
+
+    #[test]
+    fn verify_command_detection() {
+        assert!(is_verify_command("cargo test --quiet loop_key"));
+        assert!(is_verify_command("cargo clippy --tests"));
+        assert!(is_verify_command("pnpm --dir web build"));
+        assert!(is_verify_command("pnpm --dir web test && pnpm --dir web build"));
+        assert!(is_verify_command("tsc --noEmit"));
+        assert!(is_verify_command("pytest -x tests/"));
+        assert!(is_verify_command("go test ./..."));
+        assert!(!is_verify_command("ls -la"), "listing is not verification");
+        assert!(!is_verify_command("cat tsconfig.json"), "tsconfig trap: no bare tsc");
+        assert!(!is_verify_command("pnpm install"), "install is not verification");
+        assert!(!is_verify_command("git diff --stat HEAD"), "diff is not verification");
+        assert!(!is_verify_command("echo done"), "echo is not verification");
+    }
 }
 
 #[cfg(test)]
@@ -1137,6 +1322,109 @@ mod guard_tests {
             .unwrap();
         assert!(out.text.trim().is_empty(), "no-work silence must pass through, got {out:?}");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "no guard round trip for idle silence");
+    }
+
+    fn body_verify(n: usize) -> &'static str {
+        match n {
+            // Round 1: edit a.txt (alpha -> beta).
+            1 => "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"1\",\"function\":{\"name\":\"edit\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\",\\\"old_string\\\":\\\"alpha\\\",\\\"new_string\\\":\\\"beta\\\"}\"}}]}}]}\n\n",
+            // Round 2: model ends with text, no tools — gate must refuse.
+            2 => "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+            // Round 3: model runs a verify command (fails here: no crate
+            // in the temp workspace — still counts as an attempt, and the
+            // `[exit N]` marker keeps `verified` false).
+            3 => "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"cargo test --quiet\\\"}\"}}]}}]}\n\n",
+            // Round 4: model gives up with text — gate refuses once more.
+            4 => "data: {\"choices\":[{\"delta\":{\"content\":\"giving up\"}}]}\n\n",
+            // Round 5: cap reached (2 forced rounds) — turn ends carrying
+            // the unverified pointer.
+            _ => "data: {\"choices\":[{\"delta\":{\"content\":\"still giving up\"}}]}\n\n",
+        }
+    }
+
+    /// Verify-after-fix gate: an edit followed by a text finish must not
+    /// end the turn. The gate forces verification rounds (cap 2), then
+    /// releases with an explicit unverified resume pointer.
+    #[tokio::test]
+    async fn unverified_edit_forces_verify_rounds_then_pointer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for _ in 0..5 {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    let mut b = [0u8; 1];
+                    if s.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                let head_str = String::from_utf8_lossy(&head);
+                let len = head_str
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if len > 0 && s.read_exact(&mut body).is_err() {
+                    return;
+                }
+                let n = hits2.fetch_add(1, Ordering::SeqCst) + 1;
+                let payload = body_verify(n);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "testprov".into(),
+            crate::config::ProviderConfig {
+                protocol: "openai-compatible".into(),
+                base_url: format!("http://{addr}"),
+                api_key_env: String::new(),
+                api_key_cmd: String::new(),
+                token_url: String::new(),
+            },
+        );
+        let cfg = crate::config::Config {
+            router: crate::config::RouterConfig {
+                fast: String::new(),
+                executor: "testprov/echo".into(),
+                planner: String::new(),
+                improver: String::new(),
+            },
+            providers,
+            ..Default::default()
+        };
+        let router = Router::new(&cfg).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, "patch a.txt", "", &[], |_, _| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 5, "edit + 2 refused finishes + failing verify + release");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "beta", "edit must apply");
+        assert!(out.text.contains("never verified"), "released turn must carry the pointer, got {out:?}");
+        let turns = store.turns(&sess.id).unwrap();
+        assert!(turns.iter().any(|t| t.text.contains("Unverified changes")), "gate demand must hit the transcript");
     }
 }
 

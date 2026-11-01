@@ -5,7 +5,7 @@ import { loadServers, saveServers } from '../api/client';
 export function ServersModal(props: { active: string; onPick: (url: string) => void; onClose: () => void }) {
   const [list, setList] = useState<string[]>(() => loadServers());
   const [q, setQ] = useState('');
-  const [draft, setDraft] = useState('http://localhost:7432');
+  const [draft, setDraft] = useState('http://localhost:4089');
 
   const add = () => {
     const u = draft.trim();
@@ -60,7 +60,7 @@ export function ServersModal(props: { active: string; onPick: (url: string) => v
         <div className="mt-1 flex gap-2">
           <input
             className="flex-1 rounded-[6px] border border-[var(--v2-border-base)] bg-transparent px-3 py-2 text-[13px] outline-none placeholder:text-[var(--v2-text-faint)]"
-            placeholder="http://localhost:7432"
+            placeholder="http://localhost:4089"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && add()}

@@ -1,11 +1,11 @@
-# Graph Report - memory  (2026-11-01, refreshed inline incl. zen-models)
+# Graph Report - memory  (2026-11-01, refreshed inline incl. stuck-session fix)
 
 ## Corpus Check
-- 17 files · ~4200 words
+- 28 files · ~7300 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 102 nodes · 141 links · 4 communities
+- 129 nodes · 178 links · 4 communities
 - Extraction: 89% EXTRACTED · 8% INFERRED · 0% AMBIGUOUS · INFERRED: 11 edges (avg confidence: 0.83)
 - Token cost: 0 input · 0 output
 
@@ -49,11 +49,11 @@
 
 ### Community 0 - "M0-M6 Build and Delivery"
 Cohesion: 0.32
-Nodes (7): Lumina plan.md Implementation (M0-M6), Go plus Web Verification Gate, Markdown + Graphify RAG Engine, Harness2 Propose-Probe-Compose Engine, Lumina-Compatible JS/TS Plugin Host, Session Continue, Fork & Shadow-Git Undo, Singleflight Standing-Ops KB Sweeper, SPA Asset MIME plus CSP, Serve DB-Path Banner, Full Tool-Round Transcript, LLM Transport Parity, Begin-Patch Engine, Server-TUI-CLI Parity, Round-2 Verify
+Nodes (7): Lumina plan.md Implementation (M0-M6), Go plus Web Verification Gate, Markdown + Graphify RAG Engine, Harness2 Propose-Probe-Compose Engine, Lumina-Compatible JS/TS Plugin Host, Session Continue, Fork & Shadow-Git Undo, Singleflight Standing-Ops KB Sweeper, SPA Asset MIME plus CSP, Serve DB-Path Banner, Full Tool-Round Transcript, LLM Transport Parity, Begin-Patch Engine, Server-TUI-CLI Parity, Round-2 Verify, Go Tree Deleted from rust-revamp, Port-If-Seen Rust Rule, Pre/Post-Delete Green Baselines
 
 ### Community 1 - "Memory Index and Live Wiring"
 Cohesion: 0.40
-Nodes (23): lumina Live Wiring, Lumina Memory Index, Steer Queue Inbox While Working, TUI Thinking Toggle plus Web Tool Pills, Turn Delta Tool Completed Streaming Events, Long-Session Hardening Pass, Per-Session Prompt Single-Flight, Terminal SSE plus Auto-Reconnect, Web Permission Modal Answers permission.asked, Live Context Gauge (turn.context), TUI Space Key Types, Provider-Sourced Context Window, Router Context Cache with Caps, Dual Routing Session Headers, Session State Resync Endpoint, TUI Resync Timeline Rebuild, Missed-Started Recovery, Effort Variant Picker, TUI Default Effort XHigh, Gateway Models Effort Note, Web Session-Gone Recovery, Web Model Refresh on Open, Zen limit.context Window, Zen reasoning.effort Ladder, Zen 28-Model Live Verification
+Nodes (26): lumina Live Wiring, Lumina Memory Index, Steer Queue Inbox While Working, TUI Thinking Toggle plus Web Tool Pills, Turn Delta Tool Completed Streaming Events, Long-Session Hardening Pass, Per-Session Prompt Single-Flight, Terminal SSE plus Auto-Reconnect, Web Permission Modal Answers permission.asked, Live Context Gauge (turn.context), TUI Space Key Types, Provider-Sourced Context Window, Router Context Cache with Caps, Dual Routing Session Headers, Session State Resync Endpoint, TUI Resync Timeline Rebuild, Missed-Started Recovery, Effort Variant Picker, TUI Default Effort XHigh, Gateway Models Effort Note, Web Session-Gone Recovery, Web Model Refresh on Open, Zen limit.context Window, Zen reasoning.effort Ladder, Zen 28-Model Live Verification, Composer Model Filter, App Default Model Label, applyModel setSession Refresh, Model Switch Live Verification, models.list Plugin Hook, Zen Canonical-ID Twin Merge, Core Generic-Parse / Plugin Enrich Split, Zen Plugin Rust Tests, Zen-Go Twin Endpoint Binding, Zen Twin Suppression Rule, Effort Step-Down Retry, effort_step_down and is_effort_error Helpers, rules/ Plural-Dir Convention, rules.rs Discovery and Fence Tests, Canonical Effort Ladder (none..max), Advertised Effort Passthrough, Per-Model Effort Picker, Web/CLI Workspace Dir Mismatch, Workspace Path Normalization, Daemon TMPDIR May Not Exist
 
 ### Community 2 - "Subagent Background Web Tools"
 Cohesion: 0.40

@@ -27,7 +27,7 @@ pub struct LaunchOpts {
     pub mode: Option<String>,
 }
 
-const EFFORTS: [&str; 6] = ["auto", "low", "medium", "high", "xhigh", "max"];
+const EFFORTS: [&str; 8] = ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const MODES: [&str; 4] = ["ask", "auto-edit", "auto-approve", "bypass"];
 
 struct PermModal {

@@ -11,7 +11,7 @@ Verification matrix for `8nite/lumina` against `plan.md` (§1–§14) and `AGENT
 
 - **Workspace:** `<workspace-checkout>`
 - **Build target:** `CGO_ENABLED=0` static Go binary (`go1.22+`) + Vite/React 19 SPA (`node v22`, `pnpm`).
-- **State isolation:** Every CLI / integration / daemon test MUST set `LUMINA_DB=/tmp/lumina-test-<run>/lumina.db` and bind ephemeral/isolated ports (`127.0.0.1:17432+`), never polluting `~/.local/share/lumina/lumina.db` or colliding with `:7432`.
+- **State isolation:** Every CLI / integration / daemon test MUST set `LUMINA_DB=/tmp/lumina-test-<run>/lumina.db` and bind ephemeral/isolated ports (`127.0.0.1:17432+`), never polluting `~/.local/share/lumina/lumina.db` or colliding with `:4089`.
 - **Scratch hygiene:** All `/tmp/lumina-*` scratch directories created during testing are removed before exit.
 - **No-secret / No-Google rule:** Never read live credential files; test credential guards solely against synthetic dummy filenames inside `/tmp/lumina-test-*` (`t.TempDir()`).
 
@@ -60,7 +60,7 @@ Verification matrix for `8nite/lumina` against `plan.md` (§1–§14) and `AGENT
 
 | ID | Check | Scenario | Pass Criteria | Status |
 |---|---|---|---|---|
-| `TP-01.1` | Missing config defaults | `config.Load` on non-existent path | `127.0.0.1:7432`, `permission_mode="ask"`, `standing_ops=true`, `debounce=15` | `PASS` |
+| `TP-01.1` | Missing config defaults | `config.Load` on non-existent path | `127.0.0.1:4089`, `permission_mode="ask"`, `standing_ops=true`, `debounce=15` | `PASS` |
 | `TP-01.2` | Plaintext `api_key` rejection | `api_key = "sk-live-..."` in `config.toml` | `Load` returns hard error refusing plaintext key | `PASS` |
 | `TP-01.3` | Google endpoint rejection | `base_url` with `generativelanguage.googleapis.com`, `aiplatform.googleapis.com`, `fonts.googleapis.com`, `vertexai` | `Load` returns hard error (`blocked Google endpoint`) | `PASS` |
 | `TP-01.4` | Google env var rejection | `api_key_env = "GEMINI_API_KEY"` / `"GOOGLE_API_KEY"` | `Load` returns hard error | `PASS` |
@@ -278,7 +278,7 @@ scratch in `/tmp/lumina-*` (removed after), synthetic-only fixtures
 | Suite | Result | Evidence |
 |---|---|---|
 | `TP-00` | PASS | `go vet ./...` 0 warnings; `go test ./...` all green; `go test -race ./internal/... ./pkg/...` green, zero data races; `pnpm test` + `pnpm build` green; `make build` emits static `bin/lumina` (`ldd`: not a dynamic executable); supply audit: no Google SDKs/URLs in `go.mod`/`web/package.json`/sources/bundle (only React dev error-code link) |
-| `TP-01` | PASS | `TestDefaultsWhenMissing` (+`TestPermissionsTables`, matrix `TP-01.1/01.5/01.6`): `127.0.0.1:7432`, `ask`, `standing_ops=true`, `debounce=15`; plaintext `api_key` rejected; Google domains + `GEMINI/GOOGLE_API_KEY` env rejected; `api_key_env`/`api_key_cmd` resolve in-memory; `PersistModel` round-trips |
+| `TP-01` | PASS | `TestDefaultsWhenMissing` (+`TestPermissionsTables`, matrix `TP-01.1/01.5/01.6`): `127.0.0.1:4089`, `ask`, `standing_ops=true`, `debounce=15`; plaintext `api_key` rejected; Google domains + `GEMINI/GOOGLE_API_KEY` env rejected; `api_key_env`/`api_key_cmd` resolve in-memory; `PersistModel` round-trips |
 | `TP-02` | PASS | Matrix `TP-02.2–02.6` + package tests: plan+bypass denies source edits; out-of-workspace `plan.md` escapes denied; adversarial `>`,`>>`,`;`,`&&`,`\|`,`$()`,backticks,`<` denied in plan mode; credential/`.kube`/Google hard-deny in bypass; `path`+`file` aliases fenced; grep walk skips secret files; build matrix matches plan table cell-for-cell |
 | `TP-03` | PASS | Matrix `TP-03.1–03.4` + adapter tests: OpenAI SSE deltas/thinking/tool-calls; Responses text + function-call reassembly; Anthropic text/thinking/`tool_use` streaming **and** `input_schema` sent; Ollama NDJSON; router planner↔executor promotion + Google rejection |
 | `TP-04` | PASS | `TestAgenticToolLoop` + matrix `TP-04.4`: 3-round mock-LLM loop, files written, JSON schemas sent, kb/skill wired; sanitize redacts `sk-/AKIA/Bearer`; checkpoint hygiene (user `.git/index` untouched, zero `.lock` leaks, untracked files survive); MCP stdio + SSE transports, Google SSE URL blocked |

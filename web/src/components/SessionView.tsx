@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Composer } from './Composer';
-import { LinkifiedText } from './LinkifiedText';
+import { LinkifiedText, type FileTarget } from './LinkifiedText';
 import type { PromptAttachment } from '../api/client';
 
 export interface Turn {
@@ -65,17 +65,39 @@ export function formatSummary(s: TurnSummary | null): string {
 }
 
 // --- v2-style conversation rows -------------------------------------------
-// Row model mirrors opencode v2 session-ui/timeline rows: user message,
-// grouped tool calls (read group collapsed, shell monospace, errors open),
-// thinking, error card, turn diff. Data comes from Lumina's transcript
-// (tool turns are `name: output`) + live SSE steps.
+// Row model mirrors opencode v2 session-ui/timeline rows under the default
+// compact preset: user message, grouped tool calls (read group collapsed,
+// shell monospace, error cards collapsed), thinking, error card, turn diff.
+// Data comes from Lumina's transcript (tool turns are `name: output`) +
+// live SSE steps. (v2 refs: session-ui/timeline/detail.ts compact preset,
+// current-tool-state.ts currentContentDefaultOpen — errored tools start
+// collapsed; #58062 confirms user `!` shells also collapse by design.)
 
 const READ_TOOLS = new Set(['read', 'glob', 'grep', 'lsp', 'kb_query', 'skill']);
 
+// Transcript shapes (must all collapse like live rows):
+// - live done rows: `name: body` (App turn.tool handler)
+// - persisted history: `[tool result name]\n<body>` and `tool name failed: ...`
+//   (src/agent.rs stores every tool output as a `user` turn). Anything whose
+// body starts with `[tool result ` and isn't a real user message folds here.
 function parseTool(text: string): { name: string; body: string } {
+  const m = /^\[tool result ([^\]]+)\]\n?([\s\S]*)$/.exec(text.trimStart());
+  if (m) return { name: m[1].trim() || 'tool', body: (m[2] || '').trimStart() };
+  const f = /^tool (\S+) failed:\s*([\s\S]*)$/.exec(text.trimStart());
+  if (f) return { name: f[1].trim() || 'tool', body: (f[2] || '').trimStart() };
+  const arrow = /^tool (\S+)\s*→\n?([\s\S]*)$/.exec(text.trimStart());
+  if (arrow) return { name: arrow[1].trim() || 'tool', body: (arrow[2] || '').trimStart() };
   const i = text.indexOf(':');
   if (i < 0) return { name: text.trim() || 'tool', body: '' };
   return { name: text.slice(0, i).trim() || 'tool', body: text.slice(i + 1).trimStart() };
+}
+
+function isToolText(text: string): boolean {
+  const t = text.trimStart();
+  if (/^\[tool result [^\]]+\]/.test(t)) return true;
+  if (/^tool \S+ failed:/.test(t)) return true;
+  if (/^tool \S+\s*→/.test(t)) return true;
+  return false;
 }
 
 function oneLine(s: string, n = 120): string {
@@ -129,15 +151,18 @@ function fmtTime(iso?: string): string {
 }
 
 function ToolRow(props: { name: string; body: string; error: boolean; live?: boolean; duration_ms?: number }) {
-  const shell = props.name === 'bash' || props.name === 'task_output';
-  const [open, setOpen] = useState(props.error || shell);
+  // opencode v2: every finished tool row starts collapsed to a one-line
+  // preview; click toggles the full body.
+  const [open, setOpen] = useState(false);
   const summary = oneLine(props.body) || (props.live ? 'running…' : '(no output)');
+  const shell = props.name === 'bash' || props.name === 'task_output';
   return (
     <div className="rounded-[6px] border border-[var(--v2-border-base)]">
       <button
         className="flex w-full items-center gap-1.5 px-2 py-1 text-left"
         onClick={() => setOpen(!open)}
         title={props.body.slice(0, 300) || props.name}
+        aria-expanded={open}
       >
         <span
           className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${props.error ? 'bg-red-500' : props.live ? 'animate-pulse bg-amber-400' : ''}`}
@@ -167,7 +192,11 @@ function ToolRow(props: { name: string; body: string; error: boolean; live?: boo
 
 function ToolGroup(props: { tools: { idx: number; t: Turn }[] }) {
   const [show, setShow] = useState(false);
-  const parsed = props.tools.map(({ idx, t }) => ({ idx, error: t.role === 'tool_error', ...parseTool(t.text) }));
+  const parsed = props.tools.map(({ idx, t }) => {
+    const p = parseTool(t.text);
+    const failed = t.role === 'tool_error' || /^tool \S+ failed:/.test(t.text.trimStart());
+    return { idx, error: failed, ...p };
+  });
   const allRead = parsed.length > 1 && parsed.every((p) => READ_TOOLS.has(p.name));
   if (allRead && !show) {
     return (
@@ -258,6 +287,7 @@ export function SessionView(props: {
   onPerm: (p: string) => void;
   working: boolean;
   effort: string;
+  effortOptions?: string[];
   onEffort: (e: string) => void;
   attachments: PromptAttachment[];
   onAttach: (f: FileList | File[] | null) => void;
@@ -274,6 +304,7 @@ export function SessionView(props: {
   onRetry: () => void;
   changed: { files: string[]; stat: string } | null;
   queue: QueuedPrompt[];
+  onFile?: (t: FileTarget) => void;
 }) {
   const [showAllChanged, setShowAllChanged] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -286,7 +317,7 @@ export function SessionView(props: {
   // rendered in place, so the timeline follows transcript insertion order
   // (assistant reasoning between tool rounds stays where it happened
   // instead of collapsing into one block above the final text).
-  const isToolTurn = (t: Turn) => t.role === 'tool' || t.role === 'tool_error';
+  const isToolTurn = (t: Turn) => t.role === 'tool' || t.role === 'tool_error' || (t.role === 'user' && isToolText(t.text));
   // Capsule counts for the composer lane, from live (still-running) steps.
   const running = props.liveSteps.filter((s) => s.phase === 'start');
   const runningShells = running.filter((s) => s.tool === 'bash' || s.tool === 'task_output').length;
@@ -352,7 +383,7 @@ export function SessionView(props: {
                     className="rounded-[8px] px-4 py-3 text-[13px] leading-5 text-[var(--v2-text-base)] select-text"
                     style={{ background: 'var(--user-bubble)', border: '1px solid var(--user-border)' }}
                   >
-                    <LinkifiedText text={t.text} />
+                    <LinkifiedText text={t.text} onFile={props.onFile} />
                   </div>
                   <button
                     className="mt-1 text-[12px] text-[var(--v2-text-faint)] hover:text-[var(--v2-text-muted)]"
@@ -379,15 +410,36 @@ export function SessionView(props: {
             }
             // Thinking arrives as one dialog per pause (flushed live on
             // pause/tool boundaries, persisted per round server-side).
+            // opencode v2: thinking streams arrive as packed sentences, so
+            // split into one indented line per sentence for scanability
+            // (short fragments stay on one line).
             if (t.role === 'thinking') {
+              const flat = t.text.replace(/\s+/g, ' ').trim();
+              const sentences =
+                flat.length > 60
+                  ? flat
+                      .split(/(?<=[.!?])\s+(?=[A-Z0-9*`\-\[{])/)
+                      .map((s) => s.trim())
+                      .filter(Boolean)
+                  : flat
+                    ? [flat]
+                    : [];
               return (
                 <div key={i}>
                   <div className="mb-1 text-[12px] text-[var(--v2-text-faint)]">thinking</div>
                   <div
-                    className="rounded-[8px] px-4 py-3 text-[13px] leading-5 text-[var(--v2-text-muted)] select-text"
+                    className="space-y-1 rounded-[8px] px-4 py-3 text-[13px] leading-5 text-[var(--v2-text-muted)] select-text"
                     style={{ background: 'var(--v2-bg-base)', border: '1px dashed var(--v2-border-base)' }}
                   >
-                    <LinkifiedText text={t.text} />
+                    {sentences.length > 1 ? (
+                      sentences.map((s, si) => (
+                        <div key={si} className="border-l-2 border-[var(--v2-border-base)] pl-3">
+                          <LinkifiedText text={s} onFile={props.onFile} />
+                        </div>
+                      ))
+                    ) : (
+                      <LinkifiedText text={t.text} onFile={props.onFile} />
+                    )}
                   </div>
                 </div>
               );
@@ -396,7 +448,7 @@ export function SessionView(props: {
             return (
               <div key={i} className="space-y-2">
                 <div className="whitespace-pre-wrap text-[13px] leading-5 text-[var(--v2-text-base)] select-text">
-                  <LinkifiedText text={t.text} />
+                  <LinkifiedText text={t.text} onFile={props.onFile} />
                 </div>
                 {i === lastAssistant && !props.working && (
                   <div className="flex items-center gap-2 text-[12px] text-[var(--v2-text-faint)]">
@@ -589,6 +641,7 @@ export function SessionView(props: {
             perm={props.perm}
             onPerm={props.onPerm}
             effort={props.effort}
+            effortOptions={props.effortOptions}
             onEffort={props.onEffort}
             attachments={props.attachments}
             onAttach={props.onAttach}

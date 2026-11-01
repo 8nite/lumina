@@ -87,15 +87,22 @@ pub fn split_model(s: &str) -> (String, String) {
     }
 }
 
+/// Canonical reasoning ladder, low to high: none < minimal < low < medium <
+/// high < xhigh < max. This is the union of provider API vocabularies
+/// (opencode advertises minimal/none); per-model SELECTABILITY comes from
+/// each model's advertised `supported_efforts` (see `efforts_or_default`),
+/// never from this list alone.
 pub fn normalize_effort(s: &str) -> &str {
     match s.trim().to_lowercase().as_str() {
-        "low" | "medium" | "high" | "xhigh" | "max" => {
+        "low" | "medium" | "high" | "xhigh" | "max" | "minimal" | "none" => {
             // ponytail: borrow the matching static without allocating.
             match s.trim().to_lowercase().as_str() {
                 "low" => "low",
                 "medium" => "medium",
                 "high" => "high",
                 "xhigh" => "xhigh",
+                "minimal" => "minimal",
+                "none" => "none",
                 _ => "max",
             }
         }
@@ -106,7 +113,7 @@ pub fn normalize_effort(s: &str) -> &str {
 pub fn valid_effort(s: &str) -> bool {
     matches!(
         s.trim().to_lowercase().as_str(),
-        "" | "auto" | "low" | "medium" | "high" | "xhigh" | "max"
+        "" | "auto" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
     )
 }
 
@@ -114,6 +121,8 @@ pub fn valid_effort(s: &str) -> bool {
 pub fn effort_label(s: &str) -> &str {
     match normalize_effort(s) {
         "" => "auto",
+        "none" => "none",
+        "minimal" => "minimal",
         "low" => "low",
         "medium" => "medium",
         "high" => "high",
@@ -124,30 +133,37 @@ pub fn effort_label(s: &str) -> &str {
 
 /// Anthropic thinking budget ladder (must be >= 1024 when set).
 /// Position on the reasoning ladder (auto/"" = -1, provider default).
+/// `none` budgets 0 (thinking omitted); `minimal` takes the API floor.
 pub fn effort_index(effort: &str) -> i32 {
     match normalize_effort(effort) {
         "" => -1,
-        "low" => 0,
-        "medium" => 1,
-        "high" => 2,
-        "xhigh" => 3,
-        "max" => 4,
+        "none" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" => 5,
+        "max" => 6,
         _ => -1,
     }
 }
 
 /// Advertised ladder with "auto" prepended, or the global ladder when the
-/// provider advertises nothing (empty = unknown).
+/// provider advertises nothing (empty = unknown). Advertised tokens pass
+/// through verbatim (deduped) — never filtered to a hardcoded subset — so
+/// provider vocabularies like `minimal`/`none` survive to pickers and wire.
 pub fn efforts_or_default(supported: &[String]) -> Vec<String> {
-    const LADDER: [&str; 6] = ["auto", "low", "medium", "high", "xhigh", "max"];
+    const LADDER: [&str; 8] = ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
     if supported.is_empty() {
         return LADDER.iter().map(|s| s.to_string()).collect();
     }
     let mut out = vec!["auto".to_string()];
-    for v in &LADDER[1..] {
-        if supported.iter().any(|x| normalize_effort(x) == *v) && !out.iter().any(|o| o == v) {
-            out.push(v.to_string());
+    for s in supported {
+        let v = normalize_effort(s);
+        if v.is_empty() || out.iter().any(|o| o == v) {
+            continue;
         }
+        out.push(v.to_string());
     }
     if out.len() == 1 {
         return LADDER.iter().map(|s| s.to_string()).collect();
@@ -180,8 +196,35 @@ pub fn effort_budget(effort: &str) -> u32 {
         "high" => 10000,
         "xhigh" => 20000,
         "max" => 32000,
+        // minimal takes the API floor; none budgets 0 (thinking omitted).
+        "minimal" => 1024,
         _ => 0,
     }
+}
+
+/// One rung down the reasoning ladder; None at/below the floor ("",
+/// provider default). Steps down after an effort-rejection 400 instead of
+/// failing the turn on a stale pick or an unadvertised ladder.
+pub fn effort_step_down(effort: &str) -> Option<&'static str> {
+    Some(match normalize_effort(effort) {
+        "max" => "xhigh",
+        "xhigh" => "high",
+        "high" => "medium",
+        "medium" => "low",
+        "low" => "minimal",
+        "minimal" => "none",
+        "none" => "",
+        _ => return None,
+    })
+}
+
+/// True when a 400 body blames the reasoning effort (e.g. opencode zen:
+/// "does not support reasoning_effort='max'"). Transport-level signal for
+/// the step-down retry; values are never parsed out of the message.
+pub fn is_effort_error(body: &str) -> bool {
+    let b = body.to_lowercase();
+    b.contains("reasoning")
+        && (b.contains("effort") || b.contains("support") || b.contains("invalid"))
 }
 
 #[derive(Debug, Clone)]
@@ -690,14 +733,37 @@ async fn chat_openai(
         http = http.header(*k, v.clone());
     }
     // Session routing (stable per request; opencode zen routes on these).
+    // Effort step-down (responses parity): retry down the ladder on an
+    // effort-rejection 400 instead of failing the turn.
     let sid = uuid::Uuid::new_v4().to_string();
-    http = http.header("x-lumina-session", &sid).header("x-opencode-session", &sid);
-    let res = http.json(&body).send().await?;
-    if !res.status().is_success() {
+    let mut effort = normalize_effort(&req.reasoning_effort).to_string();
+    let res = loop {
+        if effort.is_empty() {
+            if let Some(o) = body.as_object_mut() {
+                o.remove("reasoning_effort");
+            }
+        } else {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        }
+        let mut http = client().post(&url).headers(auth_headers(def));
+        for (k, v) in extra_headers {
+            http = http.header(*k, v.clone());
+        }
+        http = http.header("x-lumina-session", &sid).header("x-opencode-session", &sid);
+        let res = http.json(&body).send().await?;
+        if res.status().is_success() {
+            break res;
+        }
         let st = res.status();
         let t = res.text().await.unwrap_or_default();
+        if st.as_u16() == 400 && !effort.is_empty() && is_effort_error(&t) {
+            if let Some(down) = effort_step_down(&effort) {
+                effort = down.to_string();
+                continue;
+            }
+        }
         return Err(LlmError::Msg(format!("openai {url}: {st}: {t}")));
-    }
+    };
     // Accumulate per-index tool-call fragments, then emit completed calls with Done.
     let mut arg_bufs: HashMap<u32, (String, String, String)> = HashMap::new(); // idx -> (id, name, args)
     let mut usage = Usage::default();
@@ -1108,10 +1174,9 @@ fn is_zero(n: &u32) -> bool {
 
 /// Live model listing for pickers (`lumina models`, TUI /model, web picker).
 /// Metadata failures mean "unknown" — never fail a turn over listing.
-/// OpenAI-style model listing (GET /models; OpenRouter `context_length`;
-/// opencode zen/go `limit.context` + `capabilities.reasoning.effort` per
-/// https://opencode.ai/docs/console/go "Fetch the full list ... from the
-/// models endpoint").
+/// OpenAI-style model listing (GET /models; OpenRouter `context_length`).
+/// Provider-specific schemas (e.g. opencode zen `limit.context`) belong in
+/// plugins via the `models.list` hook, not here.
 async fn openai_models(def: &ProviderDef, extra: &[(&str, String)]) -> Result<Vec<ModelMeta>, LlmError> {
     let url = format!("{}/models", def.base_url.trim_end_matches('/'));
     let mut req = client().get(&url).headers(auth_headers(def));
@@ -1138,11 +1203,6 @@ async fn openai_models(def: &ProviderDef, extra: &[(&str, String)]) -> Result<Ve
                     .or_else(|| m.get("context_window"))
                     .or_else(|| m.get("max_context_window"))
                     .and_then(|n| n.as_u64())
-                    .or_else(|| {
-                        m.get("limit")
-                            .and_then(|l| l.get("context"))
-                            .and_then(|n| n.as_u64())
-                    })
                     .unwrap_or(0) as u32,
                 supported_efforts: m
                     .get("supported_efforts")
@@ -1151,18 +1211,6 @@ async fn openai_models(def: &ProviderDef, extra: &[(&str, String)]) -> Result<Ve
                         a.iter()
                             .filter_map(|e| e.as_str().map(|s| s.to_string()))
                             .collect()
-                    })
-                    .filter(|v: &Vec<String>| !v.is_empty())
-                    .or_else(|| {
-                        m.get("capabilities")
-                            .and_then(|c| c.get("reasoning"))
-                            .and_then(|r| r.get("effort"))
-                            .and_then(|v| v.as_array())
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
-                                    .collect()
-                            })
                     })
                     .unwrap_or_default(),
             });
@@ -1278,19 +1326,39 @@ async fn chat_responses(
     }
     // One routing session for both gateway headers (Go parity: single sid).
     let sid = uuid::Uuid::new_v4().to_string();
-    let res = client()
-        .post(&url)
-        .headers(auth_headers(def))
-        .header("x-lumina-session", &sid)
-        .header("x-opencode-session", &sid)
-        .json(&body)
-        .send()
-        .await?;
-    if !res.status().is_success() {
+    // Effort step-down: a stale pick or unadvertised ladder 400s on
+    // unsupported rungs (e.g. iceman rejects max) — walk down to the
+    // provider default instead of failing the turn.
+    let mut effort = normalize_effort(&req.reasoning_effort).to_string();
+    let res = loop {
+        if effort.is_empty() {
+            if let Some(o) = body.as_object_mut() {
+                o.remove("reasoning");
+            }
+        } else {
+            body["reasoning"] = serde_json::json!({"effort": effort});
+        }
+        let res = client()
+            .post(&url)
+            .headers(auth_headers(def))
+            .header("x-lumina-session", &sid)
+            .header("x-opencode-session", &sid)
+            .json(&body)
+            .send()
+            .await?;
+        if res.status().is_success() {
+            break res;
+        }
         let st = res.status();
         let t = res.text().await.unwrap_or_default();
+        if st.as_u16() == 400 && !effort.is_empty() && is_effort_error(&t) {
+            if let Some(down) = effort_step_down(&effort) {
+                effort = down.to_string();
+                continue;
+            }
+        }
         return Err(LlmError::Msg(format!("responses {url}: {st}: {t}")));
-    }
+    };
     let mut pending: HashMap<u32, (String, String, String)> = HashMap::new(); // idx -> (id, name, args)
     let mut saw_text = false;
     let mut stream = res.bytes_stream();
@@ -1416,24 +1484,61 @@ mod tests {
     fn effort_helpers() {
         assert_eq!(effort_index("auto"), -1);
         assert_eq!(effort_index(""), -1);
-        assert_eq!(effort_index("xhigh"), 3);
+        assert_eq!(effort_index("none"), 0);
+        assert_eq!(effort_index("minimal"), 1);
+        assert_eq!(effort_index("low"), 2);
+        assert_eq!(effort_index("xhigh"), 5);
+        assert_eq!(effort_index("max"), 6);
         assert_eq!(effort_index("bogus"), -1);
-        assert_eq!(efforts_or_default(&[]), vec!["auto", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(efforts_or_default(&[]), vec!["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"]);
         assert_eq!(
             efforts_or_default(&["high".into(), "low".into()]),
-            vec!["auto", "low", "high"]
+            vec!["auto", "high", "low"]
         );
         assert_eq!(clamp_effort("max", &["low".into(), "high".into()]), "high");
         assert_eq!(clamp_effort("bogus", &["low".into()]), "low");
         assert_eq!(clamp_effort("low", &["low".into()]), "low");
+        // Advertised provider vocabularies pass through verbatim.
+        assert_eq!(
+            efforts_or_default(&["minimal".into(), "low".into(), "medium".into(), "high".into(), "xhigh".into()]),
+            vec!["auto", "minimal", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(clamp_effort("max", &["minimal".into(), "low".into(), "medium".into(), "high".into(), "xhigh".into()]), "xhigh");
+    }
+
+    #[test]
+    fn effort_step_down_walks_to_default() {
+        assert_eq!(effort_step_down("max"), Some("xhigh"));
+        assert_eq!(effort_step_down("xhigh"), Some("high"));
+        assert_eq!(effort_step_down("high"), Some("medium"));
+        assert_eq!(effort_step_down("medium"), Some("low"));
+        assert_eq!(effort_step_down("low"), Some("minimal"));
+        assert_eq!(effort_step_down("minimal"), Some("none"));
+        assert_eq!(effort_step_down("none"), Some(""));
+        assert_eq!(effort_step_down(""), None);
+        assert_eq!(effort_step_down("bogus"), None);
+    }
+
+    #[test]
+    fn effort_error_detects_rejection() {
+        assert!(is_effort_error("Upstream request failed: [invalid_request_error] Model 'iceman-contributor-free' does not support reasoning_effort='max'."));
+        assert!(is_effort_error("reasoning effort unsupported"));
+        assert!(!is_effort_error("Upstream request failed: Model is unavailable."));
+        assert!(!is_effort_error(""));
     }
 
     #[test]
     fn effort_ladder() {
         assert_eq!(normalize_effort(" XHigh "), "xhigh");
+        assert_eq!(normalize_effort("Minimal"), "minimal");
+        assert_eq!(normalize_effort("NONE"), "none");
         assert_eq!(normalize_effort("bogus"), "");
-        assert!(valid_effort("auto") && !valid_effort("ultra"));
+        assert!(valid_effort("auto") && valid_effort("minimal") && valid_effort("none") && !valid_effort("ultra"));
+        assert_eq!(effort_label("minimal"), "minimal");
+        assert_eq!(effort_label("none"), "none");
         assert_eq!(effort_budget("low"), 1024);
+        assert_eq!(effort_budget("minimal"), 1024);
+        assert_eq!(effort_budget("none"), 0);
         assert_eq!(effort_budget(""), 0);
     }
 
@@ -1497,12 +1602,12 @@ mod tests {
         assert_eq!(r.model_for("fast", "build"), "o/m");
     }
 
-    /// Opencode zen/go `/models` shape (per https://opencode.ai/docs/console/go):
-    /// window lives at `limit.context`, the reasoning ladder at
-    /// `capabilities.reasoning.effort` — neither is `context_length` /
-    /// `supported_efforts`, which the parser used to require.
+    /// Core parses only generic OpenAI/OpenRouter metadata (`context_length`,
+    /// `supported_efforts`). Provider-specific schemas (opencode zen
+    /// `limit.context`, `capabilities.reasoning.effort`) stay unknown here —
+    /// a plugin enriches them via the `models.list` hook.
     #[tokio::test]
-    async fn zen_models_parse_limit_and_efforts() {
+    async fn openai_models_parses_generic_window_and_efforts() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -1517,8 +1622,8 @@ mod tests {
                 head.push(b[0]);
             }
             let body = r#"{"data":[
-                {"id":"muse-spark-1.3-contributor","name":"Muse Spark 1.3 Contributor","limit":{"context":1048576},"capabilities":{"reasoning":{"effort":["minimal","low","medium","high","xhigh"]}}},
-                {"id":"beam-free","name":"Beam Free","context_length":200000}
+                {"id":"muse-spark-1.3-contributor","name":"Muse Spark 1.3 Contributor","context_length":1048576,"supported_efforts":["low","high"],"limit":{"context":2097152},"capabilities":{"reasoning":{"effort":["minimal","low","medium","high","xhigh"]}}},
+                {"id":"beam-free","name":"Beam Free"}
             ]}"#;
             let _ = s.write_all(
                 format!(
@@ -1537,13 +1642,13 @@ mod tests {
         };
         let models = openai_models(&def, &[]).await.expect("models");
         assert_eq!(models.len(), 2, "{models:?}");
-        // Sorted by id: beam-free first.
+        // Sorted by id: beam-free first, generic fields only.
         assert_eq!(models[0].id, "beam-free");
-        assert_eq!(models[0].context_window, 200000);
+        assert_eq!(models[0].context_window, 0);
         assert!(models[0].supported_efforts.is_empty());
         assert_eq!(models[1].id, "muse-spark-1.3-contributor");
         assert_eq!(models[1].context_window, 1048576, "{models:?}");
-        assert_eq!(models[1].supported_efforts, vec!["minimal", "low", "medium", "high", "xhigh"]);
+        assert_eq!(models[1].supported_efforts, vec!["low", "high"]);
     }
 }
 
@@ -1613,6 +1718,80 @@ mod responses_tests {
         }
         assert!(done);
         assert_eq!(text, "DONE FALLBACK", "fallback .done text must be delivered");
+    }
+
+    /// Effort step-down: a 400 blaming reasoning_effort retries one rung
+    /// lower instead of failing the turn (iceman rejects max).
+    #[tokio::test]
+    async fn effort_rejection_steps_down_and_recovers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            // Two attempts: max 400s, xhigh succeeds.
+            for _ in 0..2 {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    let mut b = [0u8; 1];
+                    if s.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                // Read the JSON body (Content-Length) to see the effort.
+                let len = String::from_utf8_lossy(&head)
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if len > 0 && s.read_exact(&mut body).is_err() {
+                    return;
+                }
+                let asked_max = String::from_utf8_lossy(&body).contains("\"effort\":\"max\"");
+                let (status, payload) = if asked_max {
+                    ("400 Bad Request", "{\"error\":{\"type\":\"server_error\",\"message\":\"Upstream request failed: [invalid_request_error] Model 'm' does not support reasoning_effort='max'.\"}}".to_string())
+                } else {
+                    ("200 OK", "data: {\"type\":\"response.completed\"}\n\n".to_string())
+                };
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        let def = ProviderDef {
+            protocol: "openai-responses".into(),
+            base_url: format!("http://{addr}"),
+            api_key: String::new(),
+            github_token: String::new(),
+            token_url: String::new(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = Request {
+            model: "m".into(),
+            messages: vec![llm_message("user", "hi")],
+            tools: vec![],
+            max_tokens: 0,
+            reasoning_effort: "max".into(),
+            images: vec![],
+        };
+        chat_responses(&def, req, tx).await.expect("retry must recover");
+        let mut done = false;
+        while let Some(c) = rx.recv().await {
+            if c.done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "stream must terminate after the stepped-down retry");
     }
 
     fn llm_message(role: &str, content: &str) -> Message {

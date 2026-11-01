@@ -5,6 +5,7 @@ import {
   setApiBase,
   getApiBase,
   fileToAttachment,
+  EFFORTS,
   type Session,
   type DaemonEvent,
   type PromptAttachment,
@@ -40,8 +41,12 @@ export default function App() {
     }
   });
   const [rightTab, setRightTab] = useState('review');
+  const [fileFocus, setFileFocus] = useState<{ path: string; line?: number; n: number } | null>(null);
   const [serversOpen, setServersOpen] = useState(false);
   const [modelOptions, setModelOptions] = useState<string[]>([]);
+  // Per-model advertised effort ladders (plugin-enriched /models metadata).
+  // Empty/absent = unknown ladder → global EFFORTS fallback.
+  const [modelEfforts, setModelEfforts] = useState<Record<string, string[]>>({});
   const [homeAgent, setHomeAgent] = useState('build');
   const [homePerm, setHomePerm] = useState('bypass');
   const [homeModel, setHomeModel] = useState('');
@@ -291,13 +296,20 @@ export default function App() {
           const name = typeof pv === 'string' ? pv : pv.name;
           api
             .models(name)
-            .then((m) =>
+            .then((m) => {
+              const entries = (m.models || []).map((x) => ({
+                id: x.id.includes('/') ? x.id : `${name}/${x.id}`,
+                efforts: x.supported_efforts || [],
+              }));
               setModelOptions((prev) =>
-                Array.from(
-                  new Set([...prev, ...(m.models || []).map((x) => (x.id.includes('/') ? x.id : `${name}/${x.id}`))]),
-                ),
-              ),
-            )
+                Array.from(new Set([...prev, ...entries.map((e) => e.id)])),
+              );
+              setModelEfforts((prev) => {
+                const next = { ...prev };
+                for (const e of entries) if (e.efforts.length) next[e.id] = e.efforts;
+                return next;
+              });
+            })
             .catch(() => {});
         }
       })
@@ -313,6 +325,21 @@ export default function App() {
     const t = setInterval(() => setNow(Date.now()), 500);
     return () => clearInterval(t);
   }, [working]);
+
+  // Watchdog: the daemon SSE broadcast sheds the oldest event on overflow
+  // (including turn.completed) and Lagged skips never resurface — a missed
+  // terminal while connected leaves the spinner forever (session 56d41a74
+  // completed backend-side at 13:21:56 but the UI never settled).
+  // syncActiveSession already stops the spinner + refetches history when
+  // running==false, so poll it while working as a missed-terminal backstop.
+  useEffect(() => {
+    if (!working) return;
+    const t = setInterval(() => {
+      const sid = sessionRef.current?.id;
+      if (sid) void syncActiveSession(sid);
+    }, 15000);
+    return () => clearInterval(t);
+  }, [working, syncActiveSession]);
 
   useEffect(() => {
     refresh();
@@ -578,6 +605,24 @@ export default function App() {
   const perm = session?.permission_mode ?? homePerm;
   // ponytail: show executor default instead of literal "model" on new session
   const model = session?.model || homeModel || modelOptions[0] || 'loading…';
+  // Per-model effort ladder when advertised (plugin-enriched /models);
+  // global EFFORTS fallback when the ladder is unknown.
+  const effortOptions = (() => {
+    const adv = modelEfforts[model];
+    if (adv && adv.length) {
+      const seen = new Set<string>();
+      const out: string[] = [''];
+      for (const e of adv) {
+        const v = (e || '').toLowerCase();
+        if (v && !seen.has(v)) {
+          seen.add(v);
+          out.push(v);
+        }
+      }
+      return out;
+    }
+    return EFFORTS;
+  })();
 
   const flipAgent = async () => {
     const next = agent === 'plan' ? 'build' : 'plan';
@@ -600,8 +645,10 @@ export default function App() {
   };
 
   const applyModel = async (id: string) => {
-    if (session) await api.patchSession(session.id, { model: id });
-    else setHomeModel(id);
+    if (session) {
+      const s = await api.patchSession(session.id, { model: id });
+      setSession(s);
+    } else setHomeModel(id);
     await api.setRouter('executor', id).catch(() => {});
     setModelOptions((prev) => (prev.includes(id) ? prev : [...prev, id]));
     refreshModels();
@@ -689,7 +736,20 @@ export default function App() {
       try {
         const r = await api.prompt(s.id, text, atts, effort || undefined, delivery);
         if (r.status === 'queued') setStage(`queued #${r.position ?? ''}`.trim());
+        else if (r.status === 'accepted') setStage('accepted — catching up…');
       } catch (err) {
+        // Retries exhausted in the client: drop the optimistic row only when
+        // the daemon is truly idle; a running turn means the submit landed
+        // and SSE will deliver it.
+        try {
+          const st = await api.sessionState(s.id);
+          if (st.running) {
+            setStage('submit timed out — turn still running, catching up…');
+            return;
+          }
+        } catch {
+          /* state unreachable; fall through to failure */
+        }
         setQueuedBoth(queuedRef.current.slice(0, -1));
         alert(String(err));
       }
@@ -703,7 +763,20 @@ export default function App() {
     try {
       const r = await api.prompt(s.id, text, atts, effort || undefined, delivery);
       if (r.status === 'queued') setStage(`queued #${r.position ?? ''}`.trim());
+      else if (r.status === 'accepted') setStage('accepted — catching up…');
     } catch (err) {
+      // Client retries (with cooldown) already exhausted: the turn may still
+      // be running server-side (detached drain survives a lost response), in
+      // which case keep the spinner and let SSE/state finish it.
+      try {
+        const st = await api.sessionState(s.id);
+        if (st.running) {
+          setStage('submit timed out — turn still running, catching up…');
+          return;
+        }
+      } catch {
+        /* state unreachable; fall through to failure */
+      }
       setWorking(false);
       setTurnStart(null);
       alert(String(err));
@@ -867,6 +940,7 @@ export default function App() {
                     perm={perm}
                     onPerm={setHomePerm}
                     effort={effort}
+                    effortOptions={effortOptions}
                     onEffort={setEffort}
                     attachments={attachments}
                     onAttach={(f) => void onAttach(f)}
@@ -878,6 +952,7 @@ export default function App() {
                 ) : (
                   <SessionView
                     turns={turns}
+                    onFile={(t) => { setReviewOpen(true); setRightTab('review'); setFileFocus({ path: t.path, line: t.line, n: Date.now() }); }}
                     onUndo={(i) => session && api.revert(session.id).then(() => setTurns((t) => t.slice(0, i)))}
                     input={input}
                     onInput={setInput}
@@ -892,11 +967,11 @@ export default function App() {
                     perm={perm}
                     onPerm={(p) => api.patchSession(session.id, { permission_mode: p }).then(setSession)}
                     effort={effort}
+                    effortOptions={effortOptions}
                     onEffort={setEffort}
                     attachments={attachments}
                     onAttach={(f) => void onAttach(f)}
                     onRemoveAttachment={(i) => setAttachments((a) => a.filter((_, j) => j !== i))}
-                    working={working}
                     liveText={liveText}
                     liveThinking={liveThinking}
                     liveSteps={liveSteps}
@@ -908,6 +983,7 @@ export default function App() {
                     onRetry={retry}
                     changed={changed}
                     queue={queued}
+                    working={working}
                   />
                 )}
               </div>
@@ -918,6 +994,7 @@ export default function App() {
                       tab={rightTab}
                       onTab={setRightTab}
                       workspace={session.workspace_dir}
+                      focus={fileFocus}
                       term={<TerminalPane />}
                       graph={<GraphifyPane />}
                       memory={

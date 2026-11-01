@@ -19,6 +19,7 @@ export function Composer(props: {
   perm: string;
   onPerm: (p: string) => void;
   effort: string;
+  effortOptions?: string[];
   onEffort: (e: string) => void;
   attachments: PromptAttachment[];
   onAttach: (files: FileList | File[] | null) => void;
@@ -165,7 +166,7 @@ export function Composer(props: {
           </button>
           {open === 'effort' && (
             <div className={menu} style={{ border: '1px solid var(--v2-border-base)' }}>
-              {EFFORTS.map((e) => (
+              {(props.effortOptions && props.effortOptions.length ? props.effortOptions : EFFORTS).map((e) => (
                 <button key={e || 'auto'} className="v2-row block w-full rounded-[6px] px-2 py-1.5 text-left capitalize"
                   onClick={() => { props.onEffort(e); setOpen(null); }}>
                   {e || 'auto'}

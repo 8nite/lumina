@@ -16,7 +16,7 @@ Keep changes boring, minimal, and reversible.
 - Plan mode is read-only: research and blueprints go in `plan.md` or
   `.lumina/plans/*.md`. Flip to build mode (`Tab`) before editing code.
 - Commit messages: short, imperative (`docs:`, `feat:`, `fix:`).
-- Server port is fixed at `127.0.0.1:7432` (code default in `src/config.rs`
+- Server port is fixed at `127.0.0.1:4089` (code default in `src/config.rs`
   and `src/main.rs`) — do not change it and do not start competing daemons
   on other ports. Ephemeral test daemons must use random free ports and be
   stopped afterwards.
@@ -38,7 +38,7 @@ Keep changes boring, minimal, and reversible.
 ## Architecture (`src/`, see `plan.md`)
 
 - `src/main.rs` — single CLI entry (TUI, `run`, `serve`, `web`, `attach`, `session`, `plugin`, `kb`, `evolve`, `models`, `auth`, `pair`, `openapi`, `vault`).
-- `src/server.rs` — axum daemon: REST + SSE + PTY WS on `127.0.0.1:7432` (fixed port, see above), embedded SPA (`rust-embed`).
+- `src/server.rs` — axum daemon: REST + SSE + PTY WS on `127.0.0.1:4089` (fixed port, see above), embedded SPA (`rust-embed`).
 - `src/security.rs` — plan/build fence + 4-mode broker + credential/Google hard-deny.
 - `src/llm.rs` — BYO-LLM adapters (OpenAI-compat, Anthropic, Ollama, Copilot, Responses) + 3-tier router.
 - `src/agent.rs` — turn loop, compaction, loop guards, subagents, steer/queue.

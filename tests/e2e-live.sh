@@ -4,7 +4,7 @@
 # Requires: daemon up, network + configured provider (opencode_go default).
 # All workspaces are scratch dirs under /tmp; router/model state is restored.
 set -u
-BASE="http://127.0.0.1:7432"
+BASE="http://127.0.0.1:4089"
 REPOROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LUMINA_BIN="${LUMINA_BIN:-lumina-rs}"
 command -v "$LUMINA_BIN" >/dev/null || { echo "need $LUMINA_BIN on PATH"; exit 2; }
@@ -193,7 +193,7 @@ python3 - "$BASE" <<'PYEOF' > "$ROOT/pty.out" 2>&1
 import sys, socket, base64, os, struct
 base = sys.argv[1]
 host = base.split("//")[1].split(":")[0]
-port = int(base.split(":")[2]) if base.count(":") > 2 else 7432
+port = int(base.split(":")[2]) if base.count(":") > 2 else 4089
 s = socket.create_connection((host, port), timeout=10)
 key = base64.b64encode(os.urandom(16)).decode()
 s.sendall(f"GET /api/v1/pty HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())

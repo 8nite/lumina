@@ -165,6 +165,54 @@
       "output_tokens": 0,
       "files": 2,
       "note": "host-agent inline refresh of opencode-zen-models.md (3 nodes, 4 links) + MEMORY.md index description (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T07:02:02.704140+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 21,
+      "note": "host-agent inline refresh of rust-migration.md + model-picker-filter.md + model-switch-ui.md (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T07:19:27.018616+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 22
+    },
+    {
+      "date": "2026-11-01T07:31:00.568370+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of zen-twin-suppression.md (2 nodes, 4 links) + MEMORY.md index description (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T07:41:21.973205+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 3,
+      "note": "host-agent inline refresh of effort-stepdown.md (2 nodes) + rules-dir.md (2 nodes) + MEMORY.md index descriptions (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T10:59:39.905722+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of effort-ladder.md (3 nodes, 4 links) + MEMORY.md index description (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T11:59:05.757968+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of stuck-session-fix.md (4 nodes, 5 links) + MEMORY.md index entry (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T13:37:37.166252+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of session-resume-workspace.md (dangling [[session-loop-guard-stall]] -> [[stuck-session-fix]] + orphan stash fragment removal) (no-key flow)"
     }
   ],
   "total_input_tokens": 0,

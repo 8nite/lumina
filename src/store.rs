@@ -67,6 +67,56 @@ fn db_path(explicit: Option<&str>) -> PathBuf {
     Path::new(".lumina/lumina.db").to_path_buf()
 }
 
+/// Canonical workspace key so `.`/relative/absolute spellings of one
+/// directory share sessions (web resume, `-c` continue, TUI picker all
+/// compare through this). Canonicalizes via the filesystem when the path
+/// exists, else joins relative paths onto the process cwd and cleans `.` /
+/// `..` / trailing slashes lexically. Never fails: worst case returns the
+/// trimmed input.
+pub fn normalize_workspace(dir: &str) -> String {
+    let t = dir.trim();
+    if t.is_empty() || t == "." || t == "./" {
+        return std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".into());
+    }
+    // Strip trailing slashes (but keep root "/").
+    let t = t.trim_end_matches('/');
+    let t = if t.is_empty() { "/" } else { t };
+    let abs = {
+        let p = Path::new(t);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(p)
+        }
+    };
+    if let Ok(c) = std::fs::canonicalize(&abs) {
+        return c.display().to_string();
+    }
+    let mut out = PathBuf::new();
+    for comp in abs.components() {
+        use std::path::Component::*;
+        match comp {
+            Prefix(p) => out.push(p.as_os_str()),
+            RootDir => out.push("/"),
+            CurDir => {}
+            ParentDir => {
+                out.pop();
+            }
+            Normal(c) => out.push(c),
+        }
+    }
+    let s = out.display().to_string();
+    if s.is_empty() {
+        "/".into()
+    } else {
+        s
+    }
+}
+
 impl Store {
     pub fn open(explicit: Option<&str>) -> Result<Self, StoreError> {
         let path = db_path(explicit);
@@ -116,10 +166,13 @@ impl Store {
         mode: &str,
         model: &str,
     ) -> Result<Session, StoreError> {
+        // Normalize so `.`/relative/absolute spellings of one directory share
+        // sessions (web resume `-c` continue, TUI picker). See normalize_workspace.
+        let workspace = normalize_workspace(workspace);
         let s = Session {
             id: uuid::Uuid::new_v4().to_string(),
             parent_id: String::new(),
-            workspace_dir: workspace.into(),
+            workspace_dir: workspace,
             agent: agent.into(),
             permission_mode: mode.into(),
             model: model.into(),
@@ -161,25 +214,61 @@ impl Store {
     }
 
     pub fn latest_for_dir(&self, dir: &str) -> Result<Option<Session>, StoreError> {
+        let want = normalize_workspace(dir);
         let db = self.db.lock().unwrap();
+        let hit = {
+            let mut st = db.prepare(
+                "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at
+                 FROM sessions WHERE workspace_dir=? ORDER BY updated_at DESC LIMIT 1",
+            )?;
+            let mut rows = st.query([&want])?;
+            rows.next()?.map(Self::row_to_session).transpose()?
+        };
+        if let Some(s) = hit {
+            return Ok(Some(s));
+        }
+        // Legacy fallback: rows stored pre-normalization (e.g. literal ".").
         let mut st = db.prepare(
             "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at
-             FROM sessions WHERE workspace_dir=? ORDER BY updated_at DESC LIMIT 1",
+             FROM sessions ORDER BY updated_at DESC",
         )?;
-        let mut rows = st.query([dir])?;
-        Ok(rows.next()?.map(Self::row_to_session).transpose()?)
+        let all = st.query_map([], Self::row_to_session)?;
+        for s in all {
+            let s = s?;
+            if normalize_workspace(&s.workspace_dir) == want {
+                return Ok(Some(s));
+            }
+        }
+        Ok(None)
     }
 
     pub fn list_for_dir(&self, dir: Option<&str>) -> Result<Vec<Session>, StoreError> {
         let db = self.db.lock().unwrap();
         let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         if let Some(d) = dir {
+            let want = normalize_workspace(d);
+            {
+                let mut st = db.prepare(
+                    "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at
+                     FROM sessions WHERE workspace_dir=? ORDER BY updated_at DESC",
+                )?;
+                for r in st.query_map([&want], Self::row_to_session)? {
+                    let s = r?;
+                    seen.insert(s.id.clone());
+                    out.push(s);
+                }
+            }
+            // Legacy fallback: pre-normalization spellings (e.g. ".").
             let mut st = db.prepare(
                 "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at
-                 FROM sessions WHERE workspace_dir=? ORDER BY updated_at DESC",
+                 FROM sessions ORDER BY updated_at DESC",
             )?;
-            for r in st.query_map([d], Self::row_to_session)? {
-                out.push(r?);
+            for r in st.query_map([], Self::row_to_session)? {
+                let s = r?;
+                if !seen.contains(&s.id) && normalize_workspace(&s.workspace_dir) == want {
+                    out.push(s);
+                }
             }
         } else {
             let mut st = db.prepare(
@@ -467,6 +556,39 @@ mod tests {
         )
         .unwrap();
         Store { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()), steered: Mutex::new(HashMap::new()) }
+    }
+
+    #[test]
+    fn workspace_dot_and_absolute_share_sessions() {
+        // Web creates sessions with "." while CLI/TUI use the absolute cwd;
+        // both spellings must resolve to the same workspace (resume fix).
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        assert_eq!(normalize_workspace("."), cwd);
+        assert_eq!(normalize_workspace(""), cwd);
+        assert_eq!(normalize_workspace("./"), cwd);
+        assert_eq!(normalize_workspace(&cwd), cwd);
+        assert_eq!(normalize_workspace(&format!("{cwd}/")), cwd);
+        let s = mem();
+        let a = s.create_session(".", "build", "bypass", "").unwrap();
+        assert_eq!(a.workspace_dir, cwd);
+        // Lookup by absolute path finds the dot-created session.
+        assert_eq!(s.latest_for_dir(&cwd).unwrap().unwrap().id, a.id);
+        assert_eq!(s.list_for_dir(Some(&cwd)).unwrap().len(), 1);
+        // Legacy rows stored pre-normalization (literal ".") still resolve.
+        {
+            let db = s.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO sessions(id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at)
+                 VALUES(?,?,?,?,?,?,?,?,?)",
+                rusqlite::params!["legacy-dot", "", ".", "build", "bypass", "", "", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        }
+        let listed = s.list_for_dir(Some(&cwd)).unwrap();
+        assert_eq!(listed.len(), 2, "legacy '.' row must list under {cwd}");
+        // Unrelated directories are unaffected.
+        assert!(s.latest_for_dir("/definitely/not/here").unwrap().is_none());
+        assert!(s.list_for_dir(Some("/definitely/not/here")).unwrap().is_empty());
     }
 
     #[test]

@@ -345,7 +345,7 @@ pub struct Eval {
     pub destructive: bool, // rm -rf, push --force, reset --hard, etc.
     /// Glob/command rules from `[permissions.bash]` (first match wins, `*` last).
     pub bash_rules: std::collections::HashMap<String, String>,
-    /// Writes to skills//instructions docs need explicit opt-in (default false).
+    /// Writes to skills//rules docs need explicit opt-in (default false).
     pub allow_tooling_write: bool,
 }
 
@@ -373,7 +373,7 @@ pub fn match_bash_rules(rules: &std::collections::HashMap<String, String>, cmd: 
 
 pub fn is_tooling_doc(target: &str) -> bool {
     let t = target.to_lowercase().replace('\\', "/");
-    t.contains("skills/") || t.ends_with("agents.md") || t.contains("instructions/")
+    t.contains("skills/") || t.ends_with("agents.md") || t.contains("rules/")
 }
 
 /// Read-only shell allowlist for plan mode (inspection only, never mutating).
@@ -548,6 +548,20 @@ mod tests {
             };
             assert_eq!(decide(&e), Decision::Allow, "{t}");
         }
+    }
+
+    #[test]
+    fn tooling_docs_cover_rules_dir() {
+        // opencode v2 plural-dir convention: rules/ (was instructions/).
+        for t in [
+            ".lumina/rules/coding.md",
+            "/home/u/.config/lumina/rules/style.md",
+            ".lumina/skills/foo/SKILL.md",
+            "AGENTS.md",
+        ] {
+            assert!(is_tooling_doc(t), "{t}");
+        }
+        assert!(!is_tooling_doc("src/main.rs"));
     }
 
     #[test]

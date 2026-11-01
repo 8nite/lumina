@@ -22,6 +22,7 @@ export function HomeView(props: {
   onPerm: (p: string) => void;
   working: boolean;
   effort: string;
+  effortOptions?: string[];
   onEffort: (e: string) => void;
   attachments: PromptAttachment[];
   onAttach: (files: FileList | File[] | null) => void;
@@ -75,6 +76,7 @@ export function HomeView(props: {
         perm={props.perm}
         onPerm={props.onPerm}
         effort={props.effort}
+        effortOptions={props.effortOptions}
         onEffort={props.onEffort}
         attachments={props.attachments}
         onAttach={props.onAttach}

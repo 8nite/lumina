@@ -7,6 +7,7 @@ export function ReviewPane(props: {
   tab: string;
   onTab: (t: string) => void;
   workspace: string;
+  focus?: { path: string; line?: number; n: number } | null;
   term: React.ReactNode;
   graph: React.ReactNode;
   memory: React.ReactNode;
@@ -35,7 +36,7 @@ export function ReviewPane(props: {
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto" data-scrollable>
-        {props.tab === 'review' && <ReviewChanges workspace={props.workspace} />}
+        {props.tab === 'review' && <ReviewChanges workspace={props.workspace} focus={props.focus} />}
         {props.tab === 'term' && props.term}
         {props.tab === 'graph' && props.graph}
         {props.tab === 'memory' && props.memory}
@@ -87,7 +88,7 @@ function parseDiff(raw: string): FileDiff[] {
   return files;
 }
 
-function ReviewChanges(props: { workspace: string }) {
+function ReviewChanges(props: { workspace: string; focus?: { path: string; line?: number; n: number } | null }) {
   const [files, setFiles] = useState<FileDiff[]>([]);
   const [split, setSplit] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -106,6 +107,13 @@ function ReviewChanges(props: { workspace: string }) {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.workspace]);
+
+  // opencode v2: clicking a file mention in chat focuses that file here.
+  useEffect(() => {
+    if (!props.focus) return;
+    setFiles((fs) => fs.map((f) => (f.path === props.focus!.path || f.path.endsWith('/' + props.focus!.path) ? { ...f, collapsed: false } : f)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.focus?.n]);
 
   const toggleAll = (collapsed: boolean) =>
     setFiles((fs) => fs.map((f) => ({ ...f, collapsed })));

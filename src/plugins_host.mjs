@@ -10,7 +10,7 @@
 // Hook map keys accepted in both styles:
 //   config, chat.message, chat.messages.transform,
 //   tool.execute.before, tool.execute.after,
-//   shell.env, permission.ask, event
+//   shell.env, permission.ask, models.list, event
 import { createServer } from "node:net";
 import { readFile, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -61,6 +61,7 @@ function makeSetupCtx(collected) {
     $,
     tool: { hook: (n, fn) => hook(`tool.${n}`, fn) },
     chat: { hook: (n, fn) => hook(`chat.${n}`, fn) },
+    models: { hook: (n, fn) => hook(`models.${n}`, fn) },
     shell: { hook: (n, fn) => hook(`shell.${n}`, fn) },
     permission: { hook: (n, fn) => hook(`permission.${n}`, fn) },
     event: { hook: (n, fn) => hook(`event.${n}`, fn) },

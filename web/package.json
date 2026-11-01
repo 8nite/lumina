@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test": "tsc --noEmit",
-    "openapi": "openapi-typescript http://127.0.0.1:7432/openapi.json -o src/api/openapi.d.ts"
+    "openapi": "openapi-typescript http://127.0.0.1:4089/openapi.json -o src/api/openapi.d.ts"
   },
   "dependencies": {
     "@xterm/xterm": "^5.5.0",

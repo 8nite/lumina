@@ -61,7 +61,7 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        #[arg(long, default_value_t = 7432)]
+        #[arg(long, default_value_t = 4089)]
         port: u16,
         /// Accepted for CLI parity (informational: loopback allowed by default).
         #[arg(long, default_value = "*")]
@@ -165,7 +165,7 @@ async fn main() -> MainResult {
         None => {
             // Terminal TUI: ensure the workspace daemon is up, then attach.
             // Honors -c/-s/--agent/--mode/--plan like the Go client.
-            let base = std::env::var("LUMINA_URL").unwrap_or_else(|_| "http://127.0.0.1:7432".into());
+            let base = std::env::var("LUMINA_URL").unwrap_or_else(|_| "http://127.0.0.1:4089".into());
             ensure_daemon(&base, &cfg).await?;
             tokio::task::block_in_place(|| {
                 tui::run(tui::LaunchOpts {
@@ -195,7 +195,7 @@ async fn main() -> MainResult {
             Ok(())
         }
         Some(Cmd::Web {}) => {
-            let base = std::env::var("LUMINA_URL").unwrap_or_else(|_| "http://127.0.0.1:7432".into());
+            let base = std::env::var("LUMINA_URL").unwrap_or_else(|_| "http://127.0.0.1:4089".into());
             ensure_daemon(&base, &cfg).await?;
             println!("{base}");
             // Best-effort browser open; the URL above is the contract.
@@ -211,7 +211,7 @@ async fn main() -> MainResult {
             }
             let short = if token.len() > 6 { &token[..6] } else { &token };
             println!("attach from another host on your LAN/Tailscale network with:");
-            println!("  lumina attach http://<this-host>:7432   (LUMINA_TOKEN={short}…)");
+            println!("  lumina attach http://<this-host>:4089   (LUMINA_TOKEN={short}…)");
             Ok(())
         }
         Some(Cmd::Auth { provider, github_url }) => {
@@ -593,8 +593,8 @@ fn split_base(base: &str) -> (String, u16) {
     let s = base.trim_end_matches('/');
     let s = s.strip_prefix("http://").or_else(|| s.strip_prefix("https://")).unwrap_or(s);
     match s.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(7432)),
-        None => (s.to_string(), 7432),
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(4089)),
+        None => (s.to_string(), 4089),
     }
 }
 

@@ -339,15 +339,52 @@ impl Sdk {
 
     /// Submit with explicit inbox behavior: steer (default) joins the running
     /// turn; queue chains behind it (Go PromptInput.Delivery parity).
+    /// Transient gateway failures (429/502/503/504, transport timeouts) cool
+    /// down and retry; when the turn already started server-side (state
+    /// running) the retry is skipped and the caller waits on SSE instead of
+    /// steering duplicate text.
     pub fn submit_delivery(&self, id: &str, text: &str, effort: &str, delivery: &str) -> Result<SubmitOut, SdkError> {
+        for attempt in 0..=3 {
+            match self.submit_once(id, text, effort, delivery) {
+                Ok(out) => return Ok(out),
+                Err(e) if Self::retryable(&e) && attempt < 3 => {
+                    // Lost response but live turn: don't resubmit (would
+                    // steer a duplicate); SSE delivers the result.
+                    if let Ok(st) = self.state(id) {
+                        if st.get("running").and_then(|r| r.as_bool()).unwrap_or(false) {
+                            return Ok(SubmitOut { text: String::new(), queued: true });
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(1 << attempt));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+
+    fn retryable(e: &SdkError) -> bool {
+        match e {
+            SdkError::Http(e) => e.is_timeout() || e.is_connect() || e.is_body() || e.is_decode(),
+            SdkError::Msg(s) => ["429", "502", "503", "504"].iter().any(|c| s.contains(c)),
+            SdkError::Json(_) => false,
+        }
+    }
+
+    fn submit_once(&self, id: &str, text: &str, effort: &str, delivery: &str) -> Result<SubmitOut, SdkError> {
         let res = Self::check(
             self.req(reqwest::Method::POST, &format!("/api/v1/sessions/{id}/prompt"))
                 .json(&serde_json::json!({"text": text, "effort": effort, "delivery": delivery}))
                 .send()?,
         )?;
         let v: serde_json::Value = res.json()?;
-        if v.get("status").and_then(|x| x.as_str()) == Some("queued")
+        // No text payload means the result arrives over SSE (queued behind
+        // or steered into a running turn, or 202-accepted slow turn).
+        let status = v.get("status").and_then(|x| x.as_str()).unwrap_or("");
+        let no_text = v.get("text").and_then(|t| t.as_str()).is_none_or(|t| t.is_empty());
+        if (matches!(status, "queued" | "accepted" | "steered") && no_text)
             || v.get("queued").and_then(|q| q.as_bool()).unwrap_or(false)
+            || v.get("accepted").and_then(|q| q.as_bool()).unwrap_or(false)
         {
             return Ok(SubmitOut { text: String::new(), queued: true });
         }
@@ -562,5 +599,20 @@ impl Sdk {
             }
         });
         rx
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn retryable_covers_gateway_failures_only() {
+        for code in [429, 502, 503, 504] {
+            assert!(Sdk::retryable(&SdkError::Msg(format!("POST /x/prompt: {code} boom"))), "{code}");
+        }
+        for code in [400, 404, 409, 413] {
+            assert!(!Sdk::retryable(&SdkError::Msg(format!("POST /x/prompt: {code} nope"))), "{code}");
+        }
     }
 }

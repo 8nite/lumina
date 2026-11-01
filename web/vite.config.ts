@@ -6,8 +6,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://127.0.0.1:7432',
-      '/openapi.json': 'http://127.0.0.1:7432',
+      '/api': 'http://127.0.0.1:4089',
+      '/openapi.json': 'http://127.0.0.1:4089',
     },
   },
   build: { outDir: 'dist', sourcemap: false },

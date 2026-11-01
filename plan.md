@@ -21,7 +21,7 @@
 | **Plan & Build Primary Modes** | Lumina-style `Plan` vs `Build` primary agent workflow | Instant **`Tab`** toggle (`plan` ↔ `build` + custom `mode: primary` agents); **`plan` mode enforces a hard Go-level read-only workspace fence** (allows `read`/`grep`/`glob`/`kb_query`/read-only `bash` + scoped `plan.md` / `.lumina/plans/*.md` writes only, even under `--bypass`) with 1-click **"Execute in Build Mode"** handoff. |
 | **Session Lifecycle & Ergonomics** | Continue sessions, resume by ID, fork trajectories, undo/redo edits, hot-persist models | `-c` / `--continue` (resumes latest workspace session), `-s <id>` / `--session`, `/fork`, `/undo` + `/redo` via shadow Git checkpoints, `/compact`, `session export [--sanitize]`, and built-in `model-persist` hot-reload. |
 | **Permissions, Auto-Approve & Bypass** | Interactive approval, auto-approve, and zero-prompt bypass (`yolo`) modes | 4 live-switchable modes (`Shift+Tab`: `default`/`ask`, `auto-edit`, `auto-approve`, `bypass`) + granular command/path glob rules (`allow`/`ask`/`deny`) — while **never** bypassing credential-file blocks or the No-Google rule. |
-| **Lumina-Compatible Plugins & `AGENTS.md`** | Drop-in support for Lumina plugin hooks, global/repo `AGENTS.md`, `instructions/`, `skills/`, `agents/`, `commands/` | Persistent Node v22 plugin host worker (`internal/plugins`) supporting both Lumina return-object and v2 `setup(ctx)` plugin formats + hierarchical `AGENTS.md` / `instructions/*.md` merging. |
+| **Lumina-Compatible Plugins & `AGENTS.md`** | Drop-in support for Lumina plugin hooks, global/repo `AGENTS.md`, `rules/`, `skills/`, `agents/`, `commands/` | Persistent Node v22 plugin host worker (`internal/plugins`) supporting both Lumina return-object and v2 `setup(ctx)` plugin formats + hierarchical `AGENTS.md` / `instructions/*.md` merging. |
 | **Bring-Your-Own LLM (BYO-LLM)** | Use any custom LLM provider or local inference server | Native Go streaming adapters for **OpenAI-compatible**, **Anthropic-compatible**, and **Ollama** endpoints with 3-tier role routing (`fast`, `executor`, `improver`). |
 | **Markdown + `graphify` RAG** | `"Text > Brain"` RAG modeled on Lumina's `./memory/` + `graphify` + `standing-ops` workflow | Plain Markdown (`YAML` frontmatter + `[[wikilinks]]`) + **`graphify`** knowledge graphs (`graph.json`, `GRAPH_REPORT.md`, `LESSONS.md`, `graph.html`) with `<2ms` Go BFS/DFS traversal and singleflight auto-refresh. Zero vector DBs. |
 | **Harness² Self-Improvement** | Recursive harness optimization (`arXiv:2610.14224`) without weight tuning | **8 editable harness components** on `refs/lumina/harness`, **Level-1 `Propose → Probe → Compose`** in `git worktree` sandboxes, and **Level-2 Improvement Library** indexed by `graphify`. |
@@ -42,7 +42,7 @@ flowchart TB
     subgraph Daemon["Lumina Local Daemon (Go Single Binary — lumina serve)"]
         API["HTTP/1.1 + OpenAPI 3.1 + SSE Stream + PTY WS\n(127.0.0.1 default + Bearer/Pairing Auth)"]
         Guard["Immutable Security Floor + Permission Broker\n(ask | auto-edit | auto-approve | bypass + Hard Secret/No-Google Deny)"]
-        Rules["Rule & Extension Loader\n(Global/Repo AGENTS.md, instructions/, skills/, agents/, commands/)"]
+        Rules["Rule & Extension Loader\n(Global/Repo AGENTS.md, rules/, skills/, agents/, commands/)"]
         Plugins["Lumina-Compat Plugin Bridge\n(On-Demand Node v22 Worker: chat.message, tool.execute.before/after, shell.env)"]
         Agent["Agent Execution Loop\n(Sessions, Resume/Fork, Auto-Compact, Shadow Git Undo/Redo, MCP)"]
         Router["3-Tier BYO-LLM Router + Hot Model Persist\n(fast | executor | improver)"]
@@ -112,7 +112,7 @@ lumina/
 │   ├── config/                 # TOML loader, hot-reload + model-persist, env/cmd secret resolver, no-Google validator
 │   ├── server/                 # net/http router, OpenAPI 3.1 spec, SSE broker, PTY WS, auth/CORS
 │   ├── security/               # Immutable guardrails, 4-mode permission broker, 2-layer secret filter, session TMPDIR
-│   ├── rules/                  # Hierarchical AGENTS.md + instructions/*.md + skills/ + agents/ + commands/ loader
+│   ├── rules/                  # Hierarchical AGENTS.md + rules/*.md + skills/ + agents/ + commands/ loader
 │   ├── plugins/                # Lumina-compatible JS/TS plugin host bridge (host.mjs + JSON-RPC hook pipeline)
 │   ├── llm/                    # Streaming Provider interface, openai_compat, anthropic, ollama, 3-tier router
 │   ├── agent/                  # Turn loop, session resume/fork, compactor, shadow-git undo/redo, subagent runner
@@ -148,8 +148,8 @@ lumina/
 | `lumina --auto-edit \| -y (--auto-approve) \| --bypass` | Launches session in the selected permission mode (also switchable live mid-session via **`Shift+Tab`** or `/mode`). |
 | `lumina run [flags] "<prompt>"` | Non-interactive headless execution (`--agent plan\|build`, `-c`, `-s <id>`, `-m provider/model`, `--auto-approve`, `--bypass`, `--format text\|json`) — parity with `lumina run`. |
 | `lumina session [list\|show\|fork\|export\|delete]` | List workspace/all sessions, fork from any turn, or export transcript (`--sanitize` strips sensitive patterns). |
-| `lumina serve` | Runs headless **Server Mode** (`127.0.0.1:7432` default; `--host`, `--port`, `--cors`) with hot config/model persistence and the **Standing-Ops KB Sweeper**. |
-| `lumina web` | Ensures `lumina serve` is running, serves embedded Web SPA, and prints/opens `http://127.0.0.1:7432`. |
+| `lumina serve` | Runs headless **Server Mode** (`127.0.0.1:4089` default; `--host`, `--port`, `--cors`) with hot config/model persistence and the **Standing-Ops KB Sweeper**. |
+| `lumina web` | Ensures `lumina serve` is running, serves embedded Web SPA, and prints/opens `http://127.0.0.1:4089`. |
 | `lumina attach <url>` | Connects local TUI to a running local or LAN/Tailscale `lumina serve` daemon. |
 | `lumina plugin [list\|enable\|disable\|doctor]` | Inspect loaded global/workspace plugins, hook registrations, and latency/errors. |
 | `lumina kb [query\|update\|reflect\|status]` | Direct CLI access to `./memory/` and workspace `graphify` graphs. |
@@ -197,8 +197,8 @@ Lumina natively honors the same Markdown customization conventions used across L
 
 1. **System Instruction Merge Order (top-to-bottom):**
    - **Layer 0 — Immutable Security Core:** Compiled Go directives (workspace fence, secret non-exposure, no-Google policy).
-   - **Layer 1 — Global Rules:** `~/.config/lumina/AGENTS.md` + `~/.config/lumina/instructions/*.md` (plus optional read-only import of `~/.config/lumina/AGENTS.md`, `~/.config/lumina/instructions/*.md`, and `~/.claude/CLAUDE.md` via `compat.import_global_rules = true`).
-   - **Layer 2 — Project & Directory Rules:** `AGENTS.md` (falling back to `CLAUDE.md` if `AGENTS.md` is absent) walked from workspace Git root down to target directory + `.lumina/instructions/*.md`.
+   - **Layer 1 — Global Rules:** `~/.config/lumina/AGENTS.md` + `~/.config/lumina/rules/*.md` (plus optional read-only import of `~/.config/lumina/AGENTS.md`, `~/.config/lumina/rules/*.md`, and `~/.claude/CLAUDE.md` via `compat.import_global_rules = true`).
+   - **Layer 2 — Project & Directory Rules:** `AGENTS.md` (falling back to `CLAUDE.md` if `AGENTS.md` is absent) walked from workspace Git root down to target directory + `.lumina/rules/*.md`.
    - **Layer 3 — Mutable Harness² Overlay:** `.lumina/harness/system_prompt.md` + `tool_guidance.md`.
 2. **Skills (`skills/<name>/SKILL.md`):** Discovered from `~/.config/lumina/skills/`, `.lumina/skills/`, `.lumina/harness/skills/` (and optionally `~/.config/lumina/skills/` & `~/.claude/skills/`). Only `name` + `description` frontmatter ship in the tool list; full `SKILL.md` loads lazily via the `skill` tool.
 3. **Custom Subagents (`agents/<name>.md`):** Markdown + YAML frontmatter (`name`, `description`, `mode: subagent|primary`, `hidden`, `model`, `tools: { bash: false, ... }`) — compatible with `~/.config/lumina/agents/*.md`.
@@ -225,6 +225,7 @@ Modeled directly on the host's live `~/.config/lumina/plugins/` (`rtk.ts`, `work
 | `tool.execute.after` | Observe tool args, result, duration, and `sessionID` asynchronously | Deployment regression triggers (`standing-ops` e2e gate), audit logging |
 | `shell.env` | Inject/override environment variables (`output.env`) per `bash`/PTY call | Per-session `TMPDIR` or tool PATH injection |
 | `permission.ask` | Return `"allow"` / `"deny"` / `"ask"` before prompting user | Custom organizational auto-approval policies |
+| `models.list` | Replace/enrich `output.models` for a provider's `/models` listing | `plugins/opencode-zen.mjs`: Zen catalog + `limit.context`/`capabilities.reasoning.effort` for opencode providers |
 | `event` | Subscribe to daemon lifecycle events (`session.created`, `session.idle`, `session.deleted`) | Scratch cleanup on `session.deleted` |
 
 - **Execution Isolation:** Runs in a single persistent local Node v22 child process (`host.mjs`) over a local Unix domain socket with per-hook timeouts (`5s` default, configurable for heavy attachment hooks) so a buggy plugin never crashes `lumina serve`.
@@ -281,14 +282,14 @@ Pure Go streaming HTTP/SSE clients with zero vendor SDK lock-in:
 ```toml
 [server]
 host = "127.0.0.1"
-port = 7432
+port = 4089
 
 [defaults]
 agent           = "build"             # "build" | "plan" | custom primary agent name
 permission_mode = "bypass"               # "ask" | "auto-edit" | "auto-approve" | "bypass"
 
 [compat]
-import_global_rules   = true          # Also load ~/.config/lumina/AGENTS.md & instructions/*.md (read-only)
+import_global_rules   = true          # Also load ~/.config/lumina/AGENTS.md & rules/*.md (read-only)
 import_global_skills  = true          # Discover ~/.config/lumina/skills & ~/.claude/skills
 
 [permissions]
@@ -404,7 +405,7 @@ Versioned on local Git ref `refs/lumina/harness` so workspace `git status` stays
 
 ### Milestone 0 — Repo Skeleton, Config, Rules (`AGENTS.md`) & Security Core
 - Initialize Go module (`github.com/8nite/lumina`), `pnpm` workspace (`web/`), `Makefile`, and pure-Go SQLite (`modernc.org/sqlite`) schema.
-- Implement `internal/config` (TOML + hot-reload + `api_key_env`/`api_key_cmd` + Google-domain blocklist), `internal/rules` (`AGENTS.md` + `instructions/*.md` + `skills/` + `agents/` + `commands/` discovery), and `internal/security` (`plan` vs `build` structural fence + 4-mode permission broker: `ask` / `auto-edit` / `auto-approve` / `bypass`, immutable credential-file hard-deny even in `bypass`, per-session `TMPDIR` lifecycle).
+- Implement `internal/config` (TOML + hot-reload + `api_key_env`/`api_key_cmd` + Google-domain blocklist), `internal/rules` (`AGENTS.md` + `rules/*.md` + `skills/` + `agents/` + `commands/` discovery), and `internal/security` (`plan` vs `build` structural fence + 4-mode permission broker: `ask` / `auto-edit` / `auto-approve` / `bypass`, immutable credential-file hard-deny even in `bypass`, per-session `TMPDIR` lifecycle).
 - **Verification Gate:** `CGO_ENABLED=0 go test ./internal/config ./internal/rules ./internal/security ./internal/server` — verifies `AGENTS.md` precedence, confirms `plan` mode blocks code mutations even when `--bypass` is set (allowing only `plan.md` / `.lumina/plans/*.md`), confirms `--bypass` in `build` mode still hard-denies `.env`/`auth.json`/`lumina.json`/`*.googleapis.com`, and validates `/openapi.json`.
 
 ### Milestone 1 — BYO-LLM Router, Sessions (`-c`/`-s`/`fork`/`run`), Undo & Plugin Host

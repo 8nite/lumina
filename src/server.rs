@@ -43,7 +43,11 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(store: Store, router: LlmRouter, cfg: Config, cfg_path: Option<PathBuf>) -> Self {
-        let (events, _) = broadcast::channel(256);
+        let (events, _) = broadcast::channel(1024);
+        // 1024 (was 256): long turns burst hundreds of events (each tool
+        // emits start+done plus deltas; the stuck session ran 128 reads).
+        // A full buffer drops the oldest — including turn.completed — and
+        // the web client spins forever. Terminal events must not shed.
         // Background task completions surface as turn.progress stages
         // (Go OnBackgroundDone parity).
         let tx = events.clone();
@@ -357,7 +361,7 @@ async fn prompt(
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "empty prompt"}))).into_response();
     }
     if !b.effort.is_empty() && !crate::llm::valid_effort(&b.effort) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid effort (want auto|low|medium|high|xhigh|max)"}))).into_response();
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid effort (want auto|none|minimal|low|medium|high|xhigh|max)"}))).into_response();
     }
     let effort = crate::llm::normalize_effort(&b.effort).to_string();
     let delivery = if b.delivery.trim().is_empty() { "steer".to_string() } else { b.delivery.trim().to_string() };
@@ -464,17 +468,22 @@ async fn prompt(
         st2.store.release_turn(&id2, &owner);
         st2.running.lock().unwrap().remove(&id2);
     });
-    match first_rx.await {
-        Ok(Ok(text)) => Json(serde_json::json!({"session": id, "text": text})).into_response(),
-        Ok(Err(s)) => {
+    // Cap the blocking wait below typical proxy/gateway timeouts (60s):
+    // slow turns return 202 and finish over SSE instead of surfacing as a
+    // 504 that tempts the client into a duplicate submit. The drain task is
+    // detached and continues either way.
+    match tokio::time::timeout(std::time::Duration::from_secs(50), first_rx).await {
+        Ok(Ok(Ok(text))) => Json(serde_json::json!({"session": id, "text": text})).into_response(),
+        Ok(Ok(Err(s))) => {
             if s.contains("not found") {
                 (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": s}))).into_response()
             } else {
                 (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": s}))).into_response()
             }
         }
-        // The drain task panicked before reporting; the queue still drains.
-        Err(_) => (StatusCode::ACCEPTED, Json(serde_json::json!({"session": id, "accepted": true}))).into_response(),
+        // Slow turn (still running; result arrives over SSE) or the drain
+        // task panicked before reporting (the queue still drains).
+        Ok(Err(_)) | Err(_) => (StatusCode::ACCEPTED, Json(serde_json::json!({"session": id, "status": "accepted"}))).into_response(),
     }
 }
 
@@ -806,7 +815,7 @@ async fn router_set(State(st): State<AppState>, body: axum::body::Bytes) -> impl
     if pairs.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "missing field `role`"}))).into_response();
     }
-    for (role, model) in &pairs {
+    for (role, _) in &pairs {
         if !["fast", "executor", "planner", "improver"].contains(&role.as_str()) {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "bad role"}))).into_response();
         }
@@ -849,9 +858,85 @@ async fn models(State(st): State<AppState>, Query(q): Query<ModelsQ>) -> impl In
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Google endpoints blocked"}))).into_response();
     }
     match st.router.list_models(&q.provider).await {
-        Ok(models) => Json(serde_json::json!({"provider": q.provider, "models": models})).into_response(),
+        Ok(models) => {
+            let models = plugin_models(&st, &q.provider, &def, models);
+            Json(serde_json::json!({"provider": q.provider, "models": models})).into_response()
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
+}
+
+/// `models.list` plugin hook: lets plugins replace/enrich the core model
+/// list (e.g. opencode zen catalog + zen schema metadata). Runs on the
+/// blocking pool; a silent/missing plugin keeps the core list.
+fn plugin_models(
+    st: &AppState,
+    provider: &str,
+    def: &crate::llm::ProviderDef,
+    mut models: Vec<crate::llm::ModelMeta>,
+) -> Vec<crate::llm::ModelMeta> {
+    let payload = serde_json::json!({
+        "provider": provider,
+        "base_url": def.base_url,
+        "protocol": def.protocol,
+        "api_key_env": st.cfg.providers.get(provider).map(|p| p.api_key_env.clone()).unwrap_or_default(),
+        "api_key_cmd": st.cfg.providers.get(provider).map(|p| p.api_key_cmd.clone()).unwrap_or_default(),
+        "models": models,
+    });
+    let out = tokio::task::block_in_place(|| {
+        st.plugins.global().dispatch(
+            "models.list",
+            &payload,
+            std::time::Duration::from_secs(10),
+        )
+    });
+    let extra = out
+        .as_ref()
+        .and_then(|o| o.get("patch"))
+        .and_then(|p| p.get("models"))
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if extra.is_empty() {
+        return models;
+    }
+    merge_models(&mut models, &extra);
+    models
+}
+
+/// Merge plugin-supplied model entries into the core list: entries with an
+/// `id` upsert by id (plugin wins on metadata), then sort by id.
+fn merge_models(core: &mut Vec<crate::llm::ModelMeta>, extra: &[serde_json::Value]) {
+    use std::collections::HashMap;
+    let mut idx: HashMap<String, usize> =
+        core.iter().enumerate().map(|(i, m)| (m.id.clone(), i)).collect();
+    for e in extra {
+        let Some(id) = e.get("id").and_then(|i| i.as_str()).filter(|s| !s.is_empty()) else { continue };
+        let meta = crate::llm::ModelMeta {
+            id: id.to_string(),
+            name: e
+                .get("name")
+                .and_then(|n| n.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id)
+                .to_string(),
+            context_window: e.get("context_window").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+            supported_efforts: e
+                .get("supported_efforts")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()
+                })
+                .unwrap_or_default(),
+        };
+        if let Some(&i) = idx.get(id) {
+            core[i] = meta;
+        } else {
+            idx.insert(id.to_string(), core.len());
+            core.push(meta);
+        }
+    }
+    core.sort_by(|a, b| a.id.cmp(&b.id));
 }
 
 #[derive(Deserialize)]
@@ -1273,6 +1358,49 @@ async fn spa_fallback(uri: axum::http::Uri) -> impl IntoResponse {
             Json(serde_json::json!({"ok": true, "hint": "run `pnpm --dir web install && pnpm --dir web build`, then restart `lumina serve`"})),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod models_hook_tests {
+    use super::*;
+
+    fn meta(id: &str, window: u32) -> crate::llm::ModelMeta {
+        crate::llm::ModelMeta {
+            id: id.into(),
+            name: id.into(),
+            context_window: window,
+            supported_efforts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merge_models_upserts_by_id_and_sorts() {
+        let mut core = vec![meta("b-model", 0), meta("a-model", 100)];
+        merge_models(
+            &mut core,
+            &serde_json::json!([
+                {"id": "b-model", "name": "B", "context_window": 1048576,
+                 "supported_efforts": ["low", "high"]},
+                {"id": "c-model"},
+                {"name": "no-id-skipped"},
+                {"id": ""},
+            ])
+            .as_array()
+            .unwrap(),
+        );
+        assert_eq!(core.len(), 3, "{core:?}");
+        assert_eq!(core[0].id, "a-model");
+        assert_eq!(core[0].context_window, 100);
+        assert_eq!(core[1].id, "b-model");
+        assert_eq!(core[1].name, "B");
+        assert_eq!(core[1].context_window, 1048576);
+        assert_eq!(core[1].supported_efforts, vec!["low", "high"]);
+        // Missing name falls back to id; missing window/efforts to zero/empty.
+        assert_eq!(core[2].id, "c-model");
+        assert_eq!(core[2].name, "c-model");
+        assert_eq!(core[2].context_window, 0);
+        assert!(core[2].supported_efforts.is_empty());
     }
 }
 

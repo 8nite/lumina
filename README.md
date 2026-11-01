@@ -15,7 +15,7 @@ and `test-plan.md` for the verification matrix (all suites PASS).
 ```bash
 make build                       # web SPA + Rust binary -> bin/lumina
 ./bin/lumina --help
-./bin/lumina serve                # daemon on 127.0.0.1:7432
+./bin/lumina serve                # daemon on 127.0.0.1:4089
 ./bin/lumina run "explain this repo" --agent plan
 ```
 
@@ -28,14 +28,14 @@ keys only via `api_key_env` / `api_key_cmd` — plaintext keys are rejected at l
 ```toml
 [server]
 host = "127.0.0.1"
-port = 7432
+port = 4089
 
 [defaults]
 agent = "build"            # new TUI sessions + `lumina run`
 permission_mode = "bypass"    # ask | auto-edit | auto-approve | bypass
 
 [compat]
-import_global_rules = true   # ~/.config/lumina/AGENTS.md + instructions/
+import_global_rules = true   # ~/.config/lumina/AGENTS.md + rules/
 import_global_skills = true  # ~/.config/lumina/skills/
 
 [permissions]
@@ -78,9 +78,9 @@ Env overrides: `LUMINA_CONFIG` (config path), `LUMINA_DB` (SQLite path),
 
 | Command | What it does |
 |---|---|
-| `lumina [--agent plan\|build] [-c] [-s <id>] [--auto-edit\|-y\|--bypass]` | Open the Terminal TUI (starts a daemon in-process if `:7432` is free). `-c` resumes the latest session for the directory, `-s` resumes one by id. `[defaults]` apply unless a flag overrides them. |
+| `lumina [--agent plan\|build] [-c] [-s <id>] [--auto-edit\|-y\|--bypass]` | Open the Terminal TUI (starts a daemon in-process if `:4089` is free). `-c` resumes the latest session for the directory, `-s` resumes one by id. `[defaults]` apply unless a flag overrides them. |
 | `lumina run [flags] "<prompt>"` | Headless one-shot. Flags work in any position, `--flag=value` too: `--agent`, `--plan`, `-c`, `-s <id>`, `-m model`, `--format text\|json`, `--auto-edit`, `-y`, `--bypass`, `--effort low\|medium\|high\|xhigh\|max`, `--attach <image>` (repeatable, 8MB cap each), `--` to end flags. |
-| `lumina serve [--host 127.0.0.1] [--port 7432]` | Headless daemon (REST + SSE + PTY). Non-loopback binds require `LUMINA_TOKEN`. |
+| `lumina serve [--host 127.0.0.1] [--port 4089]` | Headless daemon (REST + SSE + PTY). Non-loopback binds require `LUMINA_TOKEN`. |
 | `lumina web` | Ensure the daemon is up, then point your browser at it (embedded SPA). |
 | `lumina attach <url>` | Run the TUI against a remote/LAN daemon (needs `LUMINA_TOKEN` set). |
 | `lumina session list [dir\|--all]` | Sessions for this directory (or all). |
@@ -171,7 +171,9 @@ Drop-in Markdown customization, reloaded on every turn (no restart):
 
 - `~/.config/lumina/AGENTS.md` — global system instructions (Layer 1:
   under the immutable security core, above repo rules).
-- `~/.config/lumina/instructions/*.md` — one extra layer per file.
+- `~/.config/lumina/rules/*.md` — one extra layer per file (plural `rules/`
+  follows the opencode v2 extension-dir convention: `agents/`, `commands/`,
+  `skills/`).
 - `~/.config/lumina/skills/<name>/SKILL.md` — auto-discovered; only
   `name` + `description` frontmatter is advertised until the model calls
   the `skill` tool to load the body:
@@ -280,7 +282,7 @@ context/delta/tool/completed/failed`, `permission.asked/resolved`, …).
   approval modal (web) or a dropped SSE stream (both clients reconnect
   automatically; terminal `turn.completed`/`failed` is never shed).
 - **Non-loopback bind refused** — set `LUMINA_TOKEN` first, then
-  `lumina attach http://<host>:7432` from the other machine.
+  `lumina attach http://<host>:4089` from the other machine.
 - **`session delete <id>`** — hard-deletes the session row + turns (also `DELETE /api/v1/sessions/{id}`).
 
 ## Layout

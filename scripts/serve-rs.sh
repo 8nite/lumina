@@ -1,5 +1,5 @@
 #!/bin/bash
-# Lumina Rust daemon supervisor stub: exactly one instance on 7432.
+# Lumina Rust daemon supervisor stub: exactly one instance on 4089.
 PIDFILE="$HOME/.local/share/lumina-rs/serve.pid"
 LOG="$HOME/.local/share/lumina-rs/serve.log"
 BIN="$HOME/.local/bin/lumina-rs"
@@ -14,9 +14,9 @@ cd "$HOME" || exit 1
 # (chaining with && would capture a subshell instead).
 LUMINA_DB="${LUMINA_DB:-$HOME/.local/share/lumina-rs/lumina.db}" \
 LUMINA_DEBUG_SSE="${LUMINA_DEBUG_SSE:-}" \
-  nohup "$BIN" serve --port 7432 >>"$LOG" 2>&1 &
+  nohup "$BIN" serve --port 4089 >>"$LOG" 2>&1 &
 echo $! > "$PIDFILE"
 sleep 2
-curl -s -o /dev/null -w "daemon:%{http_code}\n" http://127.0.0.1:7432/openapi.json
+curl -s -o /dev/null -w "daemon:%{http_code}\n" http://127.0.0.1:4089/openapi.json
 readlink "/proc/$(cat "$PIDFILE")/exe"
 ls -l "$BIN" | awk '{print "installed:", $6, $7, $8}'

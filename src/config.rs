@@ -26,7 +26,7 @@ fn default_host() -> String {
     "127.0.0.1".into()
 }
 fn default_port() -> u16 {
-    7432
+    4089
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

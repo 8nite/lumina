@@ -23,4 +23,12 @@ tags: [index, memory, lumina]
 - [[rust-migration]] — Go tree deleted from `rust-revamp` (2026-11-01): port-if-seen rule, pre-delete baselines, post-delete verification before merge.
 - [[web-ui-sticky-scroll]] — SessionView sticky-bottom autoscroll (80px threshold, transcript + working card pin, respects manual scroll-up).
 - [[opencode-zen-models]] — Opencode zen `/models` schema (`limit.context` window, `capabilities.reasoning.effort` ladder), parsed in `src/llm.rs`, live-verified on 28 models.
-- [[model-picker-filter]]
+- [[model-picker-filter]] — Composer model menu filter (substring match), App default model label fallback, and applyModel `setSession` refresh.
+- [[model-switch-ui]] — WebUI `applyModel` `setSession(patched)` fix (header button went stale); live-verified `iceman` → `muse-spark-1.3`.
+- [[opencode-zen-plugin]] — `models.list` hook + bundled `plugins/opencode-zen.mjs` (Zen catalog merge via `canonical_id` twins); core keeps generic parse only.
+- [[zen-twin-suppression]] — Zen/Go twin suppression (endpoint-bound ids): list enriched Go id, suppress unusable Zen twin; live 55 servable models.
+- [[rules-dir]] — Global/repo rule dir renamed `instructions/` → `rules/` (opencode v2 plural-dir convention); `src/rules.rs` discovery, `security.rs` tooling-doc fence, tests.
+- [[effort-stepdown]] — `chat_responses`/`chat_openai` retry down the effort ladder on effort-rejection 400s (`effort_step_down` + `is_effort_error`); live-verified `iceman` max → OK.
+- [[effort-ladder]] — Canonical effort ladder de-hardcoded (`none`→`max` union; verbatim advertised passthrough, per-model pickers, TUI 8-step `EFFORTS`).
+- [[session-resume-workspace]] — Web/CLI session resume mismatch (`.` vs absolute `workspace_dir`); `normalize_workspace()` in `src/store.rs` + legacy `.` fallback, regression test.
+- [[stuck-session-fix]] — Stuck-session fix (56d41a74): `read_repeat_nudge` (4th same-path read), SSE channel 256→1024, `:4089` owned by ai-manager — do not kill.

@@ -40,7 +40,7 @@ pub struct SecCtx {
     pub gate: ApprovalGate,
     /// Glob/command rules from `[permissions.bash]`.
     pub bash_rules: HashMap<String, String>,
-    /// Opt-in writes to skills//instructions docs (default false).
+    /// Opt-in writes to skills//rules docs (default false).
     pub allow_tooling_write: bool,
     /// Subagent nesting depth (children may not delegate further).
     pub depth: u8,
@@ -520,12 +520,15 @@ fn exec_bash(
     extra_env: &[(String, String)],
     timeout: Option<Duration>,
 ) -> Result<String, ToolError> {
+    // Per-session TMPDIR hygiene (cleaned on session.deleted). Ensure the
+    // dir exists so tools (and test suites run via bash) can use it.
+    let tmpdir = std::env::temp_dir().join(format!("lumina-ses-{session}"));
+    let _ = std::fs::create_dir_all(&tmpdir);
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c")
         .arg(cmd_str)
         .current_dir(workspace)
-        // Per-session TMPDIR hygiene (cleaned on session.deleted).
-        .env("TMPDIR", std::env::temp_dir().join(format!("lumina-ses-{session}")))
+        .env("TMPDIR", tmpdir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     for (k, v) in extra_env {

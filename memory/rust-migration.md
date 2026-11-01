@@ -42,7 +42,9 @@ pushes, merges, or branch deletes without explicit approval.
   `cargo test`/`cargo check`/`cargo clippy` instead of `go test`
   (README permission table + `[permissions.bash]` example updated to match).
 - `AGENTS.md` port corrected to `127.0.0.1:7432` (was stale `4089`;
-  code default in `src/config.rs` / `src/main.rs`).
+  code default in `src/config.rs` / `src/main.rs`). Superseded
+  2026-11-01: canonical port is `127.0.0.1:4089` (ai-manager owns it;
+  other apps bind `:7432`). See [[stuck-session-fix]].
 - `plan.md` / `test-plan.md` marked historical (written for Go); behaviour
   guarantees still hold, gates map to `cargo test` / `cargo clippy`.
 

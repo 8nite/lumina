@@ -62,26 +62,61 @@ export function saveServers(list: string[]) {
   }
 }
 
-async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(apiBase + path, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    // Keep the daemon's reason (e.g. 409 "turn in flight on another
-    // daemon") so alerts name the cause instead of a bare status code.
-    let detail = '';
-    try {
-      const text = await res.text();
-      const err = JSON.parse(text) as { error?: string };
-      detail = (err.error || text).slice(0, 300);
-    } catch {
-      /* non-JSON error body */
-    }
-    throw new Error(`${method} ${path}: ${res.status}${detail ? ' ' + detail : ''}`);
+// Retryable failures cool down and retry instead of surfacing immediately:
+// 429 (rate limit), 502/503/504 (gateway/proxy timeouts on long turns),
+// plus network-level fetch rejections (TypeError). 4xx (except 429) is a
+// real client error and throws at once.
+function retryableStatus(status: number): boolean {
+  return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+function cooldownMs(attempt: number, retryAfter: string | null): number {
+  if (retryAfter) {
+    const secs = Number(retryAfter.trim());
+    // ponytail: numeric Retry-After only; date form falls back to backoff.
+    if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, 30_000);
   }
-  return res.json() as Promise<T>;
+  // 1s, 2s, 4s exponential cooldown.
+  return Math.min(1000 * 2 ** attempt, 8000);
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function req<T>(method: string, path: string, body?: unknown, retries = 3): Promise<T> {
+  let lastErr: unknown = null;
+  for (let attempt = 0; ; attempt++) {
+    let res: Response;
+    try {
+      res = await fetch(apiBase + path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch (e) {
+      // Network-level failure (daemon restarting, proxy blip): cool down + retry.
+      lastErr = e;
+      if (attempt >= retries) throw e;
+      await sleep(cooldownMs(attempt, null));
+      continue;
+    }
+    if (res.ok) return res.json() as Promise<T>;
+    if (!retryableStatus(res.status) || attempt >= retries) {
+      // Keep the daemon's reason (e.g. 409 "turn in flight on another
+      // daemon") so alerts name the cause instead of a bare status code.
+      let detail = '';
+      try {
+        const text = await res.text();
+        const err = JSON.parse(text) as { error?: string };
+        detail = (err.error || text).slice(0, 300);
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new Error(`${method} ${path}: ${res.status}${detail ? ' ' + detail : ''}`);
+    }
+    lastErr = new Error(`${method} ${path}: ${res.status}`);
+    await sleep(cooldownMs(attempt, res.headers.get('retry-after')));
+  }
+  throw lastErr;
 }
 
 export interface PromptAttachment {
@@ -91,7 +126,7 @@ export interface PromptAttachment {
 }
 
 // Reasoning-effort variants offered by the composer.
-export const EFFORTS = ['', 'low', 'medium', 'high', 'xhigh', 'max'];
+export const EFFORTS = ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 export function fileToAttachment(file: File): Promise<PromptAttachment> {
   return new Promise((resolve, reject) => {
@@ -115,10 +150,30 @@ export const api = {
   patchSession: (id: string, patch: Partial<Session>) =>
     req<Session>('PATCH', `/api/v1/sessions/${id}`, patch),
   fork: (id: string) => req<Session>('POST', `/api/v1/sessions/${id}/fork`, {}),
-  prompt: (id: string, text: string, images?: PromptAttachment[], effort?: string, delivery?: string) =>
-    req<{ status: string; position?: number }>('POST', `/api/v1/sessions/${id}/prompt`, {
-      text, images: images || [], effort: effort || '', delivery: delivery || '',
-    }),
+  prompt: async (id: string, text: string, images?: PromptAttachment[], effort?: string, delivery?: string) => {
+    // Retry-safe submit: a 504/proxy timeout usually means the turn STARTED
+    // server-side but the response was lost (the daemon drains detached, so
+    // the turn continues). Blindly re-POSTing would steer duplicate text
+    // into the running turn, so on a retryable failure check /state first:
+    // running → return accepted and wait on SSE; idle → cool down + resubmit.
+    const body = { text, images: images || [], effort: effort || '', delivery: delivery || '' };
+    const path = `/api/v1/sessions/${id}/prompt`;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await req<{ status: string; position?: number }>('POST', path, body, 0);
+      } catch (e) {
+        const retryable = /: (429|502|503|504)\b/.test(String(e)) || e instanceof TypeError;
+        if (!retryable || attempt >= 3) throw e;
+        try {
+          const st = await req<SessionState>('GET', `/api/v1/sessions/${id}/state`, undefined, 2);
+          if (st.running) return { status: 'accepted' };
+        } catch {
+          /* state check failed; fall through to resubmit */
+        }
+        await sleep(cooldownMs(attempt, null));
+      }
+    }
+  },
   revert: (id: string) => req<{ status: string }>('POST', `/api/v1/sessions/${id}/revert`, {}),
   unrevert: (id: string) => req<{ status: string }>('POST', `/api/v1/sessions/${id}/unrevert`, {}),
   answerPermission: (reqId: string, decision: string) =>
@@ -147,7 +202,7 @@ export const api = {
     req<{ status: string }>('PUT', '/api/v1/router', { role, model, [role]: model }),
   providers: () => req<{ providers: (string | { name: string; protocol?: string })[] }>('GET', '/api/v1/providers'),
   models: (provider: string) =>
-    req<{ models: { id: string; name: string }[] }>(
+    req<{ models: { id: string; name: string; context_window?: number; supported_efforts?: string[] }[] }>(
       'GET',
       '/api/v1/models?provider=' + encodeURIComponent(provider),
     ),
