@@ -115,9 +115,10 @@ for round in 1 2 3; do
   done
   [ -z "$REQ" ] && break
   ASKED=$((ASKED+1))
-  if api POST "/api/v1/questions/$REQ" '{"answers":["red"]}' | grep -q '"ok":true'; then ANSWERED=$((ANSWERED+1)); fi
+  if api POST "/api/v1/questions/$REQ" '{"answers":[["red"]]}' | grep -q '"ok":true'; then ANSWERED=$((ANSWERED+1)); fi
 done
-# Retry once with a nudge if the model skipped the tool entirely.
+# Retry once with a nudge if the model skipped the tool entirely (flat answer
+# shape here exercises server-side shorthand normalization).
 if [ "$ASKED" = "0" ]; then
   timeout 240 curl -s -X POST "$BASE/api/v1/sessions/$S5/prompt" -H 'Content-Type: application/json' -d "$QNUDGE" > "$ROOT/s5b.out" 2>&1 &
   P5B=$!
@@ -290,17 +291,21 @@ DB="http://127.0.0.1:$DPORT"
 DS=$(curl -s -X POST $DB/api/v1/sessions -H 'Content-Type: application/json' -d '{"workspace_dir":"/tmp/dz"}'); DID=$(echo "$DS" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
 timeout 60 curl -s -X POST $DB/api/v1/sessions/$DID/prompt -H 'Content-Type: application/json' -d '{"text":"hi"}' > "$ROOT/q1.out" 2>&1 &
 sleep 4
-C2=$(timeout 10 curl -s -o /dev/null -w "%{http_code}" -X POST $DB/api/v1/sessions/$DID/prompt -H 'Content-Type: application/json' -d '{"text":"q2"}')
-[ "$C2" = "202" ] && pass "queued while running (202)" || fail "queue 202" "$C2"
-grep -q '"queued":true' <(timeout 10 curl -s -X POST $DB/api/v1/sessions/$DID/prompt -H 'Content-Type: application/json' -d '{"text":"q3"}') && pass "queue body" || fail "queue body"
-# Poll for the full drain (3 user + 3 assistant turns).
+C2=$(timeout 10 curl -s -X POST $DB/api/v1/sessions/$DID/prompt -H 'Content-Type: application/json' -d '{"text":"q2-steer"}')
+echo "$C2" | grep -q '"status":"steered"' && pass "steer while running (steered)" || fail "steer status" "$C2"
+C3=$(timeout 10 curl -s -X POST $DB/api/v1/sessions/$DID/prompt -H 'Content-Type: application/json' -d '{"text":"q2","delivery":"queue"}')
+echo "$C3" | grep -q '"status":"queued"' && pass "queued while running (202)" || fail "queue 202" "$C3"
+echo "$C3" | grep -q '"position":1' && pass "queue position 1" || fail "queue position" "$C3"
+grep -q '"status":"queued"' <(timeout 10 curl -s -X POST $DB/api/v1/sessions/$DID/prompt -H 'Content-Type: application/json' -d '{"text":"q3","delivery":"queue"}') && pass "queue body" || fail "queue body"
+# Poll for the full drain (q1 user + steered user + q1 assistant +
+# q2 user/assistant + q3 user/assistant = 7 turns; steer joins the live turn).
 N=0; for i in $(seq 1 60); do
   N=$(curl -s $DB/api/v1/sessions/$DID/export 2>/dev/null | grep -c "^## ");
-  [ "$N" = "6" ] && break;
+  [ "$N" = "7" ] && break;
   sleep 5;
 done
-if [ "$N" = "6" ]; then
-  pass "all 3 turns drained"
+if [ "$N" = "7" ]; then
+  pass "all 3 turns + steer drained"
 else
   fail "drain count" "$N"
   echo "--- S17 forensics (doze hits / daemon state):"

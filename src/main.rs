@@ -8,6 +8,7 @@
 
 mod agent;
 mod approve;
+mod begin_patch;
 mod checkpoints;
 mod config;
 mod copilot;
@@ -335,9 +336,14 @@ async fn main() -> MainResult {
                     runner.plugins = Some(Arc::new(plugins::Host::new(files)));
                 }
             }
+            crate::tools::set_background_hook(std::sync::Arc::new(
+                |_session: &str, id: &str, kind: &str, _label: &str| {
+                    eprintln!("\u{203a} background done: {id} ({kind})");
+                },
+            ));
             // Headless progress log (Go parity): stages on stderr, only the
             // final answer on stdout.
-            let answer = runner
+            let outcome = runner
                 .run_prompt(&store, &router, &cfg, &sess.id, &text, llm::normalize_effort(&effort), &images,
                     |d, t| {
                         let preview = if d.is_empty() { t } else { d };
@@ -346,9 +352,24 @@ async fn main() -> MainResult {
                             eprintln!("\u{2192} {}", one.trim());
                         }
                     },
-                    |s| eprintln!("\u{203a} {s}"))
+                    |s| eprintln!("\u{203a} {s}"),
+                    |tool| match tool {
+                        crate::agent::ToolEvent::Start { name, target } => {
+                            let t = if target.is_empty() { name.clone() } else { format!("{name} {target}") };
+                            eprintln!("\u{25b8} {t}");
+                        }
+                        crate::agent::ToolEvent::Done { preview, error, .. } => {
+                            let mark = if error { "error: " } else { "" };
+                            let one: String = preview.chars().take(160).collect();
+                            if !one.trim().is_empty() {
+                                eprintln!("\u{2192} {mark}{}", one.trim());
+                            }
+                        }
+                    })
                 .await
                 .map_err(|e| format!("{e}"))?;
+            eprintln!("\u{2713} done");
+            let answer = outcome.text;
             if dflt_format == "json" {
                 println!("{}", serde_json::json!({"session_id": sess.id, "text": answer}));
             } else {
@@ -534,6 +555,7 @@ fn cmd_session(args: &[String]) -> MainResult {
         Some("delete") => {
             let Some(id) = args.get(1) else { eprintln!("usage: lumina session delete <id>"); std::process::exit(64); };
             if store.delete_session(id).map_err(|e| format!("store: {e}"))? {
+                let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("lumina-ses-{id}")));
                 println!("{id}");
                 Ok(())
             } else {

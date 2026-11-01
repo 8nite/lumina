@@ -15,6 +15,7 @@ export function Composer(props: {
   modelOptions: string[];
   onModel: (m: string) => void;
   onCustomModel: (m: string) => void;
+  onOpenModels?: () => void;
   perm: string;
   onPerm: (p: string) => void;
   effort: string;
@@ -129,8 +130,8 @@ export function Composer(props: {
           )}
         </div>
         <div className="relative">
-          <button onClick={() => setOpen(open === 'model' ? null : 'model')} className="v2-row flex max-w-48 items-center gap-1 truncate px-1.5 py-0.5 text-[var(--v2-text-base)]" title={props.model}>
-            <span className="truncate">{props.model.split('/').pop() || 'model'}</span> <span className="text-[11px] text-[var(--v2-text-faint)]">▾</span>
+          <button onClick={() => { if (open !== 'model') props.onOpenModels?.(); setOpen(open === 'model' ? null : 'model'); }} className="v2-row flex max-w-48 items-center gap-1 truncate px-1.5 py-0.5 text-[var(--v2-text-base)]" title={props.model || 'loading…'}>
+            <span className="truncate">{props.model ? (props.model.split('/').pop() || props.model) : 'loading…'}</span> <span className="text-[11px] text-[var(--v2-text-faint)]">▾</span>
           </button>
           {open === 'model' && (
             <div className={menu} style={{ border: '1px solid var(--v2-border-base)' }}>

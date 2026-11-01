@@ -123,6 +123,56 @@ pub fn effort_label(s: &str) -> &str {
 }
 
 /// Anthropic thinking budget ladder (must be >= 1024 when set).
+/// Position on the reasoning ladder (auto/"" = -1, provider default).
+pub fn effort_index(effort: &str) -> i32 {
+    match normalize_effort(effort) {
+        "" => -1,
+        "low" => 0,
+        "medium" => 1,
+        "high" => 2,
+        "xhigh" => 3,
+        "max" => 4,
+        _ => -1,
+    }
+}
+
+/// Advertised ladder with "auto" prepended, or the global ladder when the
+/// provider advertises nothing (empty = unknown).
+pub fn efforts_or_default(supported: &[String]) -> Vec<String> {
+    const LADDER: [&str; 6] = ["auto", "low", "medium", "high", "xhigh", "max"];
+    if supported.is_empty() {
+        return LADDER.iter().map(|s| s.to_string()).collect();
+    }
+    let mut out = vec!["auto".to_string()];
+    for v in &LADDER[1..] {
+        if supported.iter().any(|x| normalize_effort(x) == *v) && !out.iter().any(|o| o == v) {
+            out.push(v.to_string());
+        }
+    }
+    if out.len() == 1 {
+        return LADDER.iter().map(|s| s.to_string()).collect();
+    }
+    out
+}
+
+/// Clamp an effort into the advertised ladder: above the top clamps down,
+/// below the bottom (or unknown) clamps up to the lowest supported.
+pub fn clamp_effort(effort: &str, supported: &[String]) -> String {
+    let ladder = efforts_or_default(supported);
+    let want = normalize_effort(effort);
+    if ladder.iter().any(|v| v == want) {
+        return want.to_string();
+    }
+    let idx = effort_index(want);
+    // Walk down from the top to the highest supported rung at or below want.
+    for v in ladder.iter().rev() {
+        if effort_index(v) <= idx && *v != "auto" {
+            return v.clone();
+        }
+    }
+    ladder.into_iter().find(|v| v != "auto").unwrap_or_default()
+}
+
 pub fn effort_budget(effort: &str) -> u32 {
     match normalize_effort(effort) {
         "low" => 1024,
@@ -305,7 +355,7 @@ impl Router {
         self.overrides.write().unwrap().insert(role.into(), model.into());
     }
 
-    fn provider_for(&self, model: &str) -> Result<(String, ProviderDef, String), LlmError> {
+    pub(crate) fn provider_for(&self, model: &str) -> Result<(String, ProviderDef, String), LlmError> {
         let (key, mid) = split_model(model);
         if !key.is_empty() {
             if let Some(p) = self.providers.get(&key) {
@@ -372,7 +422,29 @@ impl Router {
                 "copilot: no github token (api_key_env/api_key_cmd, device auth, or token store)".into(),
             ));
         }
-        let mut req = client().get(&token_url).bearer_auth(&def.github_token);
+        match Self::exchange_copilot(&token_url, &def.base_url, &def.github_token).await {
+            Ok(sess) => {
+                self.copilot_sessions.write().unwrap().insert(key.into(), sess.clone());
+                Ok(sess)
+            }
+            Err(e) => {
+                // A construction-time key can be valid for the API yet
+                // rejected by the exchange (classic PATs 404): fall back to
+                // the device-authed store token when it differs.
+                let stored = crate::copilot::read_token_store(key);
+                if !stored.is_empty() && stored != def.github_token {
+                    if let Ok(sess) = Self::exchange_copilot(&token_url, &def.base_url, &stored).await {
+                        self.copilot_sessions.write().unwrap().insert(key.into(), sess.clone());
+                        return Ok(sess);
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn exchange_copilot(token_url: &str, base_url: &str, github_token: &str) -> Result<CopilotSession, LlmError> {
+        let mut req = client().get(token_url).bearer_auth(github_token);
         for (k, v) in copilot_headers() {
             req = req.header(k, v);
         }
@@ -390,8 +462,8 @@ impl Router {
             exp = chrono::Utc::now().timestamp()
                 + v.get("expires_in").and_then(|e| e.as_i64()).unwrap_or(1500);
         }
-        let base = if !def.base_url.is_empty() && def.base_url != "http://127.0.0.1:11434/v1" {
-            def.base_url.trim_end_matches('/').to_string()
+        let base = if !base_url.is_empty() && base_url != "http://127.0.0.1:11434/v1" {
+            base_url.trim_end_matches('/').to_string()
         } else if let Some(p) = v.get("proxy-ep").and_then(|p| p.as_str()) {
             format!("https://{}", p.trim_end_matches('/'))
         } else if let Some(api) = v.get("endpoints").and_then(|e| e.get("api")).and_then(|a| a.as_str()) {
@@ -399,9 +471,13 @@ impl Router {
         } else {
             "https://api.githubcopilot.com".to_string()
         };
-        let sess = CopilotSession { token, expires_unix: exp, base_url: base };
-        self.copilot_sessions.write().unwrap().insert(key.into(), sess.clone());
-        Ok(sess)
+        Ok(CopilotSession { token, expires_unix: exp, base_url: base })
+    }
+
+    /// Drop a cached session so the next call re-exchanges immediately
+    /// (SetKey parity: fresh device-auth token takes effect at once).
+    pub fn drop_copilot_session(&self, key: &str) {
+        self.copilot_sessions.write().unwrap().remove(key);
     }
 
     /// Provider-advertised context window, 0 when unknown (metadata failures
@@ -424,9 +500,12 @@ impl Router {
 
     async fn openai_window(&self, def: &ProviderDef, model: &str) -> u32 {
         // Copilot needs an exchanged token for /models; best-effort only.
+        // Anthropic-compatible gateways list at /v1/models (Go parity).
         let (base, key) = if def.kind() == "copilot" {
             let Ok(sess) = self.copilot_session(&self.provider_key_for(def), def).await else { return 0 };
             (sess.base_url, sess.token)
+        } else if def.kind() == "anthropic-compatible" {
+            (format!("{}/v1", def.base_url.trim_end_matches('/')), def.api_key.clone())
         } else {
             (def.base_url.clone(), def.api_key.clone())
         };
@@ -458,7 +537,11 @@ impl Router {
         match def.kind() {
             "openai-compatible" => openai_models(&def, &[]).await,
             "openai-responses" | "responses" => openai_models(&def, &[]).await,
-            "anthropic-compatible" => openai_models(&def, &[]).await,
+            "anthropic-compatible" => {
+                let mut tmp = def.clone();
+                tmp.base_url = format!("{}/v1", def.base_url.trim_end_matches('/'));
+                openai_models(&tmp, &[]).await
+            },
             "copilot" => {
                 let sess = self.copilot_session(provider, &def).await?;
                 let mut tmp = def.clone();
@@ -479,6 +562,11 @@ fn copilot_headers() -> Vec<(&'static str, String)> {
         ("Editor-Version", "vscode/1.107.0".into()),
         ("Editor-Plugin-Version", "copilot-chat/0.35.0".into()),
         ("Copilot-Integration-Id", "vscode-chat".into()),
+        // Chat-time headers (copilot.go parity): required for the
+        // conversation-edits path on some Copilot gateways.
+        ("Accept", "text/event-stream".into()),
+        ("Openai-Intent", "conversation-edits".into()),
+        ("X-Initiator", "agent".into()),
     ]
 }
 
@@ -519,6 +607,25 @@ fn openai_tools(tools: &[ToolSpec]) -> Vec<serde_json::Value> {
             })
         })
         .collect()
+}
+
+/// Drain accumulated OpenAI tool-call fragments into one done chunk.
+fn flush_openai_calls(arg_bufs: &mut HashMap<u32, (String, String, String)>, tx: &mpsc::UnboundedSender<Chunk>) {
+    if arg_bufs.is_empty() {
+        let _ = tx.send(Chunk { done: true, ..Default::default() });
+        return;
+    }
+    let mut idxs: Vec<u32> = arg_bufs.keys().copied().collect();
+    idxs.sort();
+    let calls = idxs
+        .into_iter()
+        .map(|i| {
+            let (id, name, raw) = arg_bufs.remove(&i).unwrap();
+            let args = parse_args(&raw);
+            ToolCall { id, name, args, raw_args: raw }
+        })
+        .collect();
+    let _ = tx.send(Chunk { tool_calls: calls, done: true, ..Default::default() });
 }
 
 fn parse_args(raw: &str) -> HashMap<String, serde_json::Value> {
@@ -596,6 +703,9 @@ async fn chat_openai(
     let mut usage = Usage::default();
     let mut stream = res.bytes_stream();
     let mut buf = Vec::<u8>::new();
+    // SSE dispatch: continued data: lines join until a blank line (readSSE).
+    let mut acc = String::new();
+    let mut fr_done = false;
     while let Some(item) = stream.next().await {
         let bytes = item.map_err(LlmError::Http)?;
         buf.extend_from_slice(&bytes);
@@ -603,14 +713,30 @@ async fn chat_openai(
             let line: Vec<u8> = buf.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&line);
             let line = line.trim();
-            let data = match line.strip_prefix("data:") {
-                Some(d) => d.trim(),
-                None => continue,
-            };
-            if data == "[DONE]" {
+            if fr_done {
+                break;
+            }
+            if line.is_empty() {
+                // Blank line dispatches the accumulated event below.
+            } else if let Some(d) = line.strip_prefix("data:") {
+                let d = d.trim();
+                if d == "[DONE]" {
+                    fr_done = true;
+                    break;
+                }
+                if !acc.is_empty() {
+                    acc.push('\n');
+                }
+                acc.push_str(d);
+                continue;
+            } else {
+                continue; // event:/id:/retry: lines carry no payload here
+            }
+            if acc.is_empty() {
                 continue;
             }
-            let v: serde_json::Value = match serde_json::from_str(data) {
+            let data = std::mem::take(&mut acc);
+            let v: serde_json::Value = match serde_json::from_str(&data) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -657,6 +783,13 @@ async fn chat_openai(
                 }
                 continue;
             }
+            // finish_reason flush (openai_compat.go parity): pending tool
+            // calls complete now; don't wait for EOF on a held-open stream.
+            if v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("finish_reason")).is_some_and(|f| !f.is_null()) {
+                flush_openai_calls(&mut arg_bufs, &tx);
+                fr_done = true;
+                break;
+            }
             if text.is_empty() && thinking.is_empty() {
                 continue;
             }
@@ -666,21 +799,12 @@ async fn chat_openai(
                 ..Default::default()
             });
         }
+        if fr_done {
+            break;
+        }
     }
-    if !arg_bufs.is_empty() {
-        let mut idxs: Vec<u32> = arg_bufs.keys().copied().collect();
-        idxs.sort();
-        let calls = idxs
-            .into_iter()
-            .map(|i| {
-                let (id, name, raw) = arg_bufs.remove(&i).unwrap();
-                let args = parse_args(&raw);
-                ToolCall { id, name, args, raw_args: raw }
-            })
-            .collect();
-        let _ = tx.send(Chunk { tool_calls: calls, done: true, ..Default::default() });
-    } else {
-        let _ = tx.send(Chunk { done: true, ..Default::default() });
+    if !fr_done {
+        flush_openai_calls(&mut arg_bufs, &tx);
     }
     Ok(usage)
 }
@@ -691,28 +815,44 @@ async fn chat_anthropic(
     tx: mpsc::UnboundedSender<Chunk>,
 ) -> Result<Usage, LlmError> {
     let url = format!("{}/v1/messages", def.base_url.trim_end_matches('/'));
-    let system: Vec<_> = req
+    let system: String = req
         .messages
         .iter()
         .filter(|m| m.role == "system")
-        .map(|m| m.content.clone())
+        .map(|m| m.content.as_str())
         .collect();
+    // Vision rides EVERY user turn as content blocks (anthropic.go parity).
     let messages: Vec<_> = req
         .messages
         .iter()
         .filter(|m| m.role != "system")
         .map(|m| {
-            serde_json::json!({"role": if m.role == "assistant" { "assistant" } else { "user" }, "content": m.content})
+            if m.role != "user" || req.images.is_empty() {
+                return serde_json::json!({"role": m.role, "content": m.content});
+            }
+            let mut parts = vec![serde_json::json!({"type": "text", "text": m.content})];
+            for im in &req.images {
+                let mt = if im.media_type.is_empty() { "image/png" } else { im.media_type.as_str() };
+                parts.push(serde_json::json!({"type": "image",
+                    "source": {"type": "base64", "media_type": mt, "data": im.data}}));
+            }
+            serde_json::json!({"role": "user", "content": parts})
         })
         .collect();
+    // Thinking needs headroom: floor max_tokens at budget+1024 (Go parity).
+    let budget = effort_budget(&req.reasoning_effort);
+    let mut max_tokens = if req.max_tokens == 0 { 4096 } else { req.max_tokens };
+    if budget > 0 && max_tokens < budget + 1024 {
+        max_tokens = budget + 1024;
+    }
     let mut body = serde_json::json!({
         "model": req.model,
-        "max_tokens": if req.max_tokens == 0 { 4096 } else { req.max_tokens },
+        "max_tokens": max_tokens,
         "messages": messages,
         "stream": true,
     });
     if !system.is_empty() {
-        body["system"] = serde_json::json!(system.join("\n"));
+        body["system"] = serde_json::json!(system);
     }
     if !req.tools.is_empty() {
         body["tools"] = serde_json::json!(req.tools.iter().map(|t|
@@ -720,14 +860,21 @@ async fn chat_anthropic(
                 "input_schema": if t.schema.is_null() { serde_json::json!({"type":"object"}) } else { t.schema.clone() }})
         ).collect::<Vec<_>>());
     }
-    if effort_budget(&req.reasoning_effort) > 0 {
+    if budget > 0 {
         body["thinking"] =
-            serde_json::json!({"type": "enabled", "budget_tokens": effort_budget(&req.reasoning_effort)});
+            serde_json::json!({"type": "enabled", "budget_tokens": budget});
+    }
+    // Anthropic-native auth is x-api-key, not Bearer (anthropic.go parity).
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(v) = def.api_key.parse() {
+        headers.insert("x-api-key", v);
+    }
+    if let Ok(v) = "2023-06-01".parse() {
+        headers.insert("anthropic-version", v);
     }
     let res = client()
         .post(&url)
-        .headers(auth_headers(def))
-        .header("anthropic-version", "2023-06-01")
+        .headers(headers)
         .json(&body)
         .send()
         .await?;
@@ -743,12 +890,16 @@ async fn chat_anthropic(
     let mut stream = res.bytes_stream();
     let mut buf = Vec::<u8>::new();
     let mut event = String::new();
+    let mut stopped = false;
     while let Some(item) = stream.next().await {
         let bytes = item.map_err(LlmError::Http)?;
         buf.extend_from_slice(&bytes);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&line).trim().to_string();
+            if stopped {
+                break;
+            }
             if let Some(e) = line.strip_prefix("event:") {
                 event = e.trim().to_string();
                 continue;
@@ -805,9 +956,36 @@ async fn chat_anthropic(
                         usage.input = m.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
                     }
                 }
+                // Per-block tool emission (anthropic.go parity): a finished
+                // block is actionable now, not at stream EOF.
+                "content_block_stop" => {
+                    let idx = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                    if let (Some((id, name)), Some(raw)) = (names.remove(&idx), partials.remove(&idx)) {
+                        if !name.is_empty() {
+                            let args = parse_args(&raw);
+                            let _ = tx.send(Chunk {
+                                tool_calls: vec![ToolCall { id, name, args, raw_args: raw }],
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                // Terminate on message_stop: a gateway may leave the stream
+                // open afterwards, and waiting for EOF would hang the turn.
+                "message_stop" => {
+                    let _ = tx.send(Chunk { done: true, ..Default::default() });
+                    stopped = true;
+                    break;
+                }
                 _ => {}
             }
         }
+        if stopped {
+            break;
+        }
+    }
+    if stopped {
+        return Ok(usage);
     }
     if !names.is_empty() {
         let mut idxs: Vec<u32> = names.keys().copied().collect();
@@ -834,13 +1012,32 @@ async fn chat_ollama(
     tx: mpsc::UnboundedSender<Chunk>,
 ) -> Result<Usage, LlmError> {
     let url = format!("{}/api/chat", def.base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
+    // Vision rides the last user message as `images: [base64…]` (ollama.go).
+    let last_user_idx = req.messages.iter().rposition(|m| m.role == "user");
+    let messages: Vec<serde_json::Value> = req
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let mut o = serde_json::json!({"role": m.role, "content": m.content});
+            if !req.images.is_empty() && Some(i) == last_user_idx {
+                o["images"] = serde_json::json!(req.images.iter().map(|im| &im.data).collect::<Vec<_>>());
+            }
+            o
+        })
+        .collect();
+    let mut body = serde_json::json!({
         "model": req.model,
-        "messages": req.messages.iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})).collect::<Vec<_>>(),
+        "messages": messages,
         "tools": req.tools.iter().map(|t| serde_json::json!({"type": "function", "function": {"name": t.name, "description": t.description,
             "parameters": if t.schema.is_null() { serde_json::json!({"type":"object"}) } else { t.schema.clone() }}})).collect::<Vec<_>>(),
         "stream": true,
     });
+    // Ollama has no effort ladder, only thinking on/off: any explicit
+    // variant enables it, auto ("") leaves the model default.
+    if !normalize_effort(&req.reasoning_effort).is_empty() {
+        body["think"] = serde_json::json!(true);
+    }
     let res = client().post(&url).json(&body).send().await?;
     if !res.status().is_success() {
         let st = res.status();
@@ -1193,6 +1390,22 @@ mod tests {
     fn split_model_shapes() {
         assert_eq!(split_model("openrouter/deepseek-r1"), ("openrouter".into(), "deepseek-r1".into()));
         assert_eq!(split_model("qwen"), ("".into(), "qwen".into()));
+    }
+
+    #[test]
+    fn effort_helpers() {
+        assert_eq!(effort_index("auto"), -1);
+        assert_eq!(effort_index(""), -1);
+        assert_eq!(effort_index("xhigh"), 3);
+        assert_eq!(effort_index("bogus"), -1);
+        assert_eq!(efforts_or_default(&[]), vec!["auto", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(
+            efforts_or_default(&["high".into(), "low".into()]),
+            vec!["auto", "low", "high"]
+        );
+        assert_eq!(clamp_effort("max", &["low".into(), "high".into()]), "high");
+        assert_eq!(clamp_effort("bogus", &["low".into()]), "low");
+        assert_eq!(clamp_effort("low", &["low".into()]), "low");
     }
 
     #[test]

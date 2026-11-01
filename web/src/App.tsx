@@ -30,7 +30,15 @@ export default function App() {
   const [input, setInput] = useState('');
   const [workspace, setWorkspace] = useState('.');
   const [branch, setBranch] = useState({ branch: '', modified: '' });
-  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(() => {
+    try {
+      // Persistent + default-on: missing key means open. Only an explicit
+      // '0' (user collapsed it) keeps it closed across reloads.
+      return localStorage.getItem('lumina.reviewOpen') !== '0';
+    } catch {
+      return true;
+    }
+  });
   const [rightTab, setRightTab] = useState('review');
   const [serversOpen, setServersOpen] = useState(false);
   const [modelOptions, setModelOptions] = useState<string[]>([]);
@@ -98,6 +106,14 @@ export default function App() {
 
   useEffect(() => {
     try {
+      localStorage.setItem('lumina.reviewOpen', reviewOpen ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }, [reviewOpen]);
+
+  useEffect(() => {
+    try {
       localStorage.setItem('lumina-color-scheme', scheme);
     } catch {
       /* ignore */
@@ -129,6 +145,8 @@ export default function App() {
   // recovers when turn.started was missed) + pending approval/question
   // modals (a turn waiting on approval no longer looks stuck).
   const syncActiveSession = useCallback(async (sid: string) => {
+    let stateGone = false;
+    let exportGone = false;
     try {
       const st = await api.sessionState(sid);
       const cur = sessionRef.current;
@@ -164,7 +182,11 @@ export default function App() {
         setQSel(qs.map(() => []));
         setQText(qs.map(() => ''));
       }
-    } catch {
+    } catch (e) {
+      // A daemon restarted from another directory (or with another
+      // LUMINA_DB) serves a different database: the session is gone (404),
+      // not merely unreachable. Remember it for the export check below.
+      if (String(e).includes(': 404')) stateGone = true;
       /* state endpoint missing on old daemon; export fallback below */
     }
     try {
@@ -174,8 +196,20 @@ export default function App() {
           .filter((t) => t.role === 'user' || t.role === 'assistant' || t.role === 'tool' || t.role === 'tool_error')
           .map((t) => ({ role: t.role, text: t.text, created_at: t.created_at })),
       );
-    } catch {
+    } catch (e) {
+      if (String(e).includes(': 404')) exportGone = true;
       /* offline transcript keeps whatever is on screen */
+    }
+    if (stateGone && exportGone) {
+      // Session vanished server-side (daemon restart with another database):
+      // stop the dead spinner and say so instead of working… forever.
+      // The on-screen transcript is the last synced copy.
+      setWorking(false);
+      setTurnStart(null);
+      setLiveText('');
+      setLiveThinking('');
+      setLiveSteps([]);
+      setStage('session not found on daemon — it likely restarted with a different database; start a new session to continue');
     }
   }, []);
 
@@ -497,7 +531,8 @@ export default function App() {
 
   const agent = session?.agent ?? homeAgent;
   const perm = session?.permission_mode ?? homePerm;
-  const model = session?.model || homeModel || 'model';
+  // ponytail: show executor default instead of literal "model" on new session
+  const model = session?.model || homeModel || modelOptions[0] || 'loading…';
 
   const flipAgent = async () => {
     const next = agent === 'plan' ? 'build' : 'plan';
@@ -773,6 +808,7 @@ export default function App() {
                     modelOptions={modelOptions}
                     onModel={(m) => void applyModel(m)}
                     onCustomModel={(m) => void applyModel(m)}
+                    onOpenModels={refreshModels}
                     perm={perm}
                     onPerm={setHomePerm}
                     effort={effort}
@@ -797,6 +833,7 @@ export default function App() {
                     modelOptions={modelOptions}
                     onModel={(m) => void applyModel(m)}
                     onCustomModel={(m) => void applyModel(m)}
+                    onOpenModels={refreshModels}
                     perm={perm}
                     onPerm={(p) => api.patchSession(session.id, { permission_mode: p }).then(setSession)}
                     effort={effort}

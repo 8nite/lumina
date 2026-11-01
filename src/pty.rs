@@ -1,9 +1,9 @@
 //! Shell-over-websocket endpoint (`GET /api/v1/pty`).
-//! Mirrors Go `wsServeLoop`: a minimal RFC6455 text loop where each message
-//! executes via `sh -c` in the daemon workspace and the combined output is
-//! written back. The web xterm talks to this; a full interactive PTY with
-//! row/col resize lands only if the web client ever needs more than
-//! line-execution (it doesn't today).
+//! Mirrors Go `wsServeLoop` exactly: a minimal RFC6455 text loop where each
+//! message executes via `sh -c` in the daemon workspace and the combined
+//! output is written back. The web xterm (TerminalPane) is line-based and
+//! sends no resize protocol, so neither side implements an interactive PTY:
+//! verified parity, not a gap.
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},

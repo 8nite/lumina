@@ -39,7 +39,7 @@ fn device_host(token_url: &str) -> String {
     let t = token_url.trim_end_matches('/');
     let no_scheme = t.split("://").nth(1).unwrap_or(t);
     let host = no_scheme.split('/').next().unwrap_or(no_scheme);
-    if host == "api.github.com" {
+    if host.is_empty() || host == "api.github.com" {
         return "https://github.com".into();
     }
     if let Some(rest) = host.strip_suffix(".api.github.com") {
@@ -175,6 +175,6 @@ mod tests {
     fn device_host_shapes() {
         assert_eq!(device_host("https://api.github.com"), "https://github.com");
         assert_eq!(device_host("https://ghe.example.com/api/v3/token"), "https://ghe.example.com");
-        assert_eq!(device_host(""), "https://");
+        assert_eq!(device_host(""), "https://github.com");
     }
 }

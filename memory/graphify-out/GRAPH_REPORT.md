@@ -1,11 +1,11 @@
-# Graph Report - memory  (2026-10-31, refreshed inline incl. loops-and-claims)
+# Graph Report - memory  (2026-11-01, refreshed inline incl. sticky-scroll)
 
 ## Corpus Check
-- 14 files · ~3600 words
+- 17 files · ~4200 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 56 nodes · 88 edges · 4 communities
+- 99 nodes · 137 links · 4 communities
 - Extraction: 90% EXTRACTED · 10% INFERRED · 0% AMBIGUOUS · INFERRED: 7 edges (avg confidence: 0.84)
 - Token cost: 0 input · 0 output
 
@@ -49,15 +49,15 @@
 
 ### Community 0 - "M0-M6 Build and Delivery"
 Cohesion: 0.32
-Nodes (7): Lumina plan.md Implementation (M0-M6), Go plus Web Verification Gate, Markdown + Graphify RAG Engine, Harness2 Propose-Probe-Compose Engine, Lumina-Compatible JS/TS Plugin Host, Session Continue, Fork & Shadow-Git Undo, Singleflight Standing-Ops KB Sweeper
+Nodes (7): Lumina plan.md Implementation (M0-M6), Go plus Web Verification Gate, Markdown + Graphify RAG Engine, Harness2 Propose-Probe-Compose Engine, Lumina-Compatible JS/TS Plugin Host, Session Continue, Fork & Shadow-Git Undo, Singleflight Standing-Ops KB Sweeper, SPA Asset MIME plus CSP, Serve DB-Path Banner, Full Tool-Round Transcript, LLM Transport Parity, Begin-Patch Engine, Server-TUI-CLI Parity, Round-2 Verify
 
 ### Community 1 - "Memory Index and Live Wiring"
 Cohesion: 0.40
-Nodes (18): lumina Live Wiring, Lumina Memory Index, Steer Queue Inbox While Working, TUI Thinking Toggle plus Web Tool Pills, Turn Delta Tool Completed Streaming Events, Long-Session Hardening Pass, Per-Session Prompt Single-Flight, Terminal SSE plus Auto-Reconnect, Web Permission Modal Answers permission.asked, Live Context Gauge (turn.context), TUI Space Key Types, Provider-Sourced Context Window, Router Context Cache with Caps, Dual Routing Session Headers, Session State Resync Endpoint, TUI Resync Timeline Rebuild, Missed-Started Recovery, Effort Variant Picker
+Nodes (20): lumina Live Wiring, Lumina Memory Index, Steer Queue Inbox While Working, TUI Thinking Toggle plus Web Tool Pills, Turn Delta Tool Completed Streaming Events, Long-Session Hardening Pass, Per-Session Prompt Single-Flight, Terminal SSE plus Auto-Reconnect, Web Permission Modal Answers permission.asked, Live Context Gauge (turn.context), TUI Space Key Types, Provider-Sourced Context Window, Router Context Cache with Caps, Dual Routing Session Headers, Session State Resync Endpoint, TUI Resync Timeline Rebuild, Missed-Started Recovery, Effort Variant Picker, TUI Default Effort XHigh, Gateway Models Effort Note, Web Session-Gone Recovery, Web Model Refresh on Open
 
 ### Community 2 - "Subagent Background Web Tools"
 Cohesion: 0.40
-Nodes (9): BTC E2E Web Subagent Background Verification, SSE Fragment Accumulation Fix, Reference system-prompt Parity via toolGuidance, Plan-Fence Deny plus Permission Gating, Depth-1 Subagent Runner with Explore Envelope, Subagent Background Web Tool Surface, Question Round-Trip UI Wiring, Patch Tool Envelope, Identical-Round Loop Guard
+Nodes (11): BTC E2E Web Subagent Background Verification, SSE Fragment Accumulation Fix, Reference system-prompt Parity via toolGuidance, Plan-Fence Deny plus Permission Gating, Depth-1 Subagent Runner with Explore Envelope, Subagent Background Web Tool Surface, Question Round-Trip UI Wiring, Patch Tool Envelope, Identical-Round Loop Guard, Empty-Final Turn Guard, Auto-Continue Ceiling Pointer
 
 ### Community 3 - "Plan/Build and Permission Modes"
 Nodes (9): Lumina Pure-Go Daemon, 4-Mode Permission & Bypass Broker (Shift+Tab), Plan & Build Primary Agent Modes (Tab), AGENTS.md & Markdown Extensions Loader, Config Defaults Seed Flags, agent-browser Skill Port, Skill Advertisement Gap, Skill Advertisement Fix (skillsBlock), Global Skill Promotion plus Keyless Fallback

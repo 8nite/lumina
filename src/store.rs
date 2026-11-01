@@ -4,6 +4,7 @@
 use regex::Regex;
 use rusqlite::{params, Connection};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -47,6 +48,9 @@ pub struct Store {
     /// Memory-only secret vault (dies with the process; transcripts keep values).
     /// Arc-shared: subagent closures outlive the turn borrow.
     pub vault: Arc<crate::vault::Vault>,
+    /// Steer inbox: text steered into a running turn (Go Runner inbox
+    /// parity). Memory-only; drained at round boundaries.
+    steered: Mutex<HashMap<String, Vec<String>>>,
 }
 
 fn now() -> String {
@@ -98,7 +102,11 @@ impl Store {
             // Duplicate-column is the happy path on a migrated DB.
             let _ = db.execute_batch(ddl);
         }
-        Ok(Self { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()) })
+        Ok(Self {
+            db: Mutex::new(db),
+            vault: Arc::new(crate::vault::Vault::new()),
+            steered: Mutex::new(HashMap::new()),
+        })
     }
 
     pub fn create_session(
@@ -354,11 +362,27 @@ impl Store {
         Ok(n)
     }
 
-    /// Delete a session and its turns. Returns true iff a session row was deleted.
+    /// Delete a session and all its rows (turns, approvals, traces).
+    /// Returns true iff a session row was deleted.
     pub fn delete_session(&self, id: &str) -> Result<bool, StoreError> {
         let db = self.db.lock().unwrap();
         db.execute("DELETE FROM turns WHERE session_id=?", params![id])?;
+        db.execute("DELETE FROM approvals WHERE session_id=?", params![id])?;
+        db.execute("DELETE FROM traces WHERE session_id=?", params![id])?;
         Ok(db.execute("DELETE FROM sessions WHERE id=?", params![id])? > 0)
+    }
+
+    /// Session owner + claim timestamp for 409 diagnostics (TurnOwner parity).
+    pub fn turn_owner(&self, id: &str) -> Option<(String, i64)> {
+        let db = self.db.lock().unwrap();
+        let mut st = db
+            .prepare("SELECT inflight_owner, inflight_since FROM sessions WHERE id=?")
+            .ok()?;
+        let (owner, since): (String, i64) = st.query_row([id], |r| Ok((r.get(0)?, r.get(1)?))).ok()?;
+        if owner.is_empty() {
+            return None;
+        }
+        Some((owner, since))
     }
 
     /// Append a trace event (checkpoints, reverts, stats).
@@ -414,7 +438,7 @@ mod tests {
              CREATE TABLE traces(id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, payload TEXT, created_at TEXT);",
         )
         .unwrap();
-        Store { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()) }
+        Store { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()), steered: Mutex::new(HashMap::new()) }
     }
 
     #[test]
@@ -443,6 +467,20 @@ mod tests {
     }
 
     #[test]
+    fn steer_inbox_roundtrip() {
+        let s = mem();
+        assert_eq!(s.take_steered("s1"), "");
+        s.steer("s1", "  ");
+        assert_eq!(s.take_steered("s1"), "");
+        s.steer("s1", "first");
+        s.steer("s1", "second");
+        s.steer("s2", "other");
+        assert_eq!(s.take_steered("s1"), "first\n\nsecond");
+        assert_eq!(s.take_steered("s1"), "");
+        assert_eq!(s.take_steered("s2"), "other");
+    }
+
+    #[test]
     fn sanitize_redacts() {
         let t = "key sk-abc123xyz789 here and AKIAIOSFODNN7EXAMPLE plus Bearer tok123";
         let out = sanitize_export(t);
@@ -468,6 +506,22 @@ impl Store {
     }
 
     /// Release the turn slot (only our own claims).
+    /// Buffer text into the running turn (steer delivery). Empty trims to noop.
+    pub fn steer(&self, session: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.steered.lock().unwrap().entry(session.to_string()).or_default().push(text.to_string());
+    }
+
+    /// Drain buffered steer text for one turn (joined, trimmed).
+    pub fn take_steered(&self, session: &str) -> String {
+        let mut inbox = self.steered.lock().unwrap();
+        let parts = inbox.remove(session).unwrap_or_default();
+        parts.join("\n\n").trim().to_string()
+    }
+
     pub fn release_turn(&self, id: &str, owner: &str) {
         let db = self.db.lock().unwrap();
         let _ = db.execute(
@@ -498,7 +552,7 @@ mod claim_tests {
         ] {
             let _ = db.execute_batch(ddl);
         }
-        let s = Store { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()) };
+        let s = Store { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()), steered: Mutex::new(HashMap::new()) };
         let sess = s.create_session("/w", "build", "bypass", "").unwrap();
         assert!(s.claim_turn(&sess.id, "daemon-a", 600));
         assert!(!s.claim_turn(&sess.id, "daemon-b", 600)); // held: 409 path

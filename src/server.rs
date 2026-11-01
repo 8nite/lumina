@@ -44,6 +44,16 @@ pub struct AppState {
 impl AppState {
     pub fn new(store: Store, router: LlmRouter, cfg: Config, cfg_path: Option<PathBuf>) -> Self {
         let (events, _) = broadcast::channel(256);
+        // Background task completions surface as turn.progress stages
+        // (Go OnBackgroundDone parity).
+        let tx = events.clone();
+        crate::tools::set_background_hook(std::sync::Arc::new(move |session: &str, id: &str, kind: &str, _label: &str| {
+            let _ = tx.send(serde_json::json!({
+                "type": "turn.progress",
+                "session": session,
+                "stage": format!("background done: {id} ({kind})"),
+            }));
+        }));
         Self {
             gate: ApprovalGate::new(events.clone()),
             store: Arc::new(store),
@@ -207,7 +217,10 @@ async fn create_session(State(st): State<AppState>, Json(b): Json<CreateBody>) -
     };
     let store = &st.store;
     match store.create_session(&ws, &b.agent, &b.permission_mode, &b.model) {
-        Ok(s) => (StatusCode::CREATED, Json(serde_json::json!(view(&s)))).into_response(),
+        Ok(s) => {
+            st.emit(ev("session.created", &s.id, serde_json::json!(view(&s))));
+            (StatusCode::CREATED, Json(serde_json::json!(view(&s)))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -224,7 +237,11 @@ async fn get_session(State(st): State<AppState>, Path(id): Path<String>) -> impl
 async fn delete_session(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let store = &st.store;
     match store.delete_session(&id) {
-        Ok(true) => Json(serde_json::json!({"deleted": true})).into_response(),
+        Ok(true) => {
+            // Drop the per-session TMPDIR (Go CleanupSessionDir parity).
+            let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("lumina-ses-{id}")));
+            Json(serde_json::json!({"deleted": true})).into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
@@ -268,9 +285,22 @@ async fn patch_session(
     }
     let store = &st.store;
     match store.update_session(&id, b.agent.as_deref(), b.permission_mode.as_deref(), b.model.as_deref(), b.title.as_deref()) {
-        Ok(Some(s)) => Json(serde_json::json!(view(&s))).into_response(),
+        Ok(Some(s)) => {
+            st.emit(ev("session.updated", &s.id, serde_json::json!(view(&s))));
+            Json(serde_json::json!(view(&s))).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// SSE envelope: Go `Event{Type, SessionID, Data}` parity. The web UI and
+/// TUI classify on `type` + `session_id`, reading payloads from `data`.
+pub fn ev(kind: &str, session: &str, data: serde_json::Value) -> serde_json::Value {
+    if session.is_empty() {
+        serde_json::json!({"type": kind, "data": data})
+    } else {
+        serde_json::json!({"type": kind, "session_id": session, "data": data})
     }
 }
 
@@ -288,6 +318,11 @@ struct PromptBody {
     text: String,
     #[serde(default)]
     effort: String,
+    /// Delivery while a turn is running: steer (default) joins the active
+    /// turn at the next round boundary; queue chains after it completes.
+    /// Ignored when the session is idle (Go parity).
+    #[serde(default)]
+    delivery: String,
     /// Attached images (8MB cap each, vision-capable models only).
     #[serde(default)]
     images: Vec<ImageIn>,
@@ -321,13 +356,27 @@ async fn prompt(
     if b.text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "empty prompt"}))).into_response();
     }
+    if !b.effort.is_empty() && !crate::llm::valid_effort(&b.effort) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid effort (want auto|low|medium|high|xhigh|max)"}))).into_response();
+    }
     let effort = crate::llm::normalize_effort(&b.effort).to_string();
+    let delivery = if b.delivery.trim().is_empty() { "steer".to_string() } else { b.delivery.trim().to_string() };
     let _ = st.store.touch(&id);
     // Cross-daemon turn claim: 409 when another daemon holds the turn
     // (mirrors Go ClaimTurn: free, ours, or stale >10min).
     let owner = daemon_owner();
     if !st.store.claim_turn(&id, &owner, 600) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "turn in flight (another daemon holds this session)"}))).into_response();
+        let detail = st
+            .store
+            .turn_owner(&id)
+            .map(|(o, since)| {
+                let ts = chrono::DateTime::from_timestamp(since, 0)
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_default();
+                format!("turn in flight on another daemon (owner {o} since {ts})")
+            })
+            .unwrap_or_else(|| "turn in flight (another daemon holds this session)".to_string());
+        return (StatusCode::CONFLICT, Json(serde_json::json!({"error": detail}))).into_response();
     }
     let mut runner = Runner::new();
     runner.approval = Some(st.gate.clone());
@@ -352,16 +401,24 @@ async fn prompt(
             data: im.data.clone(),
         });
     }
-    // Same-daemon gate: chain behind the running turn instead of interleaving
-    // (steer/queue semantics; cross-daemon races 409 above via the claim).
+    // Same-daemon gate: while a turn is in flight, steer into it or chain
+    // behind it instead of starting a second concurrent loop (Go parity).
     if st.running.lock().unwrap().contains(&id) {
-        st.queued
-            .lock()
-            .unwrap()
-            .entry(id.clone())
-            .or_default()
-            .push_back(QueuedPrompt { text: b.text, effort, images });
-        return (StatusCode::ACCEPTED, Json(serde_json::json!({"session": id, "queued": true}))).into_response();
+        if delivery == "queue" {
+            let pos = {
+                let mut q = st.queued.lock().unwrap();
+                let queue = q.entry(id.clone()).or_default();
+                queue.push_back(QueuedPrompt { text: b.text, effort, images });
+                queue.len()
+            };
+            st.emit(ev("turn.progress", &id, serde_json::json!({"stage": format!("queued #{pos}")})));
+            return (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "queued", "session_id": id, "position": pos}))).into_response();
+        }
+        st.store.steer(&id, &b.text);
+        let preview: String = b.text.chars().take(80).collect();
+        let preview = if b.text.chars().count() > 80 { format!("{preview}…") } else { preview };
+        st.emit(ev("turn.progress", &id, serde_json::json!({"stage": format!("steered: {preview}")})));
+        return (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "steered", "session_id": id}))).into_response();
     }
     st.running.lock().unwrap().insert(id.clone());
     let first_q = QueuedPrompt { text: b.text, effort, images };
@@ -387,6 +444,17 @@ async fn prompt(
             }
         }
         loop {
+            // Steer text that arrived after the last round boundary chains
+            // as a queued turn (Go leftover-steer parity).
+            let rest = st2.store.take_steered(&id2);
+            if !rest.trim().is_empty() {
+                let _ = drive_one(&st2, &runner2, &id2, QueuedPrompt {
+                    text: rest,
+                    effort: String::new(),
+                    images: Vec::new(),
+                })
+                .await;
+            }
             let next = {
                 st2.queued.lock().unwrap().get_mut(&id2).and_then(|q| q.pop_front())
             };
@@ -412,47 +480,61 @@ async fn prompt(
 
 /// Run one queued turn: events, context gauge, standing-ops. Returns text or error string.
 async fn drive_one(st: &AppState, runner: &Runner, id: &str, q: QueuedPrompt) -> Result<String, String> {
-    st.emit(serde_json::json!({"type": "turn.started", "session": id}));
+    st.emit(ev("turn.started", id, serde_json::json!({"text": q.text})));
     let tx = st.events.clone();
     let sid = id.to_string();
     let started = std::time::Instant::now();
     let tx2 = tx.clone();
     let sid2 = sid.clone();
+    let tx3 = tx.clone();
+    let sid3 = sid.clone();
     let out = runner
         .run_prompt(&st.store, &st.router, &st.cfg, id, &q.text, &q.effort, &q.images, |d, t| {
-            let _ = tx.send(serde_json::json!({"type": "turn.delta", "session": sid, "delta": d, "thinking": t}));
+            let _ = tx.send(ev("turn.delta", &sid, serde_json::json!({"delta": d, "thinking": t})));
         }, |stage| {
-            let _ = tx2.send(serde_json::json!({"type": "turn.progress", "session": sid2, "stage": stage}));
+            let _ = tx2.send(ev("turn.progress", &sid2, serde_json::json!({"stage": stage})));
+        }, |tool| match tool {
+            crate::agent::ToolEvent::Start { name, target } => {
+                let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "start", "tool": name, "target": target})));
+            }
+            crate::agent::ToolEvent::Done { name, target, preview, error, duration_ms } => {
+                let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "done", "tool": name, "target": target, "preview": preview, "error": error, "duration_ms": duration_ms})));
+            }
         })
         .await;
     match out {
-        Ok(text) => {
+        Ok(outcome) => {
             let ms = started.elapsed().as_millis() as u64;
-            st.emit(serde_json::json!({"type": "turn.completed", "session": id,
-                "ms": ms, "chars": text.len(), "text": text}));
-            emit_context(st, id);
+            let (model, used, max) = context_snapshot(st, id).await;
+            st.emit(ev("turn.completed", id, serde_json::json!({
+                "text": outcome.text, "model": model, "duration_ms": ms,
+                "input_tokens": outcome.usage.input, "output_tokens": outcome.usage.output,
+                "context_tokens": used, "max_tokens": max,
+            })));
+            st.emit(ev("turn.context", id, serde_json::json!({"context_tokens": used, "max_tokens": max})));
             standing_ops(st, id);
-            Ok(text)
+            Ok(outcome.text)
         }
         Err(e) => {
             let s = e.to_string();
-            st.emit(serde_json::json!({"type": "turn.failed", "session": id, "error": s}));
+            st.emit(ev("turn.failed", id, serde_json::json!({"error": s})));
             standing_ops(st, id);
             Err(s)
         }
     }
 }
 
-/// Emit one `turn.context` gauge event (used tokens vs advertised window).
-fn emit_context(st: &AppState, id: &str) {
-    let Ok(Some(sess)) = st.store.get_session(id) else { return };
-    let Ok(turns) = st.store.turns(id) else { return };
-    let used: usize = turns.iter().map(|t| t.text.len() + t.role.len()).sum::<usize>() / 4;
-    // Window resolution is async; best-effort snapshot via blocking park.
-    let router = st.router.clone();
-    let model = if sess.model.is_empty() { router.model_for("executor", "build") } else { sess.model.clone() };
-    let max = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(router.context_window(&model))) as usize;
-    let _ = st.events.send(serde_json::json!({"type": "turn.context", "session": id, "used": used, "max": max}));
+/// Shared model + usage snapshot for the completed payload + gauge event.
+async fn context_snapshot(st: &AppState, id: &str) -> (String, usize, usize) {
+    let Ok(Some(sess)) = st.store.get_session(id) else { return (String::new(), 0, 0) };
+    let model = if sess.model.is_empty() { st.router.model_for("executor", "build") } else { sess.model.clone() };
+    let used = st
+        .store
+        .turns(id)
+        .map(|turns| turns.iter().map(|t| t.text.len() + t.role.len()).sum::<usize>() / 4)
+        .unwrap_or(0);
+    let max = st.router.context_window(&model).await as usize;
+    (model, used, max)
 }
 
 /// Standing-ops: debounced KB freshness pass after every turn (success or
@@ -472,7 +554,7 @@ fn standing_ops(st: &AppState, id: &str) {
         || {
             crate::kb::refresh_memory_manifest(std::path::Path::new(&ws))
                 .map(|_| {
-                    let _ = tx.send(serde_json::json!({"type": "kb.refreshed", "session": sid}));
+                    let _ = tx.send(ev("kb.refreshed", &sid, serde_json::json!({})));
                 })
                 .map_err(|e| e.to_string())
         },
@@ -493,7 +575,10 @@ async fn fork(
     let at = body.and_then(|b| b.turn.clone());
     let store = &st.store;
     match store.fork(&id, at.as_deref()) {
-        Ok(s) => (StatusCode::CREATED, Json(serde_json::json!(view(&s)))).into_response(),
+        Ok(s) => {
+            st.emit(ev("session.forked", &s.id, serde_json::json!(view(&s))));
+            (StatusCode::CREATED, Json(serde_json::json!(view(&s)))).into_response()
+        }
         Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -517,7 +602,7 @@ pub fn openapi_spec() -> serde_json::Value {
         "openapi": "3.1.0",
         "info": {"title": "Lumina daemon", "version": "0.1.0"},
         "paths": {
-            "/api/v1/events": "SSE: turn/context/delta/tool/completed/failed, permission.asked/resolved, question.asked/resolved, session.*, config.updated",
+            "/api/v1/events": "SSE {type,session_id?,data}: turn.started/progress/context/delta/tool/completed/failed, permission.asked/resolved, question.asked/resolved, session.*, config.updated",
             "/api/v1/sessions": "list (?directory=, ?latest=1) / create",
             "/api/v1/sessions/{id}": "fetch / patch agent,permission,model,title",
             "/api/v1/sessions/{id}/state": "resync: session + running + pending permission/question",
@@ -675,7 +760,7 @@ async fn router_set(State(st): State<AppState>, Json(b): Json<RouterSet>) -> imp
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
         }
     }
-    st.emit(serde_json::json!({"type": "config.updated", "role": b.role, "model": b.model}));
+    st.emit(ev("config.updated", "", serde_json::json!({"role": b.role, "model": b.model})));
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
@@ -802,9 +887,30 @@ async fn answer_permission(
 #[derive(Deserialize)]
 struct QuestionAnswer {
     #[serde(default)]
-    answers: Vec<String>,
+    answers: serde_json::Value,
     #[serde(default)]
     dismissed: bool,
+}
+
+/// Normalize answer payloads: canonical `[[...], ...]` per-question lists,
+/// or a flat `["a", ...]` shorthand meaning one answer per question
+/// (lenient clients, scripts). Anything else is an empty answer set.
+fn normalize_answers(v: &serde_json::Value) -> Vec<Vec<String>> {
+    let Some(items) = v.as_array() else { return Vec::new() };
+    if items.iter().all(|x| x.as_str().is_some()) {
+        return items
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| vec![s.to_string()]))
+            .collect();
+    }
+    items
+        .iter()
+        .map(|q| {
+            q.as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 async fn answer_question(
@@ -816,7 +922,7 @@ async fn answer_question(
         if st.gate.dismiss(&req_id) {
             return Json(serde_json::json!({"ok": true})).into_response();
         }
-    } else if st.gate.answer(&req_id, b.answers) {
+    } else if st.gate.answer(&req_id, normalize_answers(&b.answers)) {
         return Json(serde_json::json!({"ok": true})).into_response();
     }
     (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown or expired request"}))).into_response()
@@ -842,6 +948,7 @@ async fn auth_device_start(Query(q): Query<DeviceQ>) -> impl IntoResponse {
         Ok(dc) => Json(serde_json::json!({
             "provider": provider, "device_code": dc.device_code, "user_code": dc.user_code,
             "verification_uri": dc.verification_uri, "interval": dc.interval,
+            "expires_in": dc.expires_in,
         }))
         .into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -858,7 +965,7 @@ struct DevicePollQ {
     device_code: String,
 }
 
-async fn auth_device_poll(Query(q): Query<DevicePollQ>) -> impl IntoResponse {
+async fn auth_device_poll(State(st): State<AppState>, Query(q): Query<DevicePollQ>) -> impl IntoResponse {
     let provider = if q.provider.is_empty() { "copilot".to_string() } else { q.provider };
     let token_url = if q.github_url.is_empty() { "https://api.github.com".to_string() } else { q.github_url };
     if q.device_code.is_empty() {
@@ -869,6 +976,9 @@ async fn auth_device_poll(Query(q): Query<DevicePollQ>) -> impl IntoResponse {
             if let Err(e) = crate::copilot::write_token_store(&provider, &t) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
             }
+            // Fresh token: drop any cached session so the next call
+            // re-exchanges at once (no daemon restart).
+            st.router.drop_copilot_session(&provider);
             Json(serde_json::json!({"provider": provider, "connected": true})).into_response()
         }
         Ok(crate::copilot::Poll::Pending) => Json(serde_json::json!({"pending": true})).into_response(),
@@ -881,17 +991,17 @@ async fn harness_info() -> impl IntoResponse {
 }
 
 async fn harness_evolve(State(st): State<AppState>) -> impl IntoResponse {
-    st.emit(serde_json::json!({"type": "harness.evolve.started"}));
+    st.emit(ev("harness.evolve.started", "", serde_json::json!({})));
     let ws = std::env::current_dir().unwrap_or_else(|_| ".".into());
     // Blocking git worktree ops: run off the async executor.
     let out = tokio::task::spawn_blocking(move || crate::harness::offline_pass(&ws)).await;
     match out {
         Ok(Ok(msg)) => {
-            st.emit(serde_json::json!({"type": "harness.evolve.completed", "result": msg}));
+            st.emit(ev("harness.evolve.completed", "", serde_json::json!({"result": msg})));
             Json(serde_json::json!({"status": "completed", "result": msg})).into_response()
         }
         Ok(Err(e)) => {
-            st.emit(serde_json::json!({"type": "harness.evolve.failed", "error": e.to_string()}));
+            st.emit(ev("harness.evolve.failed", "", serde_json::json!({"error": e.to_string()})));
             (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("evolve task: {e}")}))).into_response(),
@@ -948,7 +1058,7 @@ async fn revert(
     }
     match crate::checkpoints::restore(&ws, &commit) {
         Ok(_) => {
-            st.emit(serde_json::json!({"type": "session.reverted", "session": id, "turn": turn}));
+            st.emit(ev("session.reverted", &id, serde_json::json!({"turn": turn})));
             Json(serde_json::json!({"session": id, "turn": turn, "commit": commit})).into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -988,7 +1098,7 @@ async fn unrevert(State(st): State<AppState>, Path(id): Path<String>) -> impl In
     }
     match crate::checkpoints::restore(&PathBuf::from(ws), &commit) {
         Ok(_) => {
-            st.emit(serde_json::json!({"type": "session.unreverted", "session": id}));
+            st.emit(ev("session.unreverted", &id, serde_json::json!({})));
             Json(serde_json::json!({"session": id, "commit": commit})).into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -998,7 +1108,7 @@ async fn unrevert(State(st): State<AppState>, Path(id): Path<String>) -> impl In
 async fn compact(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match Runner::compact_session(&st.store, &st.router, &st.cfg, &id).await {
         Ok(msg) => {
-            st.emit(serde_json::json!({"type": "session.compacted", "session": id, "result": msg}));
+            st.emit(ev("session.compacted", &id, serde_json::json!({"result": msg})));
             Json(serde_json::json!({"session": id, "result": msg})).into_response()
         }
         Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),

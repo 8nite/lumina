@@ -1,6 +1,6 @@
-//! Core tool registry: read/edit/write/bash/grep/glob.
-//! Mirrors `internal/tools` tool surface (M1: no subagents, no MCP — those
-//! claim their own milestones). Every call is gated by `security::decide`.
+//! Core tool registry: read/edit/write/bash/grep/glob/skill/mcp/kb_query/
+//! memory_write/question/websearch/webfetch/subagent/task_output/todowrite/patch.
+//! Mirrors `internal/tools` tool surface. Every call is gated by `security::decide`.
 
 use crate::{
     approve::ApprovalGate,
@@ -59,6 +59,8 @@ pub struct Registry {
     pub bundle: Option<Bundle>,
     /// `[websearch] provider` selection ("" = auto across keyed providers).
     pub websearch_provider: String,
+    /// Kill-switch: when true the websearch tool is refused (Go parity).
+    pub websearch_disabled: bool,
     /// Lumina-compatible JS/TS plugin worker (None when unconfigured).
     pub plugins: Option<Arc<Host>>,
     /// Subagent executor (wired by the agent to avoid a tools↔agent cycle).
@@ -67,15 +69,33 @@ pub struct Registry {
     pub disabled_tools: HashSet<String>,
 }
 
-/// Subagent runner: (parent ctx, task, agent name) -> final text.
-pub type SubagentFn = Arc<dyn Fn(&SecCtx, &str, &str) -> Result<String, String> + Send + Sync>;
+/// Subagent runner: (parent ctx, request) -> final text.
+pub type SubagentFn = Arc<dyn Fn(&SecCtx, &SubagentReq) -> Result<String, String> + Send + Sync>;
+
+/// One scoped child delegation (tools.SubagentRequest parity).
+#[derive(Debug, Clone, Default)]
+pub struct SubagentReq {
+    pub task: String,
+    pub agent: String,
+    pub description: String,
+    pub model: String,
+}
+
+/// Delegation cap (default 1; `LUMINA_SUBAGENT_DEPTH` overrides).
+pub fn subagent_max_depth() -> u8 {
+    std::env::var("LUMINA_SUBAGENT_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|n: &u8| *n >= 1)
+        .unwrap_or(1)
+}
 
 /// `kb::query` adapter: (workspace, query, budget) -> context text.
 pub type KbQueryFn = Arc<dyn Fn(&Path, &str, usize) -> Result<String, String> + Send + Sync>;
 
 impl Registry {
     pub fn new() -> Self {
-        Self { kb_query: None, bundle: None, websearch_provider: String::new(), plugins: None, subagent: None, disabled_tools: HashSet::new() }
+        Self { kb_query: None, bundle: None, websearch_provider: String::new(), websearch_disabled: false, plugins: None, subagent: None, disabled_tools: HashSet::new() }
     }
 
     pub fn call(
@@ -162,21 +182,24 @@ impl Registry {
             "webfetch" => do_webfetch(&args),
             "mcp" => do_mcp(sc, &args),
             "subagent" => do_subagent(self, sc, &args),
+            "task_output" => do_task_output(&args),
             "todowrite" => do_todowrite(sc, &args),
             "patch" => do_patch(sc, &args),
             _ => Err(ToolError::Msg(format!("unknown tool {name}"))),
         };
-        // Lumina hook: tool.execute.after observes (never blocks).
+        // Lumina hook: tool.execute.after observes full args + result
+        // (never blocks).
         if let Some(h) = &self.plugins {
-            let summary = match &result {
-                Ok(o) => format!("ok {}b", o.output.len()),
-                Err(e) => format!("error: {e}"),
+            let (output, error) = match &result {
+                Ok(o) => (o.output.clone(), String::new()),
+                Err(e) => (String::new(), e.to_string()),
             };
             h.notify(
                 "tool.execute.after",
                 &serde_json::json!({
                     "tool": name, "args": args, "sessionID": sc.session,
-                    "result": summary, "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "output": output, "error": error,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
                 }),
             );
         }
@@ -191,7 +214,7 @@ impl Default for Registry {
     }
 }
 
-fn tool_target(name: &str, args: &HashMap<String, serde_json::Value>) -> String {
+pub(crate) fn tool_target(name: &str, args: &HashMap<String, serde_json::Value>) -> String {
     let s = |keys: &[&str]| {
         keys.iter()
             .filter_map(|k| args.get(*k).and_then(|v| v.as_str()))
@@ -214,6 +237,10 @@ fn tool_target(name: &str, args: &HashMap<String, serde_json::Value>) -> String 
         "webfetch" => s(&["url"]),
         "mcp" => format!("{}:{}", s(&["server"]), s(&["tool", "name"])),
         "subagent" => s(&["task", "prompt"]),
+        "task_output" => {
+            let t = s(&["task_id", "id"]);
+            if t.is_empty() { name.into() } else { format!("task:{t}") }
+        }
         "patch" => first_patch_path(&s(&["patch", "diff"])),
         "todowrite" => String::new(),
         _ => String::new(),
@@ -226,8 +253,14 @@ fn is_destructive(cmd: &str) -> bool {
 }
 
 fn int_arg(args: &HashMap<String, serde_json::Value>, key: &str, d: u64) -> u64 {
-    args.get(key)
-        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+    int_arg_any(args, &[key], d)
+}
+
+fn int_arg_any(args: &HashMap<String, serde_json::Value>, keys: &[&str], d: u64) -> u64 {
+    keys.iter()
+        .filter_map(|k| args.get(*k))
+        .filter_map(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)).or_else(|| v.as_str()?.parse().ok()))
+        .next()
         .unwrap_or(d)
 }
 
@@ -243,18 +276,39 @@ fn str_arg(args: &HashMap<String, serde_json::Value>, keys: &[&str]) -> String {
 }
 
 fn resolve(sc: &SecCtx, p: &str) -> Result<PathBuf, ToolError> {
-    let cand = if Path::new(p).is_absolute() {
-        PathBuf::from(p)
+    resolve_write(sc, p)
+}
+
+/// Read path: workspace or the external read allowlist (home/tmp/system).
+fn resolve_read(sc: &SecCtx, p: &str) -> Result<PathBuf, ToolError> {
+    if crate::security::is_read_allowed(&sc.workspace, p) {
+        return Ok(wash(sc, p));
+    }
+    Err(ToolError::Denied(format!("escape {p}")))
+}
+
+/// Write path: workspace or temp only.
+fn resolve_write(sc: &SecCtx, p: &str) -> Result<PathBuf, ToolError> {
+    if crate::security::is_write_allowed(&sc.workspace, p) {
+        return Ok(wash(sc, p));
+    }
+    Err(ToolError::Denied(format!("escape {p}")))
+}
+
+/// Lexical wash: `~`-expand, join, clean `..` (no symlink chase on missing files).
+fn wash(sc: &SecCtx, p: &str) -> PathBuf {
+    let e = crate::security::expand_home(p);
+    let cand = if Path::new(&e).is_absolute() {
+        PathBuf::from(&e)
     } else {
-        sc.workspace.join(p)
+        sc.workspace.join(&e)
     };
-    // Lexical containment (no symlink chase on missing files).
     let mut norm = PathBuf::new();
     for comp in cand.components() {
         use std::path::Component::*;
         match comp {
             RootDir => norm.push("/"),
-            Prefix(p) => norm.push(p.as_os_str()),
+            Prefix(pr) => norm.push(pr.as_os_str()),
             CurDir => {}
             ParentDir => {
                 norm.pop();
@@ -262,10 +316,7 @@ fn resolve(sc: &SecCtx, p: &str) -> Result<PathBuf, ToolError> {
             Normal(c) => norm.push(c),
         }
     }
-    if !norm.starts_with(&sc.workspace) {
-        return Err(ToolError::Denied(format!("escape {p}")));
-    }
-    Ok(norm)
+    norm
 }
 
 const MAX_BYTES: u64 = 256 * 1024;
@@ -282,20 +333,70 @@ fn cap(s: String) -> Outcome {
 
 fn do_read(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
     let p = str_arg(args, &["path", "file"]);
-    let abs = resolve(sc, &p)?;
-    let meta = std::fs::metadata(&abs).map_err(|_| ToolError::Msg(format!("read: no such file {p}")))?;
-    if meta.len() > MAX_BYTES {
-        // Paged read: offset/limit in lines (ponytail: head/tail math inline).
-        let text = std::fs::read_to_string(&abs)?;
-        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
-        let lines: Vec<&str> = text.lines().collect();
-        let end = (offset + limit).min(lines.len());
-        let mut out = format!("{p} (lines {}-{}/{}, {} bytes total)\n", offset + 1, end, lines.len(), meta.len());
-        out.push_str(&lines.get(offset..end).unwrap_or(&[]).join("\n"));
-        return Ok(cap(out));
+    if p.is_empty() {
+        return Err(ToolError::Msg("read: missing path".into()));
     }
-    Ok(cap(std::fs::read_to_string(&abs)?))
+    let abs = resolve_read(sc, &p)?;
+    let meta = std::fs::metadata(&abs).map_err(|_| ToolError::Msg(format!("read: no such file {p}")))?;
+    let mut offset = int_arg_any(args, &["offset"], 1) as usize;
+    if offset < 1 {
+        offset = 1;
+    }
+    let mut limit = int_arg_any(args, &["limit"], 2000) as usize;
+    if limit < 1 {
+        limit = 2000;
+    }
+    if limit > 2000 {
+        limit = 2000;
+    }
+    // Directory: one entry per line, paginated like text. Workspace-internal
+    // credential entries are filtered; external whitelisted dirs list all
+    // dotfiles per explicit user override.
+    if meta.is_dir() {
+        let mut names: Vec<String> = std::fs::read_dir(&abs)
+            .map_err(|e| ToolError::Msg(format!("read: {e}")))?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                let full = abs.join(n);
+                !(crate::security::is_credential_path(&full.to_string_lossy())
+                    && full.starts_with(&sc.workspace))
+            })
+            .collect();
+        names.sort();
+        let end = (offset - 1 + limit).min(names.len());
+        if offset - 1 > names.len() {
+            return Ok(Outcome { output: String::new(), truncated: false });
+        }
+        let truncated = end < names.len();
+        return Ok(Outcome { output: names[offset - 1..end].join("\n"), truncated });
+    }
+    if meta.len() > MAX_BYTES {
+        // Paged read for huge files (offset/limit in lines).
+        let text = std::fs::read_to_string(&abs)?;
+        let lines: Vec<&str> = text.lines().collect();
+        let end = (offset - 1 + limit).min(lines.len());
+        if offset - 1 > lines.len() {
+            return Ok(Outcome { output: String::new(), truncated: false });
+        }
+        let mut out = format!("{p} (lines {}-{}/{}, {} bytes total)\n", offset, end, lines.len(), meta.len());
+        out.push_str(&lines[offset - 1..end].join("\n"));
+        return Ok(Outcome { output: out, truncated: end < lines.len() });
+    }
+    let b = std::fs::read(&abs)?;
+    if b.contains(&0) {
+        return Err(ToolError::Msg(format!("read: binary file not supported ({p})")));
+    }
+    let text = String::from_utf8_lossy(&b);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let end = (offset - 1 + limit).min(lines.len());
+    if offset - 1 > lines.len() {
+        return Ok(Outcome { output: String::new(), truncated: false });
+    }
+    // 1-based "line: content" matches opencode read.ts so models can cite
+    // lines and edits stay prefix-free.
+    let out: Vec<String> = (offset - 1..end).map(|i| format!("{}: {}", i + 1, lines[i])).collect();
+    Ok(Outcome { output: out.join("\n"), truncated: end < lines.len() })
 }
 
 fn do_write(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
@@ -306,30 +407,59 @@ fn do_write(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Ou
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(&abs, content)?;
-    Ok(Outcome { output: format!("wrote {p}"), truncated: false })
+    Ok(Outcome { output: format!("wrote {}", abs.display()), truncated: false })
 }
 
 fn do_edit(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
     let p = str_arg(args, &["path", "file"]);
-    let old = str_arg(args, &["old_string", "old", "needle"]);
-    let new = str_arg(args, &["new_string", "new", "replacement"]);
-    if old.is_empty() {
-        return Err(ToolError::Msg("edit: old_string is empty".into()));
+    let old = str_arg(args, &["old_string", "oldString", "old"]);
+    let new = str_arg(args, &["new_string", "newString", "new"]);
+    if p.is_empty() || old.is_empty() {
+        return Err(ToolError::Msg("edit: missing path/old_string".into()));
     }
     let abs = resolve(sc, &p)?;
     let text = std::fs::read_to_string(&abs).map_err(|_| ToolError::Msg(format!("edit: no such file {p}")))?;
-    let matches = text.matches(&old).count();
-    if matches != 1 {
-        return Err(ToolError::Msg(format!("edit: needle matches {matches}x (need exactly 1) in {p}")));
+    if !text.contains(&old) {
+        return Err(ToolError::Msg("edit: old_string not found".into()));
     }
-    std::fs::write(&abs, text.replacen(&old, &new, 1))?;
-    Ok(Outcome { output: format!("edited {p}"), truncated: false })
+    // opencode parity: replaceAll replaces every occurrence.
+    let updated = if is_truthy(args.get("replaceAll")) || is_truthy(args.get("replace_all")) {
+        text.replace(&old, &new)
+    } else {
+        let matches = text.matches(&old).count();
+        if matches > 1 {
+            return Err(ToolError::Msg(format!(
+                "edit: old_string matches {matches} locations; add context or set replaceAll:true"
+            )));
+        }
+        text.replacen(&old, &new, 1)
+    };
+    std::fs::write(&abs, updated)?;
+    Ok(Outcome { output: format!("edited {}", abs.display()), truncated: false })
 }
 
 fn do_bash(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
     let cmd_str = str_arg(args, &["command", "cmd"]);
     if cmd_str.trim().is_empty() {
         return Err(ToolError::Msg("bash: empty command".into()));
+    }
+    // workdir runs in the workspace or a whitelisted external dir.
+    let mut dir = sc.workspace.clone();
+    if !str_arg(args, &["workdir", "work_dir", "cwd"]).is_empty() {
+        let w = str_arg(args, &["workdir", "work_dir", "cwd"]);
+        let expanded = crate::security::expand_home(&w);
+        let resolved = if std::path::Path::new(&expanded).is_absolute() {
+            PathBuf::from(&expanded)
+        } else {
+            sc.workspace.join(&expanded)
+        };
+        if !resolved.starts_with(&sc.workspace) && !crate::security::is_whitelisted_read(&resolved.to_string_lossy()) {
+            return Err(ToolError::Denied("bash: workdir escapes workspace".to_string()));
+        }
+        if !resolved.is_dir() {
+            return Err(ToolError::Msg(format!("bash: workdir is not a directory: {w}")));
+        }
+        dir = resolved;
     }
     // Lumina hook: shell.env injects/overrides environment variables.
     let mut extra_env: Vec<(String, String)> = Vec::new();
@@ -346,21 +476,59 @@ fn do_bash(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value
             }
         }
     }
-    let timeout = args
-        .get("timeout_ms")
-        .and_then(|v| v.as_u64())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(120));
-    // ponytail: std Command + scoped kill via wait_timeout emulation (poll loop).
+    // Background: no timeout unless one is supplied. Foreground keeps
+    // the 2-minute cap when timeout<=0 (doBash parity).
+    let bg = is_truthy(args.get("background"));
+    let timeout = {
+        let ms = int_arg_any(args, &["timeout", "timeout_ms", "timeoutMs"], 0);
+        if ms > 0 {
+            Some(Duration::from_millis(ms))
+        } else if bg {
+            None
+        } else {
+            Some(Duration::from_secs(120))
+        }
+    };
+    if bg {
+        let mut label = cmd_str.clone();
+        if label.len() > 80 {
+            label.truncate(80);
+            label.push('…');
+        }
+        let id = new_task(&sc.session, "bash", &label);
+        let slot = task_slot(&id);
+        let session = sc.session.clone();
+        let id2 = id.clone();
+        std::thread::spawn(move || {
+            let out = match exec_bash(&cmd_str, &dir, &session, &extra_env, timeout) {
+                Ok(s) => s,
+                Err(e) => format!("error: {e}"),
+            };
+            finish_task(&id2, &slot, &out);
+        });
+        return Ok(Outcome { output: format!("started background task {id} (poll with task_output)"), truncated: false });
+    }
+    exec_bash(&cmd_str, &dir, &sc.session, &extra_env, timeout).map(cap)
+}
+
+/// Synchronous shell run shared by foreground `bash` and background tasks.
+/// ponytail: std Command + scoped kill via wait_timeout emulation (poll loop).
+fn exec_bash(
+    cmd_str: &str,
+    workspace: &Path,
+    session: &str,
+    extra_env: &[(String, String)],
+    timeout: Option<Duration>,
+) -> Result<String, ToolError> {
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c")
-        .arg(&cmd_str)
-        .current_dir(&sc.workspace)
+        .arg(cmd_str)
+        .current_dir(workspace)
         // Per-session TMPDIR hygiene (cleaned on session.deleted).
-        .env("TMPDIR", std::env::temp_dir().join(format!("lumina-ses-{}", sc.session)))
+        .env("TMPDIR", std::env::temp_dir().join(format!("lumina-ses-{session}")))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    for (k, v) in &extra_env {
+    for (k, v) in extra_env {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn()?;
@@ -376,84 +544,316 @@ fn do_bash(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value
                     text.push_str(&err);
                 }
                 if !status.success() {
+                    if text.trim().is_empty() {
+                        return Err(ToolError::Msg(format!(
+                            "bash: command failed with exit {}",
+                            status.code().unwrap_or(-1)
+                        )));
+                    }
                     text.push_str(&format!("\n[exit {}]", status.code().unwrap_or(-1)));
                 }
-                return Ok(cap(text));
+                return Ok(text);
             }
-            None if start.elapsed() > timeout => {
+            None if timeout.is_some_and(|t| start.elapsed() > t) => {
                 let _ = child.kill();
-                return Err(ToolError::Msg(format!("bash: timed out after {timeout:?}")));
+                return Err(ToolError::Msg(format!("bash: timed out after {:?}", timeout.unwrap())));
             }
             None => std::thread::sleep(Duration::from_millis(25)),
         }
     }
 }
 
+/// Background tasks (`bash background:true`, `subagent background:true`):
+/// daemon-lifetime registry polled via `task_output`. Mirrors Go's
+/// Registry.tasks map + `task-N` ids (global here: Registry is per-turn).
+struct TaskState {
+    done: bool,
+    output: String,
+}
+
+/// One background task: owning session + kind/label + shared completion slot.
+struct TaskEntry {
+    session: String,
+    kind: String,
+    label: String,
+    slot: Arc<Mutex<TaskState>>,
+}
+
+/// Fires when a background task finishes (OnBackgroundDone parity).
+/// Daemon-lifetime: the server installs a broker hook at startup, headless
+/// `run` installs a stderr hook; unset in tests.
+pub type BackgroundHook = Arc<dyn Fn(&str, &str, &str, &str) + Send + Sync>;
+
+fn background_hook() -> &'static Mutex<Option<BackgroundHook>> {
+    use std::sync::OnceLock;
+    static HOOK: OnceLock<Mutex<Option<BackgroundHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Install the process-wide background-completion hook.
+pub fn set_background_hook(hook: BackgroundHook) {
+    *background_hook().lock().unwrap() = Some(hook);
+}
+
+fn notify_background_done(session: &str, id: &str, kind: &str, label: &str) {
+    if let Some(h) = background_hook().lock().unwrap().clone() {
+        h(session, id, kind, label);
+    }
+}
+
+fn task_registry() -> &'static Mutex<HashMap<String, TaskEntry>> {
+    use std::sync::OnceLock;
+    static TASKS: OnceLock<Mutex<HashMap<String, TaskEntry>>> = OnceLock::new();
+    TASKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn new_task(session: &str, kind: &str, label: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let id = format!("task-{}", SEQ.fetch_add(1, Ordering::Relaxed) + 1);
+    let slot = Arc::new(Mutex::new(TaskState { done: false, output: String::new() }));
+    task_registry().lock().unwrap().insert(
+        id.clone(),
+        TaskEntry { session: session.into(), kind: kind.into(), label: label.into(), slot },
+    );
+    id
+}
+
+fn task_slot(id: &str) -> Arc<Mutex<TaskState>> {
+    task_registry().lock().unwrap().get(id).map(|e| e.slot.clone()).unwrap()
+}
+
+fn finish_task(id: &str, slot: &Arc<Mutex<TaskState>>, output: &str) {
+    {
+        let mut st = slot.lock().unwrap();
+        st.done = true;
+        st.output = output.to_string();
+    }
+    if let Some(e) = task_registry().lock().unwrap().get(id) {
+        notify_background_done(&e.session.clone(), id, &e.kind.clone(), &e.label.clone());
+    }
+}
+
+fn do_task_output(args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+    let id = str_arg(args, &["task_id", "id", "taskId"]);
+    if id.is_empty() {
+        return Err(ToolError::Msg("task_output: missing task_id".into()));
+    }
+    let reg = task_registry().lock().unwrap();
+    let Some(entry) = reg.get(&id) else {
+        return Err(ToolError::Msg(format!("task_output: unknown task {id:?}")));
+    };
+    let (kind, label, slot) = (entry.kind.clone(), entry.label.clone(), entry.slot.clone());
+    drop(reg);
+    let st = slot.lock().unwrap();
+    if !st.done {
+        return Ok(Outcome { output: format!("task {id} ({kind}) still running: {label}"), truncated: false });
+    }
+    Ok(cap(st.output.clone()))
+}
+
+fn is_truthy(v: Option<&serde_json::Value>) -> bool {
+    match v {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"),
+        Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0) != 0,
+        _ => false,
+    }
+}
+
 fn do_grep(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
     let pattern = str_arg(args, &["pattern", "query"]);
     if pattern.is_empty() {
-        return Err(ToolError::Msg("grep: empty pattern".into()));
+        return Err(ToolError::Msg("grep: missing pattern".into()));
     }
-    let include = str_arg(args, &["include", "glob"]);
-    let re = regex::Regex::new(&pattern).map_err(|e| ToolError::Msg(format!("grep: bad regex: {e}")))?;
-    let mut hits = Vec::new();
-    let mut files = 0usize;
+    // Optional path base: workspace or the external read allowlist.
+    let mut root = sc.workspace.clone();
+    if !str_arg(args, &["path"]).is_empty() {
+        let p = str_arg(args, &["path"]);
+        let cand = if std::path::Path::new(&p).is_absolute() { PathBuf::from(&p) } else { sc.workspace.join(&p) };
+        if !sc.workspace.as_os_str().is_empty()
+            && !cand.starts_with(&sc.workspace)
+            && !crate::security::is_whitelisted_read(&cand.to_string_lossy())
+        {
+            return Err(ToolError::Denied("grep: path escapes workspace".into()));
+        }
+        root = cand;
+    }
+    if root.as_os_str().is_empty() {
+        return Err(ToolError::Msg("grep: missing pattern/path".into()));
+    }
+    // literal:true matches exact text; otherwise pattern is a regexp.
+    let literal = is_truthy(args.get("literal"));
+    let mut case_sensitive = true;
+    if args.contains_key("caseSensitive") {
+        case_sensitive = is_truthy(args.get("caseSensitive"));
+    } else if args.contains_key("case_sensitive") {
+        case_sensitive = is_truthy(args.get("case_sensitive"));
+    }
+    let re = if !literal {
+        let expr = if case_sensitive { pattern.clone() } else { format!("(?i){pattern}") };
+        Some(regex::Regex::new(&expr).map_err(|e| ToolError::Msg(format!("grep: invalid pattern: {e}")))?)
+    } else {
+        None
+    };
+    let include = str_arg(args, &["include"]);
+    let include_pat = if include.is_empty() { None } else { glob::Pattern::new(&include).ok() };
+    let mut limit = int_arg_any(args, &["limit"], 100) as usize;
+    if limit < 1 {
+        limit = 100;
+    }
+    if limit > 500 {
+        limit = 500;
+    }
+    let needle = if case_sensitive { pattern.clone() } else { pattern.to_lowercase() };
+    let mut out: Vec<String> = Vec::new();
     // ponytail: small recursive walker, no ignore-crate until it earns its keep.
     fn walk(dir: &Path, cb: &mut dyn FnMut(&Path)) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
             let p = e.path();
-            if p.file_name().map(|n| n == ".git" || n == "target" || n == "node_modules").unwrap_or(false) {
-                continue;
-            }
             if p.is_dir() {
+                let s = p.to_string_lossy();
+                if s.contains("/.git/") || s.contains("/node_modules/") {
+                    continue;
+                }
                 walk(&p, cb);
             } else {
                 cb(&p);
             }
         }
     }
-    walk(&sc.workspace, &mut |p: &Path| {
-        if hits.len() >= 100 {
+    let ws = sc.workspace.clone();
+    walk(&root, &mut |p| {
+        if out.len() >= limit {
             return;
         }
-        if !include.is_empty() {
-            let pat = glob::Pattern::new(&include).unwrap_or(glob::Pattern::new("*").unwrap());
-            if !pat.matches(p.file_name().and_then(|n| n.to_str()).unwrap_or("")) {
+        let s = p.to_string_lossy();
+        if s.contains("/.git/") || s.contains("/node_modules/") {
+            return;
+        }
+        // Workspace secrets are never indexed; external whitelist allows dotfiles.
+        if crate::security::is_credential_path(&s) && p.starts_with(&ws) {
+            return;
+        }
+        if p.metadata().map(|m| m.len() > 1 << 20).unwrap_or(true) {
+            return;
+        }
+        let rel = if ws.as_os_str().is_empty() {
+            s.to_string()
+        } else {
+            p.strip_prefix(&ws).map(|r| r.to_string_lossy().into_owned()).unwrap_or_else(|_| s.to_string())
+        };
+        if let Some(pat) = &include_pat {
+            // Match against the relative path and the base name so
+            // "*.go" works at any depth.
+            let base = p.file_name().map(|b| b.to_string_lossy().into_owned()).unwrap_or_default();
+            if !pat.matches(&rel) && !pat.matches(&base) {
                 return;
             }
         }
-        files += 1;
-        if files > 5000 {
-            return;
+        let Ok(b) = std::fs::read(p) else { return };
+        if b.contains(&0) {
+            return; // skip binaries
         }
-        let Ok(text) = std::fs::read_to_string(p) else { return };
-        for (i, line) in text.lines().enumerate() {
-            if re.is_match(line) {
-                hits.push(format!("{}:{}: {}", p.strip_prefix(&sc.workspace).unwrap_or(p).display(), i + 1, line.trim()));
-                if hits.len() >= 100 {
-                    return;
+        let text = String::from_utf8_lossy(&b);
+        for (i, line) in text.split('\n').enumerate() {
+            let hit = if let Some(re) = &re {
+                re.is_match(line)
+            } else if case_sensitive {
+                line.contains(&pattern)
+            } else {
+                line.to_lowercase().contains(&needle)
+            };
+            if hit {
+                out.push(format!("{rel}:{}:{line}", i + 1));
+                if out.len() >= limit {
+                    break;
                 }
             }
         }
     });
-    Ok(cap(if hits.is_empty() { "(no matches)".into() } else { hits.join("\n") }))
+    Ok(Outcome { output: out.join("\n"), truncated: out.len() >= limit })
 }
 
 fn do_glob(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
     let pattern = str_arg(args, &["pattern", "glob"]);
     if pattern.is_empty() {
-        return Err(ToolError::Msg("glob: empty pattern".into()));
+        return Err(ToolError::Msg("glob: missing pattern".into()));
     }
-    let full = sc.workspace.join(&pattern);
-    let mut hits: Vec<String> = glob::glob(full.to_str().unwrap_or(""))
-        .map_err(|e| ToolError::Msg(format!("glob: {e}")))?
-        .flatten()
-        .filter_map(|p| p.strip_prefix(&sc.workspace).ok().map(|r| r.display().to_string()))
-        .take(200)
-        .collect();
-    hits.sort();
-    Ok(cap(if hits.is_empty() { "(no matches)".into() } else { hits.join("\n") }))
+    // Optional path base: workspace or the external read allowlist.
+    let mut root = sc.workspace.clone();
+    if !str_arg(args, &["path"]).is_empty() {
+        let p = str_arg(args, &["path"]);
+        let cand = if std::path::Path::new(&p).is_absolute() { PathBuf::from(&p) } else { sc.workspace.join(&p) };
+        if !sc.workspace.as_os_str().is_empty()
+            && !cand.starts_with(&sc.workspace)
+            && !crate::security::is_whitelisted_read(&cand.to_string_lossy())
+        {
+            return Err(ToolError::Denied("glob: path escapes workspace".into()));
+        }
+        root = cand;
+    }
+    let mut limit = int_arg_any(args, &["limit"], 100) as usize;
+    if limit < 1 {
+        limit = 100;
+    }
+    if limit > 1000 {
+        limit = 1000;
+    }
+    let ws = sc.workspace.clone();
+    let mut rel: Vec<String> = Vec::new();
+    if pattern.contains("**") {
+        // Walk + glob-pattern match (globToRegExp parity via the glob crate).
+        let pat = glob::Pattern::new(&pattern).map_err(|e| ToolError::Msg(format!("glob: bad pattern: {e}")))?;
+        fn walk2(dir: &Path, cb: &mut dyn FnMut(&Path)) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    let s = p.to_string_lossy();
+                    if s.contains("/.git/") || s.contains("/node_modules/") {
+                        continue;
+                    }
+                    walk2(&p, cb);
+                } else {
+                    cb(&p);
+                }
+            }
+        }
+        walk2(&root, &mut |p| {
+            if rel.len() >= limit {
+                return;
+            }
+            let Ok(rp) = p.strip_prefix(&root) else { return };
+            let rps = rp.to_string_lossy().replace('\\', "/");
+            if rps.is_empty() {
+                return;
+            }
+            if crate::security::is_credential_path(&p.to_string_lossy()) && p.starts_with(&ws) {
+                return; // workspace secrets hidden; external whitelist lists all dotfiles
+            }
+            if pat.matches(&rps) {
+                rel.push(rps);
+            }
+        });
+    } else {
+        let mut hits: Vec<String> = glob::glob(root.join(&pattern).to_str().unwrap_or(""))
+            .map_err(|e| ToolError::Msg(format!("glob: {e}")))?
+            .flatten()
+            .filter(|p| {
+                !(crate::security::is_credential_path(&p.to_string_lossy()) && p.starts_with(&ws))
+            })
+            .filter_map(|p| p.strip_prefix(&root).ok().map(|r| r.display().to_string()))
+            .collect();
+        hits.sort();
+        rel = hits;
+    }
+    let truncated = rel.len() > limit;
+    if truncated {
+        rel.truncate(limit);
+    }
+    Ok(Outcome { output: if rel.is_empty() { "(no matches)".into() } else { rel.join("\n") }, truncated })
 }
 
 
@@ -502,37 +902,122 @@ fn do_skill(reg: &Registry, args: &HashMap<String, serde_json::Value>) -> Result
 }
 
 fn do_question(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+    let qs = parse_questions(args)?;
+    // Headless runs guide the model to proceed with best guesses (Go parity).
     if !sc.gate.is_live() {
-        return Err(ToolError::Msg("question: interactive gate not attached".into()));
+        return Ok(Outcome { output: unwired_question_guidance(&qs), truncated: false });
     }
+    match sc.gate.ask_question(&sc.session, qs.clone()) {
+        Ok(answers) => Ok(Outcome { output: format_question_answers(&qs, &answers), truncated: false }),
+        Err(e) => {
+            // Dismissals and transport failures reach the model as guidance
+            // to continue without the answers, never as a stuck turn.
+            Err(ToolError::Msg(format!("question: {e}; proceed with your best guess and note the assumption")))
+        }
+    }
+}
+
+/// Decode the question-tool input (opencode Question.Prompt shape:
+/// {question, header, options: [{label, description}], multiple}).
+/// Bare strings ("q1") and legacy {text, options:[string]} also parse.
+fn parse_questions(args: &HashMap<String, serde_json::Value>) -> Result<Vec<crate::approve::Question>, ToolError> {
     let raw = args.get("questions").cloned().unwrap_or(serde_json::Value::Null);
     let list = raw.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
-        return Err(ToolError::Msg("question: no questions provided".into()));
+        return Err(ToolError::Msg("question: missing questions".into()));
     }
     let mut qs = Vec::new();
-    for q in list.iter().take(4) {
+    for (i, item) in list.iter().enumerate() {
+        if let Some(s) = item.as_str() {
+            if s.is_empty() {
+                continue;
+            }
+            qs.push(crate::approve::Question {
+                question: s.trim().to_string(),
+                header: String::new(),
+                options: vec![],
+                multiple: false,
+            });
+            continue;
+        }
+        let Some(m) = item.as_object() else {
+            return Err(ToolError::Msg(format!("question: questions[{i}] must be {{question, header, options}}")));
+        };
+        let get = |k: &str| m.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let question = {
+            let q = get("question");
+            if q.is_empty() { get("text") } else { q }
+        };
+        if question.is_empty() {
+            return Err(ToolError::Msg(format!("question: questions[{i}].question is required")));
+        }
+        let mut options = Vec::new();
+        if let Some(arr) = m.get("options").and_then(|o| o.as_array()) {
+            for (j, o) in arr.iter().enumerate() {
+                if let Some(label) = o.as_str() {
+                    // Legacy string options.
+                    if label.is_empty() {
+                        continue;
+                    }
+                    options.push(crate::approve::QuestionOption { label: label.into(), description: String::new() });
+                    continue;
+                }
+                let Some(om) = o.as_object() else {
+                    return Err(ToolError::Msg(format!(
+                        "question: questions[{i}].options[{j}] must be {{label, description}}"
+                    )));
+                };
+                let label = om.get("label").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                if label.is_empty() {
+                    return Err(ToolError::Msg(format!(
+                        "question: questions[{i}].options[{j}].label is required"
+                    )));
+                }
+                options.push(crate::approve::QuestionOption {
+                    label,
+                    description: om.get("description").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
+                });
+            }
+        }
         qs.push(crate::approve::Question {
-            text: q.get("text").and_then(|t| t.as_str()).unwrap_or("?").to_string(),
-            options: q
-                .get("options")
-                .and_then(|o| o.as_array())
-                .map(|a| a.iter().filter_map(|o| o.as_str().map(|s| s.to_string())).collect())
-                .unwrap_or_default(),
+            question,
+            header: get("header"),
+            options,
+            multiple: m.get("multiple").and_then(|v| v.as_bool()).unwrap_or(false),
         });
     }
-    let answers = sc.gate.ask_question(&sc.session, qs).map_err(ToolError::Msg)?;
-    // Echo the question alongside the answer so the model connects its
-    // tool call to this result instead of re-asking.
-    let mut out = String::new();
-    for (i, (q, a)) in list.iter().zip(answers.iter()).enumerate() {
-        let t = q.get("text").and_then(|t| t.as_str()).unwrap_or("?");
-        out.push_str(&format!("Q{} {} → user answered: {}\n", i + 1, t, a));
+    if qs.is_empty() {
+        return Err(ToolError::Msg("question: missing questions".into()));
     }
-    Ok(Outcome { output: format!("user answered:\n{out}").trim_end().to_string(), truncated: false })
+    Ok(qs)
+}
+
+/// Render replies model-side (opencode QuestionTool.toModelContent parity).
+fn format_question_answers(qs: &[crate::approve::Question], answers: &[Vec<String>]) -> String {
+    let mut parts = Vec::new();
+    for (i, q) in qs.iter().enumerate() {
+        let a: Vec<String> = answers.get(i).cloned().unwrap_or_default();
+        let a = if a.is_empty() { vec!["Unanswered".to_string()] } else { a };
+        parts.push(format!("{:?}={:?}", q.question, a.join(", ")));
+    }
+    format!(
+        "User has answered your questions: {}. You can now continue with the user's answers in mind.",
+        parts.join(", ")
+    )
+}
+
+fn unwired_question_guidance(qs: &[crate::approve::Question]) -> String {
+    let names: Vec<&str> = qs.iter().map(|q| q.question.as_str()).collect();
+    format!(
+        "question UI is not wired in this session; proceed with your best guess for ({}) and note the assumption",
+        names.join("; ")
+    )
 }
 
 fn do_websearch(reg: &Registry, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+    if reg.websearch_disabled {
+        return Err(ToolError::Msg("websearch: disabled by configuration (websearch = false)".into()));
+    }
     let q = str_arg(args, &["query", "q"]);
     let provider = str_arg(args, &["provider"]);
     let want = if provider.is_empty() { reg.websearch_provider.clone() } else { provider };
@@ -548,7 +1033,7 @@ fn do_webfetch(args: &HashMap<String, serde_json::Value>) -> Result<Outcome, Too
     let url = str_arg(args, &["url"]);
     let format = str_arg(args, &["format"]);
     let format = if format.is_empty() { "markdown" } else { &format };
-    let timeout_ms = int_arg(args, "timeout_ms", 30_000).min(120_000);
+    let timeout_ms = int_arg_any(args, &["timeout", "timeout_ms", "timeoutMs"], 30_000).min(120_000);
     crate::websearch::fetch(&url, format, std::time::Duration::from_millis(timeout_ms))
         .map(|(s, t)| Outcome { output: s, truncated: t })
         .map_err(|e| ToolError::Msg(e.to_string()))
@@ -605,8 +1090,14 @@ fn plugin_verdict(out: &serde_json::Value) -> String {
 }
 
 fn do_subagent(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
-    if sc.depth >= 1 {
-        return Err(ToolError::Msg("subagents cannot launch subagents".into()));
+    let max = subagent_max_depth();
+    if sc.depth >= max {
+        return Err(ToolError::Msg(format!("subagent: nesting depth {max} exceeded (subagents cannot launch subagents)")));
+    }
+    // Follow-ups target live child sessions, which do not persist:
+    // fail loudly instead of silently starting an unrelated child.
+    if !str_arg(args, &["sessionID", "sessionId", "session_id"]).is_empty() {
+        return Err(ToolError::Msg("subagent: follow-up via sessionID is not supported; start a new subagent with full context instead".into()));
     }
     let task = str_arg(args, &["task", "prompt"]);
     if task.is_empty() {
@@ -614,10 +1105,34 @@ fn do_subagent(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::V
     }
     let name = str_arg(args, &["agent", "name"]);
     let name = if name.is_empty() { "general" } else { name.as_str() };
+    let req = SubagentReq {
+        task: task.clone(),
+        agent: name.into(),
+        description: str_arg(args, &["description"]),
+        model: str_arg(args, &["model"]),
+    };
     let Some(f) = &reg.subagent else {
         return Err(ToolError::Msg("subagent: executor not attached".into()));
     };
-    f(sc, &task, name)
+    if is_truthy(args.get("background")) {
+        // Detached run: the sync executor parks on a worker thread via
+        // block_in_place, so drive it from a spawned async task and poll
+        // with task_output.
+        let id = new_task(&sc.session, "subagent", &req.task);
+        let slot = task_slot(&id);
+        let f = f.clone();
+        let sc = sc.clone();
+        let id2 = id.clone();
+        tokio::spawn(async move {
+            let out = match f(&sc, &req) {
+                Ok(s) => s,
+                Err(e) => format!("error: {e}"),
+            };
+            finish_task(&id2, &slot, &out);
+        });
+        return Ok(Outcome { output: format!("started background task {id} (poll with task_output)"), truncated: false });
+    }
+    f(sc, &req)
         .map(|s| {
             let truncated = s.len() > 8000;
             Outcome { output: s, truncated }
@@ -633,51 +1148,69 @@ fn do_todowrite(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Resul
     static TODOS: OnceLock<TodoStore> = OnceLock::new();
     let store = TODOS.get_or_init(|| Mutex::new(HashMap::new()));
     let raw = args.get("todos").cloned().unwrap_or(serde_json::Value::Null);
+    let arr = raw.as_array().cloned().unwrap_or_default();
     let mut list = Vec::new();
-    if let Some(arr) = raw.as_array() {
-        for t in arr {
-            let content = t.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
-            let status = t.get("status").and_then(|s| s.as_str()).unwrap_or("pending").to_string();
-            if content.is_empty() {
-                continue;
-            }
-            if !matches!(status.as_str(), "pending" | "in_progress" | "completed" | "cancelled") {
-                return Err(ToolError::Msg(format!("todowrite: bad status {status:?}")));
-            }
-            list.push((content, status));
+    for (i, item) in arr.iter().enumerate() {
+        let Some(m) = item.as_object() else {
+            return Err(ToolError::Msg(format!("todowrite: todos[{i}] must be {{content, status}}")));
+        };
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let status = m.get("status").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+        if !matches!(status.as_str(), "pending" | "in_progress" | "completed" | "cancelled") {
+            return Err(ToolError::Msg(format!(
+                "todowrite: todos[{i}].status must be pending|in_progress|completed|cancelled"
+            )));
+        }
+        if content.is_empty() {
+            return Err(ToolError::Msg(format!("todowrite: todos[{i}].content is required")));
+        }
+        list.push((content, status));
+    }
+    if list.is_empty() {
+        store.lock().unwrap().remove(&sc.session);
+        return Ok(Outcome { output: "Todos cleared".into(), truncated: false });
+    }
+    let count = |s: &str| list.iter().filter(|(_, st)| st == s).count();
+    let mut parts = vec![format!("{}/{} completed", count("completed"), list.len())];
+    for s in ["in_progress", "pending", "cancelled"] {
+        let n = count(s);
+        if n > 0 {
+            parts.push(format!("{n} {}", s.replace('_', " ")));
         }
     }
-    let summary = if list.is_empty() {
-        store.lock().unwrap().remove(&sc.session);
-        "(todo list cleared)".to_string()
-    } else {
-        let mut s = String::from("todos:\n");
-        for (c, st) in &list {
-            let mark = match st.as_str() {
-                "completed" => "[x]",
-                "in_progress" => "[>]",
-                "cancelled" => "[-]",
-                _ => "[ ]",
-            };
-            s.push_str(&format!("{mark} {c}\n"));
-        }
-        store.lock().unwrap().insert(sc.session.clone(), list);
-        s
-    };
-    Ok(Outcome { output: summary, truncated: false })
+    let mut out = format!("Todos updated: {}", parts.join(", "));
+    let active: Vec<&str> = list.iter().filter(|(_, st)| st == "in_progress").map(|(c, _)| c.as_str()).collect();
+    if !active.is_empty() {
+        out.push_str(&format!(". In progress: {}", active.join(", ")));
+    }
+    store.lock().unwrap().insert(sc.session.clone(), list);
+    Ok(Outcome { output: out, truncated: false })
 }
 
-/// Apply a unified diff (---/+++ file headers, @@ hunks) with exact context
-/// matching. Multi-file; fails closed on ambiguous or missing context.
 fn do_patch(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
-    let diff = str_arg(args, &["patch", "diff"]);
+    let diff = str_arg(args, &["patchText", "patch_text", "patch", "diff"]);
     if diff.trim().is_empty() {
-        return Err(ToolError::Msg("patch: empty diff".into()));
+        return Err(ToolError::Msg("patch: missing patchText (wrap operations in *** Begin Patch *** / *** End Patch ***)".into()));
+    }
+    let plan = sc.agent == Agent::Plan;
+    // Primary envelope: *** Begin Patch *** (Add/Update/Delete/Move).
+    if crate::begin_patch::is_begin_patch(&diff) {
+        let out = crate::begin_patch::apply_begin_patch(&sc.workspace, plan, &diff)
+            .map_err(|e| ToolError::Msg(e.to_string()))?;
+        return Ok(cap(out));
     }
     let files = parse_unified(&diff)?;
     let mut edited = Vec::new();
     for (rel, hunks) in files {
         let abs = resolve(sc, &rel)?;
+        if crate::security::is_credential_path(&abs.to_string_lossy()) {
+            return Err(ToolError::Denied(format!("patch: credential path denied: {rel}")));
+        }
+        if plan && !crate::security::plan_allows_write(&sc.workspace, &abs.to_string_lossy()) {
+            return Err(ToolError::Denied(format!(
+                "patch: plan-mode agents may only change plan.md or .lumina/plans/*.md (got {rel})"
+            )));
+        }
         let original = std::fs::read_to_string(&abs).map_err(|_| ToolError::Msg(format!("patch: no such file {rel}")))?;
         let mut lines: Vec<String> = original.lines().map(|l| l.to_string()).collect();
         // Apply bottom-up so earlier offsets stay valid.
@@ -788,8 +1321,12 @@ fn parse_unified(diff: &str) -> Result<Vec<(String, Vec<Hunk>)>, ToolError> {
 }
 
 
-/// First +++ path of a unified diff (fence authorization granularity).
 fn first_patch_path(diff: &str) -> String {
+    // Begin-Patch headers first, then unified +++ (Go patchFirstPath parity).
+    let bp = crate::begin_patch::patch_first_path(diff);
+    if bp != "patch" {
+        return bp;
+    }
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("+++ ") {
             let p = rest.trim();
@@ -818,9 +1355,59 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let reg = Registry::new();
         let sc = ctx(d.path(), Agent::Build, PermissionMode::Bypass);
-        reg.call(&sc, "write", &args(&[("path", "a.txt"), ("content", "hi")])).unwrap();
+        reg.call(&sc, "write", &args(&[("path", "a.txt"), ("content", "hi\nthere")])).unwrap();
+        // Line-numbered output (opencode read.ts parity).
         let out = reg.call(&sc, "read", &args(&[("path", "a.txt")])).unwrap();
-        assert_eq!(out.output, "hi");
+        assert_eq!(out.output, "1: hi\n2: there");
+        assert!(!out.truncated);
+        // Paged slice.
+        let out = reg.call(&sc, "read", &args(&[("path", "a.txt"), ("offset", "2"), ("limit", "1")])).unwrap();
+        assert_eq!(out.output, "2: there");
+        // Absolute write path in output (Go parity).
+        let out = reg.call(&sc, "write", &args(&[("path", "b.txt"), ("content", "x")])).unwrap();
+        assert!(out.output.ends_with("b.txt"), "{}", out.output);
+        // Directory listing skips workspace credential files.
+        std::fs::write(d.path().join(".env"), "K=x").unwrap();
+        let out = reg.call(&sc, "read", &args(&[("path", ".")])).unwrap();
+        assert!(out.output.contains("a.txt"), "{}", out.output);
+        assert!(!out.output.contains(".env"), "{}", out.output);
+        // replaceAll replaces every occurrence; ambiguous single errors.
+        reg.call(&sc, "write", &args(&[("path", "c.txt"), ("content", "a a a")])).unwrap();
+        let err = reg.call(&sc, "edit", &args(&[("path", "c.txt"), ("old_string", "a"), ("new_string", "b")])).unwrap_err();
+        assert!(matches!(err, ToolError::Msg(_)), "{err:?}");
+        let mut m = args(&[("path", "c.txt"), ("old_string", "a"), ("new_string", "b")]);
+        m.insert("replaceAll".into(), serde_json::Value::Bool(true));
+        reg.call(&sc, "edit", &m).unwrap();
+        let out = reg.call(&sc, "read", &args(&[("path", "c.txt")])).unwrap();
+        assert_eq!(out.output, "1: b b b");
+    }
+
+    #[test]
+    fn grep_literal_case_and_include() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.go"), "Hello World\nfoo bar\n").unwrap();
+        std::fs::write(d.path().join("b.txt"), "hello world\n").unwrap();
+        let reg = Registry::new();
+        let sc = ctx(d.path(), Agent::Build, PermissionMode::Bypass);
+        // Case-insensitive regex.
+        let mut m = args(&[("pattern", "hello")]);
+        m.insert("case_sensitive".into(), serde_json::Value::Bool(false));
+        let out = reg.call(&sc, "grep", &m).unwrap();
+        assert!(out.output.contains("a.go:1:"), "{}", out.output);
+        assert!(out.output.contains("b.txt:1:"), "{}", out.output);
+        // include limits to matching basenames at any depth.
+        let mut m = args(&[("pattern", "hello"), ("include", "*.go")]);
+        m.insert("case_sensitive".into(), serde_json::Value::Bool(false));
+        let out = reg.call(&sc, "grep", &m).unwrap();
+        assert!(out.output.contains("a.go"), "{}", out.output);
+        assert!(!out.output.contains("b.txt"), "{}", out.output);
+        // literal matches exact text.
+        let mut m = args(&[("pattern", "Hello (World")]);
+        let out = reg.call(&sc, "grep", &m);
+        assert!(out.is_err(), "paren is invalid regex without literal");
+        m.insert("literal".into(), serde_json::Value::Bool(true));
+        let out = reg.call(&sc, "grep", &m).unwrap();
+        assert!(out.output.is_empty() || !out.output.contains("a.go"), "{}", out.output);
     }
 
     #[test]
@@ -888,16 +1475,115 @@ mod extended_tests {
     }
 
     #[test]
+    fn question_schema_and_unwired_guidance() {
+        let d = tempfile::tempdir().unwrap();
+        let reg = Registry::new();
+        let sc = ctx2(d.path());
+        // Headless (no live gate): guidance output, not an error.
+        let mut q = HashMap::new();
+        q.insert(
+            "questions".into(),
+            serde_json::json!([
+                {"question": "pick one?", "header": "h", "options": [{"label": "a", "description": "first"}, {"label": "b"}], "multiple": true},
+                "bare shorthand",
+            ]),
+        );
+        let out = reg.call(&sc, "question", &q).unwrap();
+        assert!(out.output.contains("best guess"), "{}", out.output);
+        assert!(out.output.contains("pick one?"), "{}", out.output);
+        // formatQuestionAnswers mirrors opencode's toModelContent.
+        let qs = parse_questions(&q).unwrap();
+        assert_eq!(qs.len(), 2);
+        assert!(qs[0].multiple && qs[0].options[0].description == "first");
+        assert_eq!(qs[1].question, "bare shorthand");
+        let s = format_question_answers(&qs, &[vec!["a".into(), "b".into()]]);
+        assert!(s.contains("\"pick one?\"=\"a, b\""), "{s}");
+        assert!(s.contains("\"bare shorthand\"=\"Unanswered\""), "{s}");
+        // Missing question text errors.
+        let mut bad = HashMap::new();
+        bad.insert("questions".into(), serde_json::json!([{"header": "h"}]));
+        assert!(reg.call(&sc, "question", &bad).is_err());
+    }
+
+    #[test]
+    fn task_output_unknown_and_background_bash() {
+        let d = tempfile::tempdir().unwrap();
+        let reg = Registry::new();
+        let sc = ctx2(d.path());
+        // Unknown id fails closed.
+        let err = reg.call(&sc, "task_output", &args(&[("task_id", "task-999999")])).unwrap_err();
+        assert!(matches!(err, ToolError::Msg(_)), "{err:?}");
+        // Missing id fails closed.
+        assert!(reg.call(&sc, "task_output", &HashMap::new()).is_err());
+        // Background bash returns a pollable id; output arrives after finish.
+        let mut bg = HashMap::new();
+        bg.insert("command".into(), serde_json::Value::String("echo hello-bg".into()));
+        bg.insert("background".into(), serde_json::Value::Bool(true));
+        let out = reg.call(&sc, "bash", &bg).unwrap();
+        assert!(out.output.contains("task-"), "{}", out.output);
+        assert!(out.output.contains("task_output"), "{}", out.output);
+        let id = out.output.split_whitespace().nth(3).unwrap().to_string();
+        // Poll until done (fast command; bounded wait).
+        let mut got = String::new();
+        for _ in 0..100 {
+            let r = reg.call(&sc, "task_output", &args(&[("task_id", &id)])).unwrap();
+            if !r.output.contains("still running") {
+                got = r.output;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(got.contains("hello-bg"), "background output lost: {got}");
+    }
+
+    #[test]
+    fn background_done_hook_fires() {
+        use std::sync::{Arc, Mutex};
+        let d = tempfile::tempdir().unwrap();
+        let reg = Registry::new();
+        let sc = ctx2(d.path());
+        let fired: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let f2 = fired.clone();
+        set_background_hook(Arc::new(move |sess: &str, id: &str, kind: &str, label: &str| {
+            f2.lock().unwrap().push(format!("{sess}|{id}|{kind}|{label}"));
+        }));
+        let mut bg = HashMap::new();
+        bg.insert("command".into(), serde_json::Value::String("echo hooked".into()));
+        bg.insert("background".into(), serde_json::Value::Bool(true));
+        let out = reg.call(&sc, "bash", &bg).unwrap();
+        let id = out.output.split_whitespace().nth(3).unwrap().to_string();
+        for _ in 0..100 {
+            let r = reg.call(&sc, "task_output", &args(&[("task_id", &id)])).unwrap();
+            if !r.output.contains("still running") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Unhook so other tests stay silent.
+        set_background_hook(Arc::new(|_, _, _, _| {}));
+        let got = fired.lock().unwrap();
+        // (Other tests may complete background tasks concurrently; match ours.)
+        assert!(got.iter().any(|e| e.starts_with(&format!("t|{id}|bash|"))), "{got:?}");
+        // Session-scoped: another session's inbox is untouched.
+        assert!(super::task_registry().lock().unwrap().get(&id).unwrap().session == "t");
+    }
+
+    #[test]
     fn todos_roundtrip_and_validate() {
         let d = tempfile::tempdir().unwrap();
         let reg = Registry::new();
         let mut a = HashMap::new();
         a.insert("todos".into(), serde_json::json!([{"content": "x", "status": "in_progress"}]));
         let out = reg.call(&ctx2(d.path()), "todowrite", &a).unwrap();
-        assert!(out.output.contains("[>] x"), "{}", out.output);
+        assert!(out.output.contains("Todos updated: 0/1 completed, 1 in progress. In progress: x"), "{}", out.output);
         let mut bad = HashMap::new();
         bad.insert("todos".into(), serde_json::json!([{"content": "x", "status": "bogus"}]));
         assert!(reg.call(&ctx2(d.path()), "todowrite", &bad).is_err());
+        let mut empty = HashMap::new();
+        empty.insert("todos".into(), serde_json::json!([{"content": "", "status": "pending"}]));
+        assert!(reg.call(&ctx2(d.path()), "todowrite", &empty).is_err());
+        let out = reg.call(&ctx2(d.path()), "todowrite", &HashMap::new()).unwrap();
+        assert_eq!(out.output, "Todos cleared");
     }
 
     #[test]

@@ -1,110 +1,165 @@
 {
- "runs": [
-  {
-   "date": "2026-10-29T19:33:14.322329+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 2
-  },
-  {
-   "date": "2026-10-29T19:38:13.510826+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 2
-  },
-  {
-   "date": "2026-10-29T19:40:57.471420+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 2
-  },
-  {
-   "date": "2026-10-30T00:02:11.534734+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 4
-  },
-  {
-   "date": "2026-10-30T11:34:47.893589+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 7
-  },
-  {
-   "date": "2026-10-30T12:28:36.659272+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 8
-  },
-  {
-   "date": "2026-10-30T12:39:27.500595+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 9
-  },
-  {
-   "date": "2026-10-30T12:45:11.116414+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 1,
-   "note": "host-agent inline refresh of long-session-fixes.md (no-key flow)"
-  },
-  {
-   "date": "2026-10-30T13:18:56.297936+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 1,
-   "note": "host-agent inline refresh of prompts-parity.md (no-key flow)"
-  },
-  {
-   "date": "2026-10-30T15:21:07.249015+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 3,
-   "note": "host-agent inline refresh of config-defaults-fix.md + lumina-live.md routing headers (no-key flow)"
-  },
-  {
-   "date": "2026-10-30T22:42:45.975964+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 2,
-   "note": "host-agent inline refresh of browser-skills.md + MEMORY.md index (no-key flow)"
-  },
-  {
-   "date": "2026-10-31T14:28:56.660797+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 2,
-   "note": "host-agent inline refresh of browser-skills.md (ad-fix + global/keyless-fallback nodes) + lumina-live.md coverage re-verify (no-key flow)"
-  },
-  {
-   "date": "2026-10-31T14:48:25.187901+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 2,
-   "note": "host-agent inline refresh of vault-placeholders.md + MEMORY.md index (no-key flow)"
-  },
-  {
-   "date": "2026-10-31T15:30:38.747616+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 4,
-   "note": "host-agent inline refresh of resync-variants.md + MEMORY.md index + lumina-live.md date + vault-placeholders.md re-stamp (no-key flow)"
-  },
-  {
-   "date": "2026-10-31T15:39:24.524129+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 2,
-   "note": "host-agent inline refresh of loops-and-claims.md + MEMORY.md index (no-key flow)"
-  },
-  {
-   "date": "2026-10-31T16:40:21.377669+00:00",
-   "input_tokens": 0,
-   "output_tokens": 0,
-   "files": 2
-  }
- ],
- "total_input_tokens": 0,
- "total_output_tokens": 0
+  "runs": [
+    {
+      "date": "2026-10-29T19:33:14.322329+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2
+    },
+    {
+      "date": "2026-10-29T19:38:13.510826+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2
+    },
+    {
+      "date": "2026-10-29T19:40:57.471420+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2
+    },
+    {
+      "date": "2026-10-30T00:02:11.534734+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 4
+    },
+    {
+      "date": "2026-10-30T11:34:47.893589+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 7
+    },
+    {
+      "date": "2026-10-30T12:28:36.659272+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 8
+    },
+    {
+      "date": "2026-10-30T12:39:27.500595+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 9
+    },
+    {
+      "date": "2026-10-30T12:45:11.116414+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of long-session-fixes.md (no-key flow)"
+    },
+    {
+      "date": "2026-10-30T13:18:56.297936+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of prompts-parity.md (no-key flow)"
+    },
+    {
+      "date": "2026-10-30T15:21:07.249015+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 3,
+      "note": "host-agent inline refresh of config-defaults-fix.md + lumina-live.md routing headers (no-key flow)"
+    },
+    {
+      "date": "2026-10-30T22:42:45.975964+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of browser-skills.md + MEMORY.md index (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T14:28:56.660797+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of browser-skills.md (ad-fix + global/keyless-fallback nodes) + lumina-live.md coverage re-verify (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T14:48:25.187901+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of vault-placeholders.md + MEMORY.md index (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T15:30:38.747616+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 4,
+      "note": "host-agent inline refresh of resync-variants.md + MEMORY.md index + lumina-live.md date + vault-placeholders.md re-stamp (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T15:39:24.524129+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of loops-and-claims.md + MEMORY.md index (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T16:40:21.377669+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2
+    },
+    {
+      "date": "2026-10-31T17:46:18.532431+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of rust-port.md parity+harden passes (ee2c159/2ead19e) (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T21:11:37.613623+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 4,
+      "note": "host-agent inline refresh of resync-variants.md (120-cap + effort clamp) + long-session-fixes.md (30m timeout + review default-on) + loops-and-claims.md cross-ref (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T21:21:25.063729+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 3,
+      "note": "host-agent inline refresh of resync-variants.md (xhigh default + empty-final guard + gateway models note) + loops-and-claims.md ceiling pointer + reviewOpen key fix (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T21:30:32.988666+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of rust-port.md replay dup-guard (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T22:15:25.928470+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2
+    },
+    {
+      "date": "2026-10-31T23:22:21.047956+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of rust-port.md (SPA MIME+CSP, serve DB banner, full tool-round transcript) + long-session-fixes.md (session-gone 404, model refresh-on-open) (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T23:58:37.652274+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of rust-port.md deep-audit round 2 (LLM transport, Copilot session, stage progress, begin-patch, tool/server/TUI parity, verify + deferrals) (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T06:24:09.520485+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of web-ui-sticky-scroll.md (dedup + index) + rust-port.md source_file dedup (no-key flow)"
+    }
+  ],
+  "total_input_tokens": 0,
+  "total_output_tokens": 0
 }

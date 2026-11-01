@@ -159,6 +159,10 @@ type ModelMeta struct {
 	// the provider does not report one (OpenAI /models has no such
 	// field; OpenRouter-style gateways send `context_length`).
 	ContextWindow int `json:"context_window,omitempty"`
+	// SupportedEfforts is the provider-advertised reasoning ladder for
+	// this model, or empty when the provider does not advertise one.
+	// Empty means "unknown — fall back to EffortVariants".
+	SupportedEfforts []string `json:"supported_efforts,omitempty"`
 }
 
 // ContextLens is optionally implemented by providers that can report a
@@ -166,6 +170,94 @@ type ModelMeta struct {
 // tokens without a window) — never fail a turn over metadata.
 type ContextLens interface {
 	ContextWindow(ctx context.Context, model string) (int, error)
+}
+
+// EffortIndex orders the ladder for clamping (auto/"" = -1, provider default).
+func EffortIndex(effort string) int {
+	switch NormalizeEffort(effort) {
+	case "":
+		return -1
+	case "low":
+		return 0
+	case "medium":
+		return 1
+	case "high":
+		return 2
+	case "xhigh":
+		return 3
+	case "max":
+		return 4
+	default:
+		return -1
+	}
+}
+
+// EffortsOrDefault returns the model's advertised ladder with "auto"
+// prepended, or the global EffortVariants when the provider does not
+// advertise one (empty SupportedEfforts = unknown).
+func (m ModelMeta) EffortsOrDefault() []string {
+	if len(m.SupportedEfforts) == 0 {
+		return append([]string(nil), EffortVariants...)
+	}
+	seen := map[string]bool{"auto": true}
+	out := []string{"auto"}
+	for _, v := range EffortVariants[1:] {
+		for _, s := range m.SupportedEfforts {
+			if NormalizeEffort(s) == v && !seen[v] {
+				seen[v] = true
+				out = append(out, v)
+			}
+		}
+	}
+	if len(out) == 1 {
+		return append([]string(nil), EffortVariants...)
+	}
+	return out
+}
+
+// ClampEffort maps a requested variant onto the model's advertised ladder.
+// Unknown ladder (empty) passes through normalized; auto always passes.
+// Over-requests downgrade to the highest supported step, under-requests
+// (should not happen on this ladder) upgrade to the lowest supported.
+func ClampEffort(supported []string, effort string) string {
+	n := NormalizeEffort(effort)
+	if n == "" {
+		return ""
+	}
+	if len(supported) == 0 {
+		return n
+	}
+	norm := map[string]bool{}
+	for _, s := range supported {
+		if v := NormalizeEffort(s); v != "" {
+			norm[v] = true
+		}
+	}
+	if norm[n] {
+		return n
+	}
+	want := EffortIndex(n)
+	best, bestIdx := "", -2
+	for s := range norm {
+		idx := EffortIndex(s)
+		if idx <= want && idx > bestIdx {
+			best, bestIdx = s, idx
+		}
+	}
+	if best != "" {
+		return best
+	}
+	// Requested below everything supported: return the lowest step.
+	low, lowIdx := "", 99
+	for s := range norm {
+		if idx := EffortIndex(s); idx < lowIdx {
+			low, lowIdx = s, idx
+		}
+	}
+	if low != "" {
+		return low
+	}
+	return n
 }
 
 // modelWindow extracts an advertised window from one loose /models entry.

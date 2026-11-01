@@ -20,3 +20,4 @@ tags: [index, memory, lumina]
 - [[resync-variants]] — session state resync endpoint + TUI rebuild, effort variant picker, identical-round loop guard.
 - [[loops-and-claims]] — per-call repeat ledger (3rd identical call) + cross-daemon turn claim (`inflight_owner`, 12 min stale takeover, 409).
 - [[rust-port]] — single-binary Rust port (M0/M1/M2): axum server + broker/hard-deny, BYO-LLM router, tool registry, native `graph.json` KB (`kb/query|update|reflect|status`), compat flags.
+- [[web-ui-sticky-scroll]] — SessionView sticky-bottom autoscroll (80px threshold, transcript + working card pin, respects manual scroll-up).

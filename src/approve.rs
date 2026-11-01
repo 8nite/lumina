@@ -6,7 +6,7 @@
 //! The wait uses `block_in_place` + `blocking_recv` so the synchronous tool
 //! layer can pause a turn without deadlocking the async daemon.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -29,10 +29,27 @@ pub struct PendingQuestion {
     pub questions: Vec<Question>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// One option in a user question (opencode Question.Prompt shape).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QuestionOption {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// One user question: `{question, header, options: [{label, description}],
+/// multiple}` (opencode parity).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {
-    pub text: String,
-    pub options: Vec<String>,
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multiple: bool,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -50,7 +67,13 @@ struct Inner {
 }
 
 type PermMap = HashMap<String, (PendingPerm, oneshot::Sender<String>)>;
-type QuesMap = HashMap<String, (PendingQuestion, oneshot::Sender<Vec<String>>)>;
+type QuesMap = HashMap<String, (PendingQuestion, oneshot::Sender<Vec<Vec<String>>>)>;
+
+/// Blocking-receive outcome: answered, peer dismissed, or deadline passed.
+enum WaitErr {
+    Closed, // peer dismissed the request (or went away)
+    Timeout,
+}
 
 impl ApprovalGate {
     pub fn new(broker: broadcast::Sender<serde_json::Value>) -> Self {
@@ -68,15 +91,15 @@ impl ApprovalGate {
 
 /// Blocking receive with a deadline (polls in short slices so Ctrl+C in the
 /// daemon console can still interrupt between slices).
-fn wait_timeout<T>(mut rx: oneshot::Receiver<T>, max: Duration) -> Result<T, ()> {
+fn wait_timeout<T>(mut rx: oneshot::Receiver<T>, max: Duration) -> Result<T, WaitErr> {
     let start = std::time::Instant::now();
     loop {
         match rx.try_recv() {
             Ok(v) => return Ok(v),
-            Err(oneshot::error::TryRecvError::Closed) => return Err(()),
+            Err(oneshot::error::TryRecvError::Closed) => return Err(WaitErr::Closed),
             Err(oneshot::error::TryRecvError::Empty) => {
                 if start.elapsed() >= max {
-                    return Err(());
+                    return Err(WaitErr::Timeout);
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -104,10 +127,11 @@ fn wait_timeout<T>(mut rx: oneshot::Receiver<T>, max: Duration) -> Result<T, ()>
             req_id.clone(),
             (PendingPerm { req_id: req_id.clone(), session: session.into(), tool: tool.into(), target: target.into() }, tx),
         );
-        let _ = inner.broker.send(serde_json::json!({
-            "type": "permission.asked", "req_id": req_id,
-            "session": session, "tool": tool, "target": target,
-        }));
+        let _ = inner.broker.send(crate::server::ev(
+            "permission.asked",
+            session,
+            serde_json::json!({"request_id": req_id, "tool": tool, "target": target}),
+        ));
         let decision = Self::wait_timeout(rx, Duration::from_secs(600))
             .map_err(|_| "permission: timed out waiting for an answer".to_string())?;
         match decision.as_str() {
@@ -120,7 +144,7 @@ fn wait_timeout<T>(mut rx: oneshot::Receiver<T>, max: Duration) -> Result<T, ()>
         }
     }
 
-    pub fn ask_question(&self, session: &str, questions: Vec<Question>) -> Result<Vec<String>, String> {
+    pub fn ask_question(&self, session: &str, questions: Vec<Question>) -> Result<Vec<Vec<String>>, String> {
         let inner = self.inner().ok_or_else(|| "question gate not attached".to_string())?;
         let req_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
@@ -128,14 +152,35 @@ fn wait_timeout<T>(mut rx: oneshot::Receiver<T>, max: Duration) -> Result<T, ()>
             req_id.clone(),
             (PendingQuestion { req_id: req_id.clone(), session: session.into(), questions: questions.clone() }, tx),
         );
-        let _ = inner.broker.send(serde_json::json!({
-            "type": "question.asked", "req_id": req_id, "session": session,
-            "questions": questions.iter().map(|q| serde_json::json!({"text": q.text, "options": q.options})).collect::<Vec<_>>(),
-        }));
+        let _ = inner.broker.send(crate::server::ev(
+            "question.asked",
+            session,
+            serde_json::json!({"request_id": req_id, "questions": questions.iter().map(|q| serde_json::json!({"question": q.question, "header": q.header, "options": q.options, "multiple": q.multiple})).collect::<Vec<_>>() }),
+        ));
         tokio::task::block_in_place(|| {
-            Self::wait_timeout(rx, Duration::from_secs(600))
-                .map_err(|_| "question: timed out waiting for an answer".to_string())
+            Self::wait_timeout(rx, Duration::from_secs(600)).map_err(|e| match e {
+                WaitErr::Closed => "question dismissed by user".to_string(),
+                WaitErr::Timeout => "question: timed out waiting for an answer".to_string(),
+            })
         })
+    }
+
+    /// Dismiss a pending question without answers (POST dismissed:true).
+    /// Surfaces as an error on the waiting turn. Returns false when unknown.
+    pub fn dismiss(&self, req_id: &str) -> bool {
+        let Some(inner) = self.inner() else { return false };
+        match inner.questions.lock().unwrap().remove(req_id) {
+            Some((meta, _tx)) => {
+                // Drop the sender: the waiter sees Closed → dismissed error.
+                let _ = inner.broker.send(crate::server::ev(
+                    "question.resolved",
+                    &meta.session,
+                    serde_json::json!({"request_id": req_id, "dismissed": true}),
+                ));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Resolve a pending permission (POST /api/v1/permissions/{reqId}).
@@ -144,23 +189,26 @@ fn wait_timeout<T>(mut rx: oneshot::Receiver<T>, max: Duration) -> Result<T, ()>
         let Some(inner) = self.inner() else { return false };
         match inner.perms.lock().unwrap().remove(req_id) {
             Some((meta, tx)) => {
-                let _ = inner.broker.send(serde_json::json!({
-                    "type": "permission.resolved", "req_id": req_id,
-                    "session": meta.session, "decision": decision,
-                }));
+                let _ = inner.broker.send(crate::server::ev(
+                    "permission.resolved",
+                    &meta.session,
+                    serde_json::json!({"request_id": req_id, "decision": decision}),
+                ));
                 tx.send(decision.into()).is_ok()
             }
             None => false,
         }
     }
 
-    pub fn answer(&self, req_id: &str, answers: Vec<String>) -> bool {
+    pub fn answer(&self, req_id: &str, answers: Vec<Vec<String>>) -> bool {
         let Some(inner) = self.inner() else { return false };
         match inner.questions.lock().unwrap().remove(req_id) {
             Some((meta, tx)) => {
-                let _ = inner.broker.send(serde_json::json!({
-                    "type": "question.resolved", "req_id": req_id, "session": meta.session,
-                }));
+                let _ = inner.broker.send(crate::server::ev(
+                    "question.resolved",
+                    &meta.session,
+                    serde_json::json!({"request_id": req_id}),
+                ));
                 tx.send(answers).is_ok()
             }
             None => false,
@@ -231,5 +279,31 @@ mod tests {
         h2.join().unwrap();
         // Second ask on the same prefix passes without a new request.
         assert!(gate2.ask("s2", "edit", "a.rs").unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dismiss_question_surfaces_error() {
+        use tokio::sync::broadcast;
+        let (tx, _rx) = broadcast::channel(16);
+        let gate = ApprovalGate::new(tx);
+        let g2 = gate.clone();
+        // Dismiss from another thread once the request is pending.
+        let h = std::thread::spawn(move || {
+            for _ in 0..100 {
+                let (_, ques) = g2.pending_for_session("s9");
+                if let Some(q) = ques {
+                    assert!(g2.dismiss(&q.req_id));
+                    assert!(!g2.dismiss(&q.req_id)); // second dismiss: unknown
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("no pending question appeared");
+        });
+        let err = gate
+            .ask_question("s9", vec![crate::approve::Question { question: "pick?".into(), header: String::new(), options: vec![crate::approve::QuestionOption { label: "a".into(), description: String::new() }], multiple: false }])
+            .unwrap_err();
+        assert_eq!(err, "question dismissed by user", "{err}");
+        h.join().unwrap();
     }
 }

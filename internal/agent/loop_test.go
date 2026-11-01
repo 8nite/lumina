@@ -18,6 +18,174 @@ import (
 	"github.com/8nite/lumina/internal/tools"
 )
 
+// TestAgenticLoopAutoContinuesPastOldCap keeps emitting tool calls past
+// the old 40-round cliff: the turn must continue to completion instead
+// of ending with a budget summary that forces the user to type `continue`.
+func TestAgenticLoopAutoContinuesPastOldCap(t *testing.T) {
+	var calls int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		n := atomic.AddInt64(&calls, 1)
+		if n <= 50 {
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"f.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")
+			return
+		}
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"finished after 50\"},\"finish_reason\":\"stop\"}]}\n\n")
+	}))
+	defer srv.Close()
+
+	ws := t.TempDir()
+	os.WriteFile(filepath.Join(ws, "f.txt"), []byte("f"), 0o644)
+	cfg := config.Defaults()
+	cfg.Providers = map[string]config.ProviderConfig{
+		"testprov": {Protocol: "openai-compatible", BaseURL: srv.URL},
+	}
+	cfg.Router.Executor = "testprov/echo"
+	router, err := llm.NewRouter(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	reg := tools.NewRegistry()
+	r := NewRunner(st, router, reg)
+	sess, err := st.CreateSession(ws, "build", "bypass", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.RunPrompt(context.Background(), sess.ID, TurnInput{Text: "read f.txt many times"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "finished after 50" {
+		t.Fatalf("final=%q (auto-continue past old 40 cap failed)", out)
+	}
+	if n := atomic.LoadInt64(&calls); n != 51 {
+		t.Fatalf("expected 51 model rounds (50 tool + final), got %d", n)
+	}
+	if strings.Contains(out, "budget") {
+		t.Fatalf("must not end with a budget summary: %q", out)
+	}
+}
+
+// TestEmptyFinalGuarded: a turn whose model goes silent (empty text, no
+// further calls) must still end with a non-empty stuck summary, never a
+// 0-char assistant turn that forces a blind `continue`.
+func TestEmptyFinalGuarded(t *testing.T) {
+	var calls int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch n := atomic.AddInt64(&calls, 1); n {
+		case 1:
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"f.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")
+		case 2:
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		default:
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"stuck: audit done, nothing left\"},\"finish_reason\":\"stop\"}]}\n\n")
+		}
+	}))
+	defer srv.Close()
+
+	ws := t.TempDir()
+	os.WriteFile(filepath.Join(ws, "f.txt"), []byte("f"), 0o644)
+	cfg := config.Defaults()
+	cfg.Providers = map[string]config.ProviderConfig{
+		"testprov": {Protocol: "openai-compatible", BaseURL: srv.URL},
+	}
+	cfg.Router.Executor = "testprov/echo"
+	router, err := llm.NewRouter(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	r := NewRunner(st, router, tools.NewRegistry())
+	sess, err := st.CreateSession(ws, "build", "bypass", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.RunPrompt(context.Background(), sess.ID, TurnInput{Text: "read f.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "stuck: audit done, nothing left" {
+		t.Fatalf("guarded final=%q (want stuck summary, never empty)", out)
+	}
+	if n := atomic.LoadInt64(&calls); n != 3 {
+		t.Fatalf("expected 3 model rounds (tool + silent + guard), got %d", n)
+	}
+	turns, _ := st.ListTurns(sess.ID)
+	last := turns[len(turns)-1]
+	if last.Role != "assistant" || strings.TrimSpace(last.Text) == "" {
+		t.Fatalf("transcript must end with a non-empty assistant turn, got %+v", last)
+	}
+}
+
+// TestEmptyFinalNoWorkPassesThrough: a turn that did nothing (empty text,
+// no tool calls, single round) must NOT trigger the guard — no extra backend
+// round trip for silence.
+func TestEmptyFinalNoWorkPassesThrough(t *testing.T) {
+	var calls int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"data":[]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		atomic.AddInt64(&calls, 1)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+	}))
+	defer srv.Close()
+
+	ws := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Providers = map[string]config.ProviderConfig{
+		"testprov": {Protocol: "openai-compatible", BaseURL: srv.URL},
+	}
+	cfg.Router.Executor = "testprov/echo"
+	router, err := llm.NewRouter(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	r := NewRunner(st, router, tools.NewRegistry())
+	sess, err := st.CreateSession(ws, "build", "bypass", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.RunPrompt(context.Background(), sess.ID, TurnInput{Text: "say nothing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("no-work silence must pass through, got %q", out)
+	}
+	if n := atomic.LoadInt64(&calls); n != 1 {
+		t.Fatalf("expected exactly 1 model round (no guard trip), got %d", n)
+	}
+}
+
 // TestAgenticToolLoop drives RunPrompt against a scripted OpenAI-compatible
 // mock: turn 1 emits write+read calls, turn 2 emits the final answer.
 func TestAgenticToolLoop(t *testing.T) {

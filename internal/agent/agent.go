@@ -185,7 +185,7 @@ func renderToolGuidance(specs []llm.ToolSpec) string {
 		}
 		sb.WriteString("- Skills: load a `skill` playbook body by name before doing the task it describes.\n")
 	}
-	sb.WriteString("- After tool results arrive, continue the task; call more tools if needed, else reply substantively, gathering every result (web, subagent, background) into the final answer.")
+	sb.WriteString("- After tool results arrive, continue the task until the ORIGINAL user request is fully complete (all edits applied, tests/build pass); call more tools if anything remains. Do NOT stop with a status summary, do NOT ask the user to say 'continue', and do NOT end with 'what I found' when fixes were requested — finish the work, then reply substantively, gathering every result (web, subagent, background) into the final answer.")
 	return sb.String()
 }
 
@@ -420,10 +420,12 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 	in.Images = nil
 	// Agentic loop: feed tool results back until the model stops calling
 	// tools. The soft cap is a progress checkpoint (tools stay on, the
-	// model restates done-vs-remaining and keeps going); only the hard
-	// cap ends the turn with a summary — so long tasks continue instead
-	// of dying 8 rounds in with work still queued.
-	const softCap, hardCap = 8, 40
+	// model restates done-vs-remaining and keeps going). The hard cap is a
+	// high auto-continue ceiling: long tasks keep their tools past the old
+	// 40-round cliff instead of ending with a "budget reached" summary
+	// that forces the user to type `continue`. Only a truly exhausted
+	// ceiling ends the turn with a summary.
+	const softCap, hardCap = 8, 120
 	// Loop guard: an identical tool round (same calls, same args) three
 	// times in a row means the model is stuck — e.g. re-running a green
 	// check whose empty output teaches nothing. task_output polling is
@@ -437,7 +439,9 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 	// alternating other calls). Keyed by toolCallKey, so task_output
 	// polls stay exempt here too.
 	seenCalls := map[string]int{}
+	didWork := false
 	for round := 0; round < hardCap && len(calls) > 0; round++ {
+		didWork = true
 		roundKey := roundCallKey(calls)
 		if roundKey != "" && roundKey == prevRoundKey {
 			repeatStreak++
@@ -499,9 +503,9 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 		}
 		userMsg := "Tool results:\n" + feedback.String()
 		if (round+1)%softCap == 0 {
-			userMsg += "Checkpoint: briefly note what is done vs remaining, then continue the task; call more tools if needed, else give the final answer."
+			userMsg += "Checkpoint: briefly note what is done vs remaining, then CONTINUE the task until the original request is fully done (all edits applied, tests/build pass). Do NOT stop with a status summary or ask the user to say 'continue'; call more tools if anything remains, else give the final completed answer."
 		} else {
-			userMsg += "Continue the task; call more tools if needed, else give the final answer."
+			userMsg += "Continue the task until the original request is fully complete; call more tools if anything remains, else give the final completed answer. Do NOT end with a partial summary when work is still pending."
 		}
 		if repeatStreak >= 3 && len(calls) > 0 {
 			userMsg += fmt.Sprintf(" Loop guard: this is the %d-th identical tool round in a row (%s) with no new result. Do NOT call the same tool with the same arguments again — change approach (different args or tool) or give the final text answer now.", repeatStreak, toolLabel(calls[0].Name, calls[0].Args))
@@ -543,9 +547,9 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 			return "", err
 		}
 	}
-	// Step-cap: on the final step the tools are removed and
-	// the model is asked to summarize in text, so a turn that hits the
-	// round cap still ends with a substantive reply gathering all results.
+	// Step-cap: only a truly exhausted ceiling (120 rounds) ends with a
+	// text summary. Name the remaining work and the exact next tool
+	// calls so a `continue` resumes precisely instead of re-discovering.
 	if len(calls) > 0 {
 		r.progress(sessionID, "summarizing…")
 		text2sub, serr := r.store.substituteSecrets(sessionID, text2)
@@ -557,11 +561,36 @@ func (r *Runner) RunPrompt(ctx context.Context, sessionID string, in TurnInput) 
 			Model: sess.Model,
 			Messages: append(msgs,
 				llm.Message{Role: "assistant", Content: text2sub},
-				llm.Message{Role: "user", Content: "Tool budget reached. Summarize in text: what was accomplished, what each tool found, and what is still running. Do not call tools."},
+				llm.Message{Role: "user", Content: "Tool budget exhausted after 120 tool rounds with work still pending. Summarize in text: what was accomplished, what each tool found, what EXACTLY remains undone, and the precise next tool calls (names + arguments) needed to finish. Do not call tools."},
 			),
 		}, stream)
 		if serr == nil && strings.TrimSpace(summary) != "" {
 			text2 = summary
+		}
+	}
+	// Empty-final guard: a turn that did work but ends with no text (model
+	// went silent after tools, or the budget summary came back empty)
+	// stores a stuck-summary instead of silence, so `continue` resumes
+	// precisely instead of from a 0-char assistant message. Pure-empty
+	// turns (no tool calls at all) pass through untouched.
+	if strings.TrimSpace(text2) == "" && didWork {
+		r.progress(sessionID, "summarizing…")
+		text2sub, serr := r.store.substituteSecrets(sessionID, text2)
+		if serr != nil {
+			finishTurn()
+			return "", serr
+		}
+		stuck, _, _, serr := completeStream(ctx, mustProvider(r, sess), llm.Request{
+			Model: sess.Model,
+			Messages: append(msgs,
+				llm.Message{Role: "assistant", Content: text2sub},
+				llm.Message{Role: "user", Content: "The turn produced no final text. State briefly: what was accomplished this turn, what remains undone, and the exact next step. Text only, do not call tools."},
+			),
+		}, stream)
+		if serr == nil && strings.TrimSpace(stuck) != "" {
+			text2 = stuck
+		} else {
+			text2 = "(turn completed with no text reply; transcript holds the tool results — say `continue` to resume)"
 		}
 	}
 	// Leftover steer (arrived after the last round) chains as a queued
@@ -1199,7 +1228,7 @@ func (r *Runner) runChildLoop(ctx context.Context, sc tools.SecCtx, model, syste
 	if err != nil {
 		return "", err
 	}
-	const maxRounds = 32
+	const maxRounds = 64
 	for round := 0; round < maxRounds && len(calls) > 0; round++ {
 		var feedback strings.Builder
 		for _, c := range calls {
@@ -1231,7 +1260,7 @@ func (r *Runner) runChildLoop(ctx context.Context, sc tools.SecCtx, model, syste
 		if serr != nil {
 			return "", serr
 		}
-		umsg, serr := r.store.substituteSecrets(sc.SessionID, "Tool results:\n"+feedback.String()+"Continue the task; call more tools if needed, else give the final answer.")
+		umsg, serr := r.store.substituteSecrets(sc.SessionID, "Tool results:\n"+feedback.String()+"Continue the task until fully complete; call more tools if anything remains, else give the final completed answer. Do NOT end with a partial summary when work is still pending.")
 		if serr != nil {
 			return "", serr
 		}

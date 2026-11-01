@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Composer } from './Composer';
 import { LinkifiedText } from './LinkifiedText';
 import type { PromptAttachment } from '../api/client';
@@ -253,6 +253,7 @@ export function SessionView(props: {
   modelOptions: string[];
   onModel: (m: string) => void;
   onCustomModel: (m: string) => void;
+  onOpenModels?: () => void;
   perm: string;
   onPerm: (p: string) => void;
   working: boolean;
@@ -308,9 +309,38 @@ export function SessionView(props: {
     setTimeout(() => setCopied(false), 1500);
   };
 
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const workRef = useRef<HTMLDivElement>(null);
+  const stickRef = useRef(true);
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+  const stick = () => {
+    const el = scrollRef.current;
+    if (el) el.scrollTo({ top: el.scrollHeight });
+  };
+  useEffect(() => {
+    if (!stickRef.current) return;
+    stick();
+  }, [props.turns.length, props.liveText, props.liveThinking, props.liveSteps.length, props.working, props.error, props.changed]);
+  // Working card grows separately at the bottom: keep it pinned too.
+  useEffect(() => {
+    if (!stickRef.current) return;
+    const el = workRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    stick();
+  }, [props.liveText, props.liveThinking, props.liveSteps.length, props.stage]);
+  useEffect(() => {
+    stickRef.current = true;
+    stick();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.turns.length === 0]);
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6" data-scrollable>
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto px-4 py-6" data-scrollable>
         <div className="mx-auto w-full max-w-[720px] space-y-4">
           {props.turns.map((t, i) => {
             if (t.role === 'user') {
@@ -371,53 +401,6 @@ export function SessionView(props: {
               </div>
             );
           })}
-          {props.working && (
-            <div
-              className="rounded-[8px] bg-[var(--v2-bg-base)] px-4 py-3"
-              style={{ border: '1px solid var(--v2-border-base)' }}
-            >
-              {/* v2 activity lane: fixed height, shimmer status, no layout shift. */}
-              <div className="mb-1 flex h-9 items-center gap-2 text-[13px]">
-                <span className="v2-shimmer font-medium" role="status">Working</span>
-                {props.elapsedMs > 0 && (
-                  <span className="text-[12px] tabular-nums text-[var(--v2-text-muted)]">{Math.floor(props.elapsedMs / 1000)}s</span>
-                )}
-                {props.stage && <span className="truncate text-[12px] text-[var(--v2-text-muted)]">· {props.stage}</span>}
-                <span className="flex-1" />
-                {formatCtx(props.ctx) && (
-                  <span className="rounded border border-[var(--v2-border-base)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--v2-text-muted)]">
-                    {formatCtx(props.ctx)}
-                  </span>
-                )}
-              </div>
-              {props.liveSteps.length > 0 && (
-                <div className="mb-2 space-y-1">
-                  {props.liveSteps.map((s, i) => (
-                    <ToolRow
-                      key={i}
-                      name={s.tool}
-                      body={(s.target + (s.preview ? '\n' + s.preview : '')).trim()}
-                      error={!!s.error}
-                      live={s.phase === 'start'}
-                      duration_ms={s.phase === 'done' ? s.duration_ms : undefined}
-                    />
-                  ))}
-                </div>
-              )}
-              {props.liveThinking && (
-                <details className="mb-2 text-[12px] text-[var(--v2-text-muted)]">
-                  <summary className="cursor-pointer hover:text-[var(--v2-text-base)]">thinking</summary>
-                  <div className="mt-1 whitespace-pre-wrap select-text">{props.liveThinking.slice(-2000)}</div>
-                </details>
-              )}
-              {props.liveText && (
-                <div className="whitespace-pre-wrap text-[13px] leading-5 text-[var(--v2-text-base)] select-text">
-                  {props.liveText.slice(-4000)}
-                  <span className="animate-pulse">▊</span>
-                </div>
-              )}
-            </div>
-          )}
           {!props.working && props.error && (
             <div
               role="alert"
@@ -461,7 +444,54 @@ export function SessionView(props: {
           )}
         </div>
       </div>
-      <div className="relative z-[70] mx-auto w-full max-w-[720px] px-4 pb-4">
+      <div className="sticky bottom-0 z-10 mx-auto w-full max-w-[720px] px-4 pb-4" style={{ background: 'var(--v2-bg-base)' }}>
+        {props.working && (
+          <div ref={workRef} className="mb-2 max-h-[38vh] overflow-y-auto rounded-[8px] bg-[var(--v2-bg-base)] px-4 py-3"
+            style={{ border: '1px solid var(--v2-border-base)' }}
+          >
+            {/* v2 working card pinned above the msg box: full live status at the bottom. */}
+            <div className="mb-1 flex h-9 items-center gap-2 text-[13px]">
+              <span className="v2-shimmer font-medium" role="status">Working</span>
+              {props.elapsedMs > 0 && (
+                <span className="text-[12px] tabular-nums text-[var(--v2-text-muted)]">{Math.floor(props.elapsedMs / 1000)}s</span>
+              )}
+              {props.stage && <span className="truncate text-[12px] text-[var(--v2-text-muted)]">· {props.stage}</span>}
+              <span className="flex-1" />
+              {formatCtx(props.ctx) && (
+                <span className="rounded border border-[var(--v2-border-base)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--v2-text-muted)]">
+                  {formatCtx(props.ctx)}
+                </span>
+              )}
+            </div>
+            {props.liveSteps.length > 0 && (
+              <div className="mb-2 space-y-1">
+                {props.liveSteps.map((s, i) => (
+                  <ToolRow
+                    key={i}
+                    name={s.tool}
+                    body={(s.target + (s.preview ? '\n' + s.preview : '')).trim()}
+                    error={!!s.error}
+                    live={s.phase === 'start'}
+                    duration_ms={s.phase === 'done' ? s.duration_ms : undefined}
+                  />
+                ))}
+              </div>
+            )}
+            {props.liveThinking && (
+              <details className="mb-2 text-[12px] text-[var(--v2-text-muted)]">
+                <summary className="cursor-pointer hover:text-[var(--v2-text-base)]">thinking</summary>
+                <div className="mt-1 whitespace-pre-wrap select-text">{props.liveThinking.slice(-2000)}</div>
+              </details>
+            )}
+            {props.liveText && (
+              <div className="whitespace-pre-wrap text-[13px] leading-5 text-[var(--v2-text-base)] select-text">
+                {props.liveText.slice(-4000)}
+                <span className="animate-pulse">▊</span>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* v2 composer lane: activity + todo capsules sit beside the composer. */}
         {props.working && (runningShells + runningAgents > 0 || props.queue.length > 0) && (
           <div className="relative mb-1 flex min-w-0 items-center gap-2 px-1">
@@ -540,6 +570,7 @@ export function SessionView(props: {
             modelOptions={props.modelOptions}
             onModel={props.onModel}
             onCustomModel={props.onCustomModel}
+            onOpenModels={props.onOpenModels}
             perm={props.perm}
             onPerm={props.onPerm}
             effort={props.effort}

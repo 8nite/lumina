@@ -112,12 +112,195 @@ pub fn is_google_target(target: &str) -> bool {
     false
 }
 
+/// Home directory (`os.UserHomeDir` then `$HOME`).
+pub fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_default()
+}
+
+/// `~` and `~/…` expand to the home directory (ExpandHome parity).
+pub fn expand_home(p: &str) -> String {
+    if p == "~" {
+        let h = home_dir();
+        if h.is_empty() { p.into() } else { h }
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        let h = home_dir();
+        if h.is_empty() { p.into() } else { format!("{h}/{rest}") }
+    } else {
+        p.into()
+    }
+}
+
+/// Temp locations writable outside the workspace.
+pub fn temp_prefixes() -> Vec<String> {
+    let mut out = Vec::new();
+    for s in [std::env::temp_dir().to_string_lossy().into_owned(),
+        "/tmp".into(), "/var/tmp".into(), "/temp".into(), "/private/tmp".into()] {
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// System locations readable outside the workspace (Linux/macOS set).
+pub fn system_read_prefixes() -> Vec<String> {
+    ["/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/System", "/Library"]
+        .iter().map(|s| s.to_string()).collect()
+}
+
+fn under(dir: &str, p: &str) -> bool {
+    !dir.is_empty() && (p == dir || p.starts_with(&format!("{dir}/")))
+}
+
+fn clean_abs(p: &str) -> Option<String> {
+    let e = expand_home(p);
+    let path = Path::new(&e);
+    if !path.is_absolute() {
+        return None;
+    }
+    // Lexical clean (no symlink chase).
+    let mut norm = PathBuf::new();
+    for comp in path.components() {
+        use std::path::Component::*;
+        match comp {
+            RootDir => norm.push("/"),
+            Prefix(pr) => norm.push(pr.as_os_str()),
+            CurDir => {}
+            ParentDir => { norm.pop(); }
+            Normal(c) => norm.push(c),
+        }
+    }
+    Some(norm.to_string_lossy().into_owned())
+}
+
+/// Read allowlist: home, temp, or system (IsWhitelistedRead parity).
+/// Relative paths return false (they resolve inside the workspace).
+pub fn is_whitelisted_read(p: &str) -> bool {
+    let Some(e) = clean_abs(p) else { return false };
+    let h = home_dir();
+    if under(&h, &e) {
+        return true;
+    }
+    temp_prefixes().iter().any(|t| under(t, &e)) || system_read_prefixes().iter().any(|t| under(t, &e))
+}
+
+/// Write allowlist: temp locations only (IsWhitelistedWrite parity).
+pub fn is_whitelisted_write(p: &str) -> bool {
+    let Some(e) = clean_abs(p) else { return false };
+    temp_prefixes().iter().any(|t| under(t, &e))
+}
+
+/// Union for generic fence checks.
+pub fn is_whitelisted_external(p: &str) -> bool {
+    is_whitelisted_read(p) || is_whitelisted_write(p)
+}
+
+fn in_workspace(workspace: &Path, target: &str) -> bool {
+    if workspace.as_os_str().is_empty() {
+        return false;
+    }
+    let e = expand_home(target);
+    let cand = if Path::new(&e).is_absolute() { PathBuf::from(&e) } else { workspace.join(&e) };
+    let mut norm = PathBuf::new();
+    for comp in cand.components() {
+        use std::path::Component::*;
+        match comp {
+            RootDir => norm.push("/"),
+            Prefix(pr) => norm.push(pr.as_os_str()),
+            CurDir => {}
+            ParentDir => { norm.pop(); }
+            Normal(c) => norm.push(c),
+        }
+    }
+    norm.starts_with(workspace)
+}
+
+/// Inside the workspace or whitelisted for reads.
+pub fn is_read_allowed(workspace: &Path, target: &str) -> bool {
+    if workspace.as_os_str().is_empty() {
+        return true;
+    }
+    if in_workspace(workspace, target) {
+        return true;
+    }
+    is_whitelisted_read(target)
+}
+
+/// Inside the workspace or whitelisted for writes (temp only).
+pub fn is_write_allowed(workspace: &Path, target: &str) -> bool {
+    if workspace.as_os_str().is_empty() {
+        return true;
+    }
+    if in_workspace(workspace, target) {
+        return true;
+    }
+    is_whitelisted_write(target)
+}
+
+/// External-whitelist secret override (credentialOverrideAllowed parity):
+/// credential-shaped paths outside the workspace in a whitelisted location
+/// skip the hard-deny. Workspace-internal secrets stay denied. Bash commands
+/// are scanned for path-like tokens.
+pub fn credential_override_allowed(workspace: &Path, tool: &str, target: &str) -> bool {
+    let low = tool.to_lowercase();
+    if low == "bash" || low == "shell" {
+        let mut found_external = false;
+        for tok in target.split([' ', '\t', '\n', '"', '\'', ';', '|', '&', '`']) {
+            let t = tok.trim_matches(|c| matches!(c, '(' | ')' | '{' | '}' | '<' | '>'));
+            if t.is_empty() {
+                continue;
+            }
+            if !(t.starts_with('/') || t.starts_with('~') || t.starts_with("$HOME")) {
+                continue;
+            }
+            let t = expand_home(&t.replace("$HOME", &home_dir()));
+            let Some(abs) = clean_abs(&t) else { continue };
+            if in_workspace(workspace, &abs) {
+                // Workspace-internal secret ref wins: stay denied.
+                if is_credential_path(&abs) {
+                    return false;
+                }
+                continue;
+            }
+            if is_whitelisted_read(&abs) || is_whitelisted_write(&abs) {
+                found_external = true;
+            }
+        }
+        if !found_external {
+            let low_t = target.to_lowercase();
+            for frag in temp_prefixes().into_iter().chain(system_read_prefixes()) {
+                if low_t.contains(&frag.to_lowercase()) {
+                    found_external = true;
+                    break;
+                }
+            }
+            let h = home_dir().to_lowercase();
+            if !h.is_empty() && low_t.contains(&h) {
+                found_external = true;
+            }
+            if target.contains("~/") || target.contains("$HOME") {
+                found_external = true;
+            }
+        }
+        return found_external;
+    }
+    // File tools: single path target.
+    if !is_credential_path(target) {
+        return false;
+    }
+    if in_workspace(workspace, target) {
+        return false; // workspace secrets stay denied
+    }
+    is_whitelisted_external(target)
+}
+
 /// `plan` may only write `plan.md` or `.lumina/plans/*.md` inside the workspace.
 pub fn plan_allows_write(workspace: &Path, target: &str) -> bool {
-    let abs = if Path::new(target).is_absolute() {
-        PathBuf::from(target)
+    let expanded = expand_home(target);
+    let abs = if Path::new(&expanded).is_absolute() {
+        PathBuf::from(&expanded)
     } else {
-        workspace.join(target)
+        workspace.join(&expanded)
     };
     // Containment: normalize `..` lexically, require workspace prefix.
     let mut norm = PathBuf::new();
@@ -241,8 +424,12 @@ pub fn is_destructive_bash(cmd: &str) -> bool {
 }
 
 pub fn decide(e: &Eval) -> Decision {
-    // Layer 0 hard denies first.
-    if is_credential_path(&e.target) || is_google_target(&e.target) {
+    // Layer 0 hard denies first (credential paths honor the explicit
+    // external-whitelist override; Google targets never do).
+    if is_credential_path(&e.target) && !credential_override_allowed(&e.workspace, &e.tool, &e.target) {
+        return Decision::Deny;
+    }
+    if is_google_target(&e.target) || is_google_target(&e.tool) {
         return Decision::Deny;
     }
     let tool = e.tool.as_str();

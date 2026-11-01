@@ -95,25 +95,27 @@ fn run_one(provider: &str, key: &str, query: &str) -> Result<String, WebError> {
                 &serde_json::json!({"query": query, "search_depth": "basic", "max_results": 8, "include_answer": false}),
                 None,
             )?;
-            Ok(fmt_results(&v, "results", &["title", "url", "content"]))
+            Ok(fmt_tavily(&v))
         }
         "exa" => {
             let v = post_json(
                 "https://api.exa.ai/search",
                 key,
-                &serde_json::json!({"query": query, "type": "auto", "numResults": 8}),
+                &serde_json::json!({"query": query, "type": "auto", "numResults": 8,
+                    "contents": {"highlights": true}}),
                 None,
             )?;
-            Ok(fmt_results(&v, "results", &["title", "url", "text"]))
+            Ok(fmt_exa(&v))
         }
         "firecrawl" => {
             let v = post_json(
                 "https://api.firecrawl.dev/v2/search",
                 key,
-                &serde_json::json!({"query": query, "limit": 8}),
+                &serde_json::json!({"query": query, "limit": 8,
+                    "sources": [{"type": "web"}]}),
                 None,
             )?;
-            Ok(fmt_results(&v, "data", &["title", "url", "markdown"]))
+            Ok(fmt_firecrawl(&v))
         }
         "parallel" => {
             let v = post_json(
@@ -122,7 +124,7 @@ fn run_one(provider: &str, key: &str, query: &str) -> Result<String, WebError> {
                 &serde_json::json!({"objective": query, "search_queries": [query], "mode": "basic"}),
                 Some(("x-api-key", key)),
             )?;
-            Ok(fmt_results(&v, "results", &["title", "url", "content"]))
+            Ok(fmt_parallel(&v))
         }
         "tinyfish" => {
             let res = blocking_client(Duration::from_secs(30))
@@ -131,7 +133,8 @@ fn run_one(provider: &str, key: &str, query: &str) -> Result<String, WebError> {
                 .send()
                 .map_err(|e| WebError::Msg(format!("websearch: {e}")))?;
             if res.status().as_u16() == 429 {
-                return Err(WebError::Msg("websearch: provider rate limited (429)".into()));
+                let ra = res.headers().get("retry-after").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                return Err(WebError::Limited(ra));
             }
             if !res.status().is_success() {
                 return Err(WebError::Msg(format!("websearch: status {}", res.status())));
@@ -154,6 +157,83 @@ fn url_encode(s: &str) -> String {
         }
     }
     out.replace(' ', "+")
+}
+
+fn fmt_tavily(v: &serde_json::Value) -> String {
+    let mut sb = String::new();
+    if let Some(arr) = v.get("results").and_then(|a| a.as_array()) {
+        for (i, it) in arr.iter().enumerate() {
+            let g = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("");
+            sb.push_str(&format!("{}. {}\n   {}\n   {}\n", i + 1, g("title"), g("url"), trunc(g("content"), 500)));
+        }
+    }
+    if let Some(ans) = v.get("answer").and_then(|a| a.as_str()) {
+        if !ans.is_empty() {
+            sb.push_str(&format!("\nAnswer: {}\n", trunc(ans, 1000)));
+        }
+    }
+    if sb.is_empty() {
+        sb.push_str("(no results)");
+    }
+    sb
+}
+
+fn first_str(it: &serde_json::Value, key: &str) -> String {
+    it.get(key)
+        .and_then(|a| a.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str()).find(|x| !x.is_empty()).unwrap_or(""))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn fmt_exa(v: &serde_json::Value) -> String {
+    let mut sb = String::new();
+    if let Some(arr) = v.get("results").and_then(|a| a.as_array()) {
+        for (i, it) in arr.iter().enumerate() {
+            let g = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("");
+            sb.push_str(&format!("{}. {}\n   {}\n", i + 1, g("title"), g("url")));
+            let hl = first_str(it, "highlights");
+            if !hl.is_empty() {
+                sb.push_str(&format!("   {}\n", trunc(&hl, 500)));
+            }
+        }
+    }
+    if sb.is_empty() {
+        sb.push_str("(no results)");
+    }
+    sb
+}
+
+fn fmt_firecrawl(v: &serde_json::Value) -> String {
+    let mut sb = String::new();
+    let arr = v.get("data").and_then(|d| d.get("web")).and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    for (i, it) in arr.iter().enumerate() {
+        let g = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        let snip = if !g("markdown").is_empty() { g("markdown") } else { g("description") };
+        sb.push_str(&format!("{}. {}\n   {}\n   {}\n", i + 1, g("title"), g("url"), trunc(snip, 500)));
+    }
+    if sb.is_empty() {
+        sb.push_str("(no results)");
+    }
+    sb
+}
+
+fn fmt_parallel(v: &serde_json::Value) -> String {
+    let mut sb = String::new();
+    if let Some(arr) = v.get("results").and_then(|a| a.as_array()) {
+        for (i, it) in arr.iter().enumerate() {
+            let g = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("");
+            sb.push_str(&format!("{}. {}\n   {}\n", i + 1, g("title"), g("url")));
+            let ex = first_str(it, "excerpts");
+            if !ex.is_empty() {
+                sb.push_str(&format!("   {}\n", trunc(&ex, 500)));
+            }
+        }
+    }
+    if sb.is_empty() {
+        sb.push_str("(no results)");
+    }
+    sb
 }
 
 fn fmt_results(v: &serde_json::Value, arr_key: &str, fields: &[&str]) -> String {

@@ -57,6 +57,9 @@ func TestVariantMatrixPromptBodies(t *testing.T) {
 		m := New(sdk.New(srv.URL, ""), &sdk.Session{ID: "s1", Agent: "build", PermissionMode: "ask"})
 		if v != "" {
 			m.ApplyCommand("/variant " + v)
+		} else {
+			// Default is xhigh; reach provider-default via explicit auto.
+			m.ApplyCommand("/effort auto")
 		}
 		m.Input = "hello " + v
 		next, cmd := m.Update(key("", tea.KeyEnter))
@@ -92,9 +95,7 @@ func TestVariantPickerStartsOnCurrent(t *testing.T) {
 	// Cursor opens on the live variant, not a hard-coded top entry.
 	for idx, v := range llm.EffortVariants {
 		m := testModel()
-		if v != "auto" {
-			m.ApplyCommand("/variant " + v)
-		}
+		m.ApplyCommand("/variant " + v)
 		m.ApplyCommand("/variant")
 		if !m.PickingVariant {
 			t.Fatalf("variant %q: picker did not open", v)

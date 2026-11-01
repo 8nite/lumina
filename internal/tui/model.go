@@ -263,7 +263,9 @@ type Model struct {
 	Picking      bool
 	PickingModel bool
 	// Variant picker (/variant) entries + mode flag. Reuses PickIdx.
-	// Effort holds the current reasoning-effort variant ("" = auto).
+	// Effort holds the current reasoning-effort variant ("" = provider
+	// default; the TUI starts at "xhigh" for web parity, /effort auto
+	// resets to "").
 	Effort          string
 	VariantOptions  []string
 	PickingVariant  bool
@@ -519,6 +521,7 @@ func New(c *sdk.Client, sess *sdk.Session) Model {
 		}
 	}
 	m := Model{Client: c, Session: sess, Agent: agent, Perm: perm,
+		Effort: "xhigh", // default variant (web parity; /effort auto resets to provider default)
 		SlashCommands: builtinSlashCommands(),
 		Width:         80}
 	m.appendLine("# lumina")

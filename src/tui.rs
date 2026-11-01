@@ -39,22 +39,62 @@ struct PermModal {
 
 struct QModal {
     req_id: String,
-    questions: Vec<Q>,
+    questions: Vec<QItem>,
     qi: usize,
     oi: usize,
+    typed: String,
+    answers: Vec<Vec<String>>,
 }
-#[derive(serde::Deserialize)]
-struct Q {
-    #[serde(default)]
-    text: String,
-    #[serde(default)]
-    options: Vec<String>,
+
+#[derive(Clone, Default)]
+struct QItem {
+    question: String,
+    header: String,
+    options: Vec<(String, String)>, // (label, description)
+    multiple: bool,
+}
+
+/// Map typed input to option labels: a comma-separated number list
+/// ("1,3") selects those options, anything else is a free-text answer,
+/// and empty input takes the highlighted option (Go parity).
+fn parse_question_answer(q: &QItem, typed: &str, cursor: usize) -> Vec<String> {
+    let t = typed.trim();
+    if !t.is_empty() {
+        let mut picks = Vec::new();
+        let mut numbered = true;
+        for part in t.split(',') {
+            let part = part.trim();
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                numbered = false;
+                break;
+            }
+            match part.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= q.options.len() => picks.push(q.options[n - 1].0.clone()),
+                _ => {
+                    numbered = false;
+                    break;
+                }
+            }
+        }
+        if numbered && !picks.is_empty() {
+            if !q.multiple {
+                picks.truncate(1);
+            }
+            return picks;
+        }
+        return vec![t.to_string()];
+    }
+    if let Some((label, _)) = q.options.get(cursor) {
+        return vec![label.clone()];
+    }
+    vec![String::new()]
 }
 
 enum Popup {
-    Complete { items: Vec<String>, idx: usize },
+    Complete { items: Vec<(String, String)>, idx: usize },
     Models { providers: Vec<String>, pi: usize, models: Vec<String>, mi: usize, picking_model: bool },
     Sessions { list: Vec<SessionView>, idx: usize },
+    Variants { idx: usize },
 }
 
 struct PendingConnect {
@@ -75,8 +115,12 @@ struct App {
     cursor: usize,
     scroll: usize,
     follow: bool,
+    /// Last-drawn message viewport (total rows, start row, height).
+    view_total: usize,
+    view_start: usize,
+    view_h: usize,
     running: bool,
-    queued: Option<String>,
+    queue_armed: bool,
     effort: String,
     thinking_shown: bool,
     thinking: String,
@@ -121,6 +165,19 @@ impl App {
         }
     }
 
+    /// Scroll toward the live tail, snapping to follow at the bottom.
+    fn scroll_down(&mut self, n: usize) {
+        if self.scroll == usize::MAX {
+            self.follow = true;
+            return;
+        }
+        self.scroll = self.scroll.saturating_add(n);
+        if self.scroll + self.view_h.max(1) >= self.view_total {
+            self.follow = true;
+            self.scroll = usize::MAX;
+        }
+    }
+
     fn submit(&mut self) {
         let text: String = self.input_text();
         if text.trim().is_empty() {
@@ -137,20 +194,23 @@ impl App {
     }
 
     fn send_prompt(&mut self, text: String) {
-        if self.running {
-            self.queued = Some(text);
-            self.set_status("queued (running turn active)");
-            return;
-        }
+        // Inbox behavior: armed Ctrl+X queues behind a running turn,
+        // otherwise Enter steers into it (Go parity). The daemon is the
+        // source of truth for running vs idle.
+        let delivery = if self.queue_armed { "queue" } else { "steer" };
+        self.queue_armed = false;
         self.push_msg("user", text.clone());
         self.running = true;
         let sdk = self.sdk.clone();
         let id = self.session.id.clone();
         let effort = self.effort.clone();
+        let delivery = delivery.to_string();
         std::thread::spawn(move || {
             // Results surface over SSE (turn.completed/failed, possibly after a
             // server-side queue); the ack itself carries no content.
-            let _ = sdk.submit(&id, &text, &effort);
+            if let Err(e) = sdk.submit_delivery(&id, &text, &effort, &delivery) {
+                let _ = e;
+            }
         });
     }
 
@@ -166,19 +226,33 @@ impl App {
                 Some(_) => self.set_status("usage: /mode [ask|auto-edit|auto-approve|bypass]"),
                 None => self.cycle_mode(),
             },
-            "variant" | "effort" => match rest.first() {
+            "variant" | "effort" | "variants" => match rest.first() {
                 Some(v) if EFFORTS.contains(v) => {
                     self.effort = v.to_string();
                     self.set_status(&format!("effort → {}", self.effort));
                 }
                 Some(_) => self.set_status("usage: /variant [auto|low|medium|high|xhigh|max]"),
                 None => {
-                    let cur = EFFORTS.iter().position(|e| *e == self.effort).unwrap_or(0);
-                    self.effort = EFFORTS[(cur + 1) % EFFORTS.len()].to_string();
-                    self.set_status(&format!("effort → {}", self.effort));
+                    // Picker at the current variant (Go parity).
+                    let idx = EFFORTS.iter().position(|e| *e == self.effort).unwrap_or(0);
+                    self.popup = Some(Popup::Variants { idx });
                 }
             },
             "model" => match rest.first().copied() {
+                Some(p) if p.contains('/') => {
+                    let id = p.to_string();
+                    match self.sdk.set_router("executor", &id) {
+                        Ok(()) => {
+                            self.session.model = id.clone();
+                            if let Err(e) = self.sdk.patch(&self.session.id, &serde_json::json!({"model": id})) {
+                                self.set_status(&format!("model: router set, session persist failed: {e}"));
+                            } else {
+                                self.set_status(&format!("executor → {id}"));
+                            }
+                        }
+                        Err(e) => self.set_status(&format!("model: {e}")),
+                    }
+                }
                 Some(p) => self.open_models_at(&p.to_string()),
                 None => self.open_models(),
             },
@@ -210,7 +284,10 @@ impl App {
                     self.thinking_shown = false;
                     self.set_status("thinking hidden");
                 }
-                _ => self.set_status("usage: /thinking [show|hide]"),
+                _ => {
+                    self.thinking_shown = !self.thinking_shown;
+                    self.set_status(if self.thinking_shown { "thinking shown" } else { "thinking hidden" });
+                }
             },
             "connect" => self.connect(rest),
             "init" => {
@@ -272,6 +349,8 @@ impl App {
         let user_code = dc.get("user_code").and_then(|c| c.as_str()).unwrap_or("").to_string();
         let uri = dc.get("verification_uri").and_then(|u| u.as_str()).unwrap_or("").to_string();
         let interval = dc.get("interval").and_then(|i| i.as_u64()).unwrap_or(5).max(2);
+        // Daemon expiry wins; fall back to 600s (Go expires_in parity).
+        let ttl = dc.get("expires_in").and_then(|e| e.as_u64()).filter(|e| *e > 0).unwrap_or(600);
         if code.is_empty() {
             self.set_status("connect: bad device response");
             return;
@@ -283,7 +362,7 @@ impl App {
             device_code: code,
             next_poll: Instant::now() + Duration::from_secs(interval),
             interval,
-            deadline: Instant::now() + Duration::from_secs(600),
+            deadline: Instant::now() + Duration::from_secs(ttl),
         });
         self.set_status("device flow started — approve in your browser");
     }
@@ -380,14 +459,24 @@ impl App {
 
     fn open_sessions(&mut self) {
         match self.sdk.list_sessions(Some(&self.workspace), false) {
-            Ok(list) => self.popup = Some(Popup::Sessions { list, idx: 0 }),
+            Ok(list) => {
+                let kept: Vec<_> = list.into_iter().filter(|x| x.id != self.session.id).collect();
+                if kept.is_empty() {
+                    self.set_status("no previous sessions for this workspace");
+                } else {
+                    self.popup = Some(Popup::Sessions { list: kept, idx: 0 });
+                }
+            }
             Err(e) => self.set_status(&format!("resume: {e}")),
         }
     }
 
     fn continue_latest(&mut self) {
-        match self.sdk.latest(&self.workspace) {
-            Ok(s) => self.attach_session(s),
+        match self.sdk.list_sessions(Some(&self.workspace), false) {
+            Ok(list) => match list.into_iter().find(|x| x.id != self.session.id) {
+                Some(s) => self.attach_session(s),
+                None => self.set_status("no previous sessions for this workspace"),
+            },
             Err(e) => self.set_status(&format!("continue: {e}")),
         }
     }
@@ -412,6 +501,8 @@ impl App {
     /// Best-effort transcript restore via export (## role sections).
     fn load_transcript(&mut self) {
         // ponytail: export is markdown; parse the ## role headers directly.
+        // Rebuild semantics (Go parity): replace, never append.
+        self.messages.clear();
         let md = self.sdk.export(&self.session.id).unwrap_or_default();
         let mut role = String::new();
         let mut buf = String::new();
@@ -454,58 +545,196 @@ impl App {
         }
         if let Some(q) = v.get("question") {
             if !q.is_null() {
+                let questions: Vec<QItem> = q
+                    .get("questions")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .map(|x| QItem {
+                                question: x
+                                    .get("question")
+                                    .or_else(|| x.get("text"))
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("(no question)")
+                                    .into(),
+                                header: x.get("header").and_then(|t| t.as_str()).unwrap_or("").into(),
+                                options: x
+                                    .get("options")
+                                    .and_then(|o| o.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|o| {
+                                                if let Some(l) = o.as_str() {
+                                                    Some((l.to_string(), String::new()))
+                                                } else {
+                                                    o.get("label").and_then(|l| l.as_str()).map(|l| {
+                                                        (
+                                                            l.to_string(),
+                                                            o.get("description")
+                                                                .and_then(|d| d.as_str())
+                                                                .unwrap_or("")
+                                                                .to_string(),
+                                                        )
+                                                    })
+                                                }
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                multiple: x.get("multiple").and_then(|m| m.as_bool()).unwrap_or(false),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 self.ques = Some(QModal {
                     req_id: q.get("req_id").and_then(|r| r.as_str()).unwrap_or("").into(),
-                    questions: q
-                        .get("questions")
-                        .and_then(|x| serde_json::from_value(x.clone()).ok())
-                        .unwrap_or_default(),
+                    questions,
                     qi: 0,
                     oi: 0,
+                    typed: String::new(),
+                    answers: Vec::new(),
                 });
             }
         }
     }
 
+    /// Cross-session filter (Go parity): only our own session's events
+    /// drive the timeline and modals; config.updated is global.
+    fn ours(&self, session: &str) -> bool {
+        session.is_empty() || session == self.session.id
+    }
+
     fn on_event(&mut self, ev: Event) {
         match ev {
-            Event::TurnStarted { .. } => {
+            Event::TurnStarted { session } => {
+                if !self.ours(&session) {
+                    return;
+                }
                 self.running = true;
                 self.thinking.clear();
             }
-            Event::TurnDelta { delta, thinking, .. } => {
+            Event::TurnDelta { session, delta, thinking } => {
+                if !self.ours(&session) {
+                    return;
+                }
+                if !self.running {
+                    self.running = true; // missed-started recovery
+                }
                 self.append_delta(&delta);
                 if !thinking.is_empty() {
                     self.thinking.push_str(&thinking);
                 }
             }
-            Event::TurnCompleted { ms, chars, .. } => {
+            Event::TurnProgress { session, stage } => {
+                if !self.ours(&session) || stage.is_empty() {
+                    return;
+                }
+                // A progress row for an apparently-idle session means we
+                // missed turn.started while disconnected: recover the spinner.
+                if !self.running && !stage.starts_with("queued #") {
+                    self.running = true;
+                }
+                self.set_status(&stage);
+            }
+            Event::TurnCompleted { session, ms, chars, text, model } => {
+                if !self.ours(&session) {
+                    return;
+                }
                 self.running = false;
-                // Turn footer stats (model · seconds · ~tok/s), like the Go TUI.
+                // Transcript repair: the server re-sends the final text; append
+                // only when the streamed tail doesn't already hold it.
+                let t = text.trim();
+                if !t.is_empty() {
+                    let tail_has = self
+                        .messages
+                        .last()
+                        .map(|(r, m)| r == "assistant" && m.ends_with(t))
+                        .unwrap_or(false);
+                    if !tail_has {
+                        self.push_msg("assistant", t.to_string());
+                    }
+                }
+                // Turn footer: model · seconds · ~tok/s (Go turnFooter parity).
                 let secs = ms as f64 / 1000.0;
                 let tps = if secs > 0.0 { chars as f64 / 4.0 / secs } else { 0.0 };
-                self.set_status(&format!("{} · {secs:.1}s · ~{tps:.0} tok/s", self.session.model));
-                if let Some(q) = self.queued.take() {
-                    self.send_prompt(q);
+                let m = if model.is_empty() { self.session.model.clone() } else { model };
+                self.set_status(&format!("{m} · {secs:.1}s · ~{tps:.0} tok/s"));
+                // (Steered/queued follow-ups ride the daemon inbox now.)
+            }
+            Event::TurnTool { session, phase, tool, target, preview, error, .. } => {
+                if !self.ours(&session) {
+                    return;
+                }
+                if !self.running {
+                    self.running = true; // missed-started recovery
+                }
+                let tgt = if target.is_empty() { String::new() } else { format!(" {target}") };
+                if phase == "done" {
+                    let prev = preview.trim();
+                    if error {
+                        self.push_msg("system", format!("· `{tool}`{tgt} → error: {prev}"));
+                    } else if prev.is_empty() {
+                        self.push_msg("system", format!("· `{tool}`{tgt} → done"));
+                    } else {
+                        self.push_msg("system", format!("· `{tool}`{tgt} → {prev}"));
+                    }
+                } else {
+                    self.push_msg("system", format!("· `{tool}`{tgt}"));
                 }
             }
-            Event::TurnFailed { error, .. } => {
+            Event::TurnFailed { session, error } => {
+                if !self.ours(&session) {
+                    return;
+                }
                 self.running = false;
                 self.push_msg("system", format!("turn failed: {error}"));
             }
-            Event::PermissionAsked { req_id, tool, target, .. } => {
+            Event::PermissionAsked { session, req_id, tool, target } => {
+                if !self.ours(&session) {
+                    return;
+                }
                 self.perm = Some(PermModal { req_id, tool, target, choice: 0 });
             }
-            Event::PermissionResolved { .. } => {}
-            Event::QuestionAsked { req_id, questions, .. } => {
+            Event::PermissionResolved { req_id, .. } => {
+                if self.perm.as_ref().map(|p| p.req_id == req_id).unwrap_or(false) {
+                    self.perm = None;
+                }
+            }
+            Event::QuestionAsked { session, req_id, questions } => {
+                if !self.ours(&session) {
+                    return;
+                }
                 self.ques = Some(QModal {
                     req_id,
-                    questions: questions.into_iter().map(|q| Q { text: q.text, options: q.options }).collect(),
+                    questions: questions
+                        .into_iter()
+                        .map(|q| QItem {
+                            question: if q.question.is_empty() { "(no question)".into() } else { q.question },
+                            header: q.header,
+                            options: q.options.into_iter().map(|o| (o.label, o.description)).collect(),
+                            multiple: q.multiple,
+                        })
+                        .collect(),
                     qi: 0,
                     oi: 0,
+                    typed: String::new(),
+                    answers: Vec::new(),
                 });
             }
+            Event::QuestionResolved { req_id } => {
+                if self.ques.as_ref().map(|q| q.req_id == req_id).unwrap_or(false) {
+                    self.ques = None;
+                }
+            }
             Event::ConfigUpdated { role, model } => self.set_status(&format!("{role} → {model}")),
+            Event::Other { kind, .. } if kind == "sse.reconnected" => {
+                self.resync();
+                // Repair missed turns when idle; an active stream keeps
+                // flowing deltas (rebuild would clobber it).
+                if !self.running {
+                    self.load_transcript();
+                }
+            }
             Event::Other { kind, raw } => {
                 if kind == "turn.context" {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -536,24 +765,44 @@ impl App {
             self.popup = None;
             return;
         };
-        let items: Vec<String> = match kind {
+        let items: Vec<(String, String)> = match kind {
             "cmd" => {
-                let mut builtin: Vec<String> = ["plan", "build", "mode", "model", "variant", "resume", "continue", "fork", "graphify", "clear", "help", "compact", "thinking", "undo", "redo", "evolve", "init", "connect"]
-                    .into_iter()
-                    .filter(|c| c.starts_with(prefix))
-                    .map(|s| format!("/{s}"))
-                    .collect();
-                let mut customs: Vec<String> = self
-                    .custom_cmds
+                let builtin: &[(&str, &str)] = &[
+                    ("plan", "switch to read-only plan mode"),
+                    ("build", "switch to full build mode"),
+                    ("mode", "view or set approval mode (ask|auto-edit|auto-approve|bypass)"),
+                    ("model", "pick a model or connect a provider (usage: /model [filter])"),
+                    ("variant", "pick the reasoning-effort variant"),
+                    ("variants", "pick the reasoning-effort variant"),
+                    ("effort", "pick the reasoning-effort variant"),
+                    ("resume", "pick a previous session in this workspace"),
+                    ("continue", "attach the latest session in this workspace"),
+                    ("fork", "branch this session at the latest turn"),
+                    ("graphify", "refresh the knowledge graph"),
+                    ("compact", "summarize context to free the window"),
+                    ("thinking", "show or hide model reasoning while working (show|hide)"),
+                    ("undo", "restore the last shadow-git checkpoint"),
+                    ("redo", "re-apply the undone checkpoint"),
+                    ("evolve", "run a Harness² self-improvement pass"),
+                    ("init", "scaffold repo memory and harness overlay"),
+                    ("connect", "connect a provider via device web-auth (usage: /connect [provider] [github-url])"),
+                    ("clear", "clear the timeline"),
+                    ("help", "show keybindings and slash commands"),
+                ];
+                let mut out: Vec<(String, String)> = builtin
                     .iter()
-                    .map(|(n, _)| format!("/{n}"))
-                    .filter(|s| s[1..].starts_with(prefix))
+                    .filter(|(c, _)| c.starts_with(prefix))
+                    .map(|(c, d)| (format!("/{c}"), d.to_string()))
                     .collect();
-                builtin.append(&mut customs);
-                builtin
+                for (n, body) in &self.custom_cmds {
+                    if n.starts_with(prefix) && !out.iter().any(|(t, _)| t == &format!("/{n}")) {
+                        out.push((format!("/{n}"), command_desc(body)));
+                    }
+                }
+                out
             }
-            "file" => complete_files(&self.workspace, prefix),
-            "memory" => complete_memory(&self.workspace, prefix),
+            "file" => complete_files(&self.workspace, prefix).into_iter().map(|f| (f, String::new())).collect(),
+            "memory" => complete_memory(&self.workspace, prefix).into_iter().map(|m| (m, String::new())).collect(),
             _ => vec![],
         };
         if items.is_empty() {
@@ -565,7 +814,7 @@ impl App {
 
     fn accept_complete(&mut self) {
         let Some(Popup::Complete { items, idx }) = &self.popup else { return };
-        let pick = items[*idx].clone();
+        let pick = items[*idx].0.clone();
         let text = self.input_text();
         if pick.starts_with('/') {
             self.input = pick.chars().collect();
@@ -588,24 +837,28 @@ impl App {
 fn complete_files(workspace: &str, prefix: &str) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>, prefix: &str) {
-        if out.len() >= 30 {
+        if out.len() >= 200 {
             return;
         }
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
             let p = e.path();
-            if p.file_name().map(|n| n == ".git" || n == "target" || n == "node_modules").unwrap_or(false) {
+            if p.file_name().map(|n| n == ".git" || n == "target" || n == "node_modules" || n == ".lumina").unwrap_or(false) {
                 continue;
             }
             if p.is_dir() {
                 walk(&p, base, out, prefix);
             } else if let Ok(rel) = p.strip_prefix(base) {
+                let Ok(meta) = e.metadata() else { continue };
+                if !meta.is_file() || meta.len() > 1 << 20 {
+                    continue;
+                }
                 let s = rel.display().to_string();
                 if s.starts_with(prefix) {
                     out.push(s);
                 }
             }
-            if out.len() >= 30 {
+            if out.len() >= 200 {
                 return;
             }
         }
@@ -613,6 +866,21 @@ fn complete_files(workspace: &str, prefix: &str) -> Vec<String> {
     walk(std::path::Path::new(workspace), std::path::Path::new(workspace), &mut out, prefix);
     out.sort();
     out
+}
+
+/// One-line summary of a custom command body (60 chars, #-stripped).
+fn command_desc(body: &str) -> String {
+    for line in body.lines() {
+        let t = line.trim().trim_start_matches('#').trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.len() > 60 {
+            return format!("{}...", &t[..57]);
+        }
+        return t.to_string();
+    }
+    "custom command".to_string()
 }
 
 /// Expand a custom command template: $ARGUMENTS (and $@) become the rest
@@ -629,7 +897,7 @@ fn complete_memory(workspace: &str, prefix: &str) -> Vec<String> {
         .flatten()
         .filter_map(|e| {
             let n = e.file_name().to_string_lossy().into_owned();
-            if !n.ends_with(".md") || !n.starts_with(prefix) {
+            if !n.ends_with(".md") || n.starts_with('.') || !n.starts_with(prefix) {
                 return None;
             }
             Some(format!("[[{}]]", n.trim_end_matches(".md")))
@@ -648,7 +916,18 @@ pub fn run(opts: LaunchOpts) -> Result<(), String> {
     let session = if let Some(id) = &opts.session {
         sdk.get(id).map_err(|e| format!("session: {e}"))?
     } else if opts.cont {
-        sdk.latest(&ws).map_err(|e| format!("continue: {e} (omit -c to start fresh)"))?
+        match sdk.latest(&ws) {
+            Ok(sess) => sess,
+            // No previous session: fall back to a fresh one (Go parity).
+            Err(_) => sdk
+                .create(
+                    &ws,
+                    opts.agent.as_deref().unwrap_or("build"),
+                    opts.mode.as_deref().unwrap_or("bypass"),
+                    "",
+                )
+                .map_err(|e| format!("create: {e}"))?,
+        }
     } else {
         sdk.create(
             &ws,
@@ -668,8 +947,11 @@ pub fn run(opts: LaunchOpts) -> Result<(), String> {
         cursor: 0,
         scroll: 0,
         follow: true,
+        view_total: 0,
+        view_start: 0,
+        view_h: 20,
         running: false,
-        queued: None,
+        queue_armed: false,
         effort: "xhigh".into(), // default variant (web parity; /variant auto resets to provider default)
         thinking_shown: false,
         thinking: String::new(),
@@ -702,6 +984,7 @@ pub fn run(opts: LaunchOpts) -> Result<(), String> {
     let res = event_loop(&mut term, &mut app, events);
     crossterm::terminal::disable_raw_mode().map_err(|e| e.to_string())?;
     crossterm::execute!(term.backend_mut(), crossterm::terminal::LeaveAlternateScreen).map_err(|e| e.to_string())?;
+    println!("session {}", app.session.id);
     res
 }
 
@@ -752,44 +1035,67 @@ fn event_loop(
         }
         // Question modal captures navigation keys.
         if app.ques.is_some() {
-            match k.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if let Some(q) = &mut app.ques {
-                        let n = q.questions[q.qi].options.len().max(1);
-                        q.oi = (q.oi + n - 1) % n;
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if let Some(q) = &mut app.ques {
-                        let n = q.questions[q.qi].options.len().max(1);
-                        q.oi = (q.oi + 1) % n;
-                    }
-                }
-                KeyCode::Enter => {
-                    let done = if let Some(q) = &mut app.ques {
-                        let ans = q.questions[q.qi].options.get(q.oi).cloned().unwrap_or_default();
-                        // stash answer in status-adjacent vec via options reuse
-                        q.questions[q.qi].options = vec![ans];
-                        q.qi += 1;
-                        q.oi = 0;
-                        q.qi >= q.questions.len()
-                    } else {
-                        false
-                    };
-                    if done {
-                        if let Some(q) = app.ques.take() {
-                            let answers: Vec<String> = q.questions.into_iter().map(|x| x.options.into_iter().next().unwrap_or_default()).collect();
-                            if let Err(e) = app.sdk.answer_question(&q.req_id, &answers) {
-                                app.set_status(&format!("question: {e}"));
+            // Borrow dance: compute transitions, then act.
+            enum QAct {
+                None,
+                Answer,
+                Dismiss,
+            }
+            let mut act = QAct::None;
+            if let Some(q) = &mut app.ques {
+                if q.qi >= q.questions.len() {
+                    act = QAct::Answer;
+                } else {
+                    match k.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let n = q.questions[q.qi].options.len().max(1);
+                            q.oi = (q.oi + n - 1) % n;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let n = q.questions[q.qi].options.len().max(1);
+                            q.oi = (q.oi + 1) % n;
+                        }
+                        KeyCode::Backspace => {
+                            q.typed.pop();
+                        }
+                        KeyCode::Enter => {
+                            let ans = parse_question_answer(&q.questions[q.qi], &q.typed, q.oi);
+                            q.answers.push(ans);
+                            q.qi += 1;
+                            q.oi = 0;
+                            q.typed.clear();
+                            if q.qi >= q.questions.len() {
+                                act = QAct::Answer;
                             }
+                        }
+                        KeyCode::Esc => act = QAct::Dismiss,
+                        KeyCode::Char(c) => {
+                            q.typed.push(c);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            match act {
+                QAct::None => {}
+                QAct::Answer => {
+                    if let Some(q) = app.ques.take() {
+                        if let Err(e) = app.sdk.answer_question(&q.req_id, &q.answers) {
+                            app.set_status(&format!("question: {e}"));
+                        } else {
+                            app.set_status("question: answered");
                         }
                     }
                 }
-                KeyCode::Esc => {
-                    app.ques = None;
-                    app.set_status("question dismissed (turn will time out)");
+                QAct::Dismiss => {
+                    if let Some(q) = app.ques.take() {
+                        if let Err(e) = app.sdk.dismiss_question(&q.req_id) {
+                            app.set_status(&format!("dismiss: {e}"));
+                        } else {
+                            app.set_status("question dismissed");
+                        }
+                    }
                 }
-                _ => {}
             }
             continue;
         }
@@ -803,26 +1109,27 @@ fn event_loop(
             }
             (KeyCode::Char('x'), m) if m.contains(KeyModifiers::CONTROL) => {
                 // Arm queue: next Enter queues behind the running turn.
-                let t = app.input_text();
-                if !t.trim().is_empty() {
-                    app.input.clear();
-                    app.cursor = 0;
-                    if app.running {
-                        app.queued = Some(t);
-                        app.set_status("armed: queued behind running turn");
-                    } else {
-                        app.send_prompt(t);
-                    }
-                }
+                app.queue_armed = true;
+                app.set_status("armed: next Enter queues behind running turn");
             }
             (KeyCode::Esc, _) => {
                 if app.popup.is_some() {
                     app.popup = None;
-                } else if app.queued.take().is_some() {
-                    app.set_status("queue cancelled");
+                } else if app.queue_armed {
+                    app.queue_armed = false;
+                    app.set_status("queue disarmed");
+                } else {
+                    app.follow = true;
+                    app.scroll = usize::MAX;
                 }
             }
-            (KeyCode::Tab, _) => app.cycle_agent(),
+            (KeyCode::Tab, _) => {
+                if matches!(app.popup, Some(Popup::Complete { .. })) {
+                    app.accept_complete();
+                } else {
+                    app.cycle_agent();
+                }
+            }
             (KeyCode::BackTab, _) => app.cycle_mode(),
             (KeyCode::Enter, _) => {
                 if popup_open(app) {
@@ -831,8 +1138,24 @@ fn event_loop(
                     app.submit();
                 }
             }
-            (KeyCode::Up, _) => popup_nav(app, true),
-            (KeyCode::Down, _) => popup_nav(app, false),
+            (KeyCode::Up, _) => {
+                if popup_open(app) {
+                    popup_nav(app, true);
+                } else {
+                    app.follow = false;
+                    if app.scroll == usize::MAX {
+                        app.scroll = app.view_start;
+                    }
+                    app.scroll = app.scroll.saturating_sub(3);
+                }
+            }
+            (KeyCode::Down, _) => {
+                if popup_open(app) {
+                    popup_nav(app, false);
+                } else {
+                    app.scroll_down(3);
+                }
+            }
             (KeyCode::Left, _) => {
                 app.cursor = app.cursor.saturating_sub(1);
             }
@@ -854,10 +1177,21 @@ fn event_loop(
             }
             (KeyCode::PageUp, _) => {
                 app.follow = false;
-                app.scroll = app.scroll.saturating_sub(10);
+                if app.scroll == usize::MAX {
+                    app.scroll = app.view_start;
+                }
+                app.scroll = app.scroll.saturating_sub(app.view_h / 2 + 1);
             }
             (KeyCode::PageDown, _) => {
-                app.scroll = app.scroll.saturating_add(10);
+                app.scroll_down(app.view_h / 2 + 1);
+            }
+            (KeyCode::Home, _) => {
+                app.follow = false;
+                app.scroll = 0;
+            }
+            (KeyCode::End, _) => {
+                app.follow = true;
+                app.scroll = usize::MAX;
             }
             (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
                 app.input.insert(app.cursor, c);
@@ -889,6 +1223,9 @@ fn popup_nav(app: &mut App, up: bool) {
             *idx = if up { (*idx + list.len() - 1) % list.len() } else { (*idx + 1) % list.len() };
         }
         Some(Popup::Sessions { .. }) => {}
+        Some(Popup::Variants { idx }) => {
+            *idx = if up { (*idx + EFFORTS.len() - 1) % EFFORTS.len() } else { (*idx + 1) % EFFORTS.len() };
+        }
         None => {}
     }
 }
@@ -918,7 +1255,13 @@ fn popup_enter(app: &mut App) {
                 match app.sdk.set_router("executor", &format!("{p}/{m}")) {
                     Ok(()) => {
                         app.session.model = format!("{p}/{m}");
-                        app.set_status(&format!("executor → {p}/{m}"));
+                        // Persist on the session too, or the pick reverts on
+                        // reattach/resync (Go UpdateSession parity).
+                        if let Err(e) = app.sdk.patch(&app.session.id, &serde_json::json!({"model": format!("{p}/{m}")})) {
+                            app.set_status(&format!("model: router set, session persist failed: {e}"));
+                        } else {
+                            app.set_status(&format!("executor → {p}/{m}"));
+                        }
                     }
                     Err(e) => app.set_status(&format!("model: {e}")),
                 }
@@ -929,11 +1272,15 @@ fn popup_enter(app: &mut App) {
                 app.attach_session(s);
             }
         }
+        Some(Popup::Variants { idx }) => {
+            app.effort = EFFORTS[idx % EFFORTS.len()].to_string();
+            app.set_status(&format!("effort → {}", app.effort));
+        }
         None => {}
     }
 }
 
-fn draw(f: &mut ratatui::Frame, app: &App) {
+fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -971,16 +1318,36 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         lines.push(Line::from(""));
     }
     let total = lines.len();
-    let height = chunks[1].height as usize;
-    let start = if app.follow || app.scroll == usize::MAX { total.saturating_sub(height) } else { app.scroll.min(total) };
+    let mut height = chunks[1].height as usize;
+    // Scroll banner occupies one row when active (Go parity).
+    let scrolled = !app.follow && app.scroll != usize::MAX;
+    if scrolled && height > 1 {
+        height -= 1;
+    }
+    let start = if app.follow || app.scroll == usize::MAX {
+        total.saturating_sub(height)
+    } else {
+        app.scroll.min(total.saturating_sub(height))
+    };
     let view: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
+    app.view_total = total;
+    app.view_start = start;
+    app.view_h = height;
     f.render_widget(Paragraph::new(view).block(Block::default().borders(Borders::NONE)), chunks[1]);
+    if scrolled {
+        let banner = Line::from(Span::styled(
+            format!("… scroll {}↑ · pgdn/end to follow …", total.saturating_sub(start + height)),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        let r = Rect { x: chunks[1].x, y: chunks[1].y + height as u16, width: chunks[1].width, height: 1 };
+        f.render_widget(Paragraph::new(banner), r);
+    }
 
     // Composer.
     let mut shown: String = app.input.iter().collect();
     shown.insert(app.cursor.min(shown.len()), '▌');
     let composer = Paragraph::new(format!("> {shown}"))
-        .block(Block::default().borders(Borders::ALL).title(if app.running { "steer: Enter queues" } else { "prompt (Enter send · / commands)" }));
+        .block(Block::default().borders(Borders::ALL).title(if app.queue_armed { "prompt (Enter queues · Esc disarm)" } else if app.running { "prompt (Enter steers · Ctrl+X queues)" } else { "prompt (Enter send · / commands)" }));
     f.render_widget(composer, chunks[2]);
 
     // Status bar (thinking excerpt when /thinking show).
@@ -1000,7 +1367,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             Popup::Complete { items, idx } => items
                 .iter()
                 .enumerate()
-                .map(|(i, s)| ListItem::new(s.clone()).style(sel(i == *idx)))
+                .map(|(i, (t, d))| {
+                    let body = if d.is_empty() { t.clone() } else { format!("{t} — {d}") };
+                    ListItem::new(body).style(sel(i == *idx))
+                })
                 .collect(),
             Popup::Models { providers, pi, models, mi, picking_model } => {
                 if *picking_model {
@@ -1013,6 +1383,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 .iter()
                 .enumerate()
                 .map(|(i, s)| ListItem::new(format!("{} {} {}", &s.id[..8.min(s.id.len())], s.agent, s.title)).style(sel(i == *idx)))
+                .collect(),
+            Popup::Variants { idx } => EFFORTS
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let mark = if *v == app.effort { "● " } else { "○ " };
+                    ListItem::new(format!("{mark}{v}")).style(sel(i == *idx))
+                })
                 .collect(),
         };
         let r = centered(chunks[1], 60, items.len().min(12) as u16 + 2);
@@ -1048,20 +1426,30 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
     if let Some(q) = &app.ques {
         let cur = &q.questions[q.qi.min(q.questions.len().saturating_sub(1))];
-        let items: Vec<ListItem> = cur
+        let mut items: Vec<ListItem> = cur
             .options
             .iter()
             .enumerate()
-            .map(|(i, o)| ListItem::new(o.clone()).style(sel(i == q.oi)))
+            .map(|(i, (label, desc))| {
+                let body = if desc.is_empty() { label.clone() } else { format!("{label} — {desc}") };
+                ListItem::new(format!("{}. {body}", i + 1)).style(sel(i == q.oi))
+            })
             .collect();
-        let r = centered(chunks[1], 70, items.len().min(10) as u16 + 5);
+        if !cur.header.is_empty() {
+            items.insert(0, ListItem::new(cur.header.clone()));
+        }
+        items.push(ListItem::new(format!("> {}", q.typed)));
+        let r = centered(chunks[1], 70, (items.len().min(12) + 4) as u16);
         f.render_widget(Clear, r);
+        let multi = if cur.multiple { " (multi)" } else { "" };
         f.render_widget(
-            List::new(items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!("Q{}/{}: {} (↑↓ · Enter · Esc)", q.qi + 1, q.questions.len(), cur.text)),
-            ),
+            List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+                "Q{}/{}{}: {} (↑↓ · type 1,3/free text · Enter · Esc)",
+                q.qi + 1,
+                q.questions.len(),
+                multi,
+                cur.question
+            ))),
             r,
         );
     }
@@ -1127,8 +1515,11 @@ mod tests {
             cursor: 2,
             scroll: 0,
             follow: true,
+            view_total: 0,
+            view_start: 0,
+            view_h: 20,
             running: true,
-            queued: None,
+            queue_armed: false,
             effort: "auto".into(),
             thinking_shown: false,
             thinking: String::new(),
@@ -1148,8 +1539,8 @@ mod tests {
     fn frame_renders_with_modal() {
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = Terminal::new(backend).unwrap();
-        let app = dummy();
-        term.draw(|f| draw(f, &app)).unwrap();
+        let mut app = dummy();
+        term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol().to_string()).collect();
         assert!(text.contains("permission") && text.contains("working"), "{text}");

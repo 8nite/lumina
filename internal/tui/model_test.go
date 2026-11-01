@@ -648,8 +648,8 @@ func TestParseQuestionAnswer(t *testing.T) {
 
 func TestVariantCommand(t *testing.T) {
 	m := testModel()
-	if m.Effort != "" {
-		t.Fatalf("default variant must be auto, got %q", m.Effort)
+	if m.Effort != "xhigh" {
+		t.Fatalf("default variant must be xhigh (web parity), got %q", m.Effort)
 	}
 	// Direct set, case-insensitive (xhigh is the requested example).
 	m.ApplyCommand("/variant XHIGH")

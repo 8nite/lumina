@@ -17,6 +17,7 @@ export function HomeView(props: {
   modelOptions: string[];
   onModel: (m: string) => void;
   onCustomModel: (m: string) => void;
+  onOpenModels?: () => void;
   perm: string;
   onPerm: (p: string) => void;
   working: boolean;
@@ -70,6 +71,7 @@ export function HomeView(props: {
         modelOptions={props.modelOptions}
         onModel={props.onModel}
         onCustomModel={props.onCustomModel}
+        onOpenModels={props.onOpenModels}
         perm={props.perm}
         onPerm={props.onPerm}
         effort={props.effort}

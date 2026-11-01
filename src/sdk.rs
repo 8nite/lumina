@@ -45,21 +45,71 @@ pub struct SessionView {
 pub enum Event {
     TurnStarted { session: String },
     TurnDelta { session: String, delta: String, thinking: String },
-    TurnCompleted { session: String, ms: u64, chars: usize },
+    TurnProgress { session: String, stage: String },
+    TurnTool {
+        session: String,
+        phase: String,
+        tool: String,
+        target: String,
+        preview: String,
+        error: bool,
+        duration_ms: u64,
+    },
+    TurnCompleted { session: String, ms: u64, chars: usize, text: String, model: String },
     TurnFailed { session: String, error: String },
     PermissionAsked { req_id: String, session: String, tool: String, target: String },
     PermissionResolved { req_id: String, decision: String },
     QuestionAsked { req_id: String, session: String, questions: Vec<QuestionView> },
+    QuestionResolved { req_id: String },
     ConfigUpdated { role: String, model: String },
     Other { kind: String, raw: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct QuestionOptionView {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Unknown option shapes degrade to plain text (decodeQuestionItem parity).
+fn decode_options(v: &serde_json::Value) -> Vec<QuestionOptionView> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| {
+                    if let Some(label) = o.get("label").and_then(|l| l.as_str()) {
+                        if label.is_empty() {
+                            return None;
+                        }
+                        Some(QuestionOptionView {
+                            label: label.into(),
+                            description: o
+                                .get("description")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .into(),
+                        })
+                    } else {
+                        o.as_str().map(|label| QuestionOptionView { label: label.into(), description: String::new() })
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct QuestionView {
     #[serde(default)]
-    pub text: String,
+    pub question: String,
     #[serde(default)]
-    pub options: Vec<String>,
+    pub header: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOptionView>,
+    #[serde(default)]
+    pub multiple: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,27 +132,131 @@ pub struct AgentView {
 
 fn classify(v: &serde_json::Value) -> Event {
     let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    // Go envelope: {type, session_id?, data?}. Flat legacy payloads
+    // (pre-envelope daemons) are tolerated field-by-field below.
+    let sid = v
+        .get("session_id")
+        .or_else(|| v.get("session"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let s = |k: &str| {
+        v.get("data")
+            .and_then(|d| d.get(k))
+            .or_else(|| v.get(k))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let n = |k: &str| {
+        v.get("data")
+            .and_then(|d| d.get(k))
+            .or_else(|| v.get(k))
+            .and_then(|m| m.as_u64())
+            .unwrap_or(0)
+    };
     match kind {
-        "turn.started" => Event::TurnStarted { session: s("session") },
-        "turn.delta" => Event::TurnDelta { session: s("session"), delta: s("delta"), thinking: s("thinking") },
-        "turn.completed" => Event::TurnCompleted {
-            session: s("session"),
-            ms: v.get("ms").and_then(|m| m.as_u64()).unwrap_or(0),
-            chars: v.get("chars").and_then(|c| c.as_u64()).unwrap_or(0) as usize,
+        "turn.started" => Event::TurnStarted { session: sid },
+        "turn.delta" => Event::TurnDelta {
+            session: sid,
+            delta: s("delta"),
+            thinking: s("thinking"),
         },
-        "turn.failed" => Event::TurnFailed { session: s("session"), error: s("error") },
+        "turn.progress" => Event::TurnProgress { session: sid, stage: s("stage") },
+        "turn.tool" => {
+            let phase = s("phase");
+            let tool = s("tool");
+            let target = s("target");
+            let preview = s("preview");
+            let error = v
+                .get("data")
+                .and_then(|d| d.get("error"))
+                .or_else(|| v.get("error"))
+                .and_then(|e| e.as_bool())
+                .unwrap_or(false);
+            let duration_ms = n("duration_ms");
+            Event::TurnTool { session: sid, phase, tool, target, preview, error, duration_ms }
+        }
+        "turn.completed" => {
+            let text = s("text");
+            let model = s("model");
+            Event::TurnCompleted {
+                session: sid,
+                ms: {
+                    let d = n("duration_ms");
+                    if d > 0 { d } else { n("ms") }
+                },
+                chars: {
+                    let c = n("chars");
+                    if c > 0 { c as usize } else { text.len() }
+                },
+                text,
+                model,
+            }
+        }
+        "turn.failed" => Event::TurnFailed { session: sid, error: s("error") },
+        "turn.context" => {
+            let (used, max) = {
+                let u = n("context_tokens");
+                let u = if u > 0 { u } else { n("used") };
+                let m = n("max_tokens");
+                let m = if m > 0 { m } else { n("max") };
+                (u, m)
+            };
+            Event::Other { kind: "turn.context".into(), raw: serde_json::json!({"used": used, "max": max}).to_string() }
+        }
         "permission.asked" => Event::PermissionAsked {
-            req_id: s("req_id"), session: s("session"), tool: s("tool"), target: s("target"),
+            req_id: s("request_id").if_empty(s("req_id")),
+            session: sid,
+            tool: s("tool"),
+            target: s("target"),
         },
-        "permission.resolved" => Event::PermissionResolved { req_id: s("req_id"), decision: s("decision") },
+        "permission.resolved" => Event::PermissionResolved {
+            req_id: s("request_id").if_empty(s("req_id")),
+            decision: s("decision"),
+        },
         "question.asked" => Event::QuestionAsked {
-            req_id: s("req_id"),
-            session: s("session"),
-            questions: v.get("questions").and_then(|q| serde_json::from_value(q.clone()).ok()).unwrap_or_default(),
+            req_id: s("request_id").if_empty(s("req_id")),
+            session: sid,
+            questions: v
+                .get("data")
+                .and_then(|d| d.get("questions"))
+                .or_else(|| v.get("questions"))
+                .and_then(|q| q.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|q| QuestionView {
+                            question: q
+                                .get("question")
+                                .or_else(|| q.get("text"))
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .into(),
+                            header: q.get("header").and_then(|x| x.as_str()).unwrap_or("").into(),
+                            options: q.get("options").map(decode_options).unwrap_or_default(),
+                            multiple: q.get("multiple").and_then(|x| x.as_bool()).unwrap_or(false),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         },
+        "question.resolved" => Event::QuestionResolved { req_id: s("request_id").if_empty(s("req_id")) },
         "config.updated" => Event::ConfigUpdated { role: s("role"), model: s("model") },
         _ => Event::Other { kind: kind.into(), raw: v.to_string() },
+    }
+}
+
+trait IfEmpty {
+    fn if_empty(self, alt: String) -> String;
+}
+
+impl IfEmpty for String {
+    fn if_empty(self, alt: String) -> String {
+        if self.is_empty() {
+            alt
+        } else {
+            self
+        }
     }
 }
 
@@ -180,13 +334,21 @@ impl Sdk {
     }
 
     pub fn submit(&self, id: &str, text: &str, effort: &str) -> Result<SubmitOut, SdkError> {
+        self.submit_delivery(id, text, effort, "steer")
+    }
+
+    /// Submit with explicit inbox behavior: steer (default) joins the running
+    /// turn; queue chains behind it (Go PromptInput.Delivery parity).
+    pub fn submit_delivery(&self, id: &str, text: &str, effort: &str, delivery: &str) -> Result<SubmitOut, SdkError> {
         let res = Self::check(
             self.req(reqwest::Method::POST, &format!("/api/v1/sessions/{id}/prompt"))
-                .json(&serde_json::json!({"text": text, "effort": effort}))
+                .json(&serde_json::json!({"text": text, "effort": effort, "delivery": delivery}))
                 .send()?,
         )?;
         let v: serde_json::Value = res.json()?;
-        if v.get("queued").and_then(|q| q.as_bool()).unwrap_or(false) {
+        if v.get("status").and_then(|x| x.as_str()) == Some("queued")
+            || v.get("queued").and_then(|q| q.as_bool()).unwrap_or(false)
+        {
             return Ok(SubmitOut { text: String::new(), queued: true });
         }
         Ok(SubmitOut {
@@ -221,10 +383,20 @@ impl Sdk {
         Ok(())
     }
 
-    pub fn answer_question(&self, req_id: &str, answers: &[String]) -> Result<(), SdkError> {
+    pub fn answer_question(&self, req_id: &str, answers: &[Vec<String>]) -> Result<(), SdkError> {
         Self::check(
             self.req(reqwest::Method::POST, &format!("/api/v1/questions/{req_id}"))
                 .json(&serde_json::json!({"answers": answers}))
+                .send()?,
+        )?;
+        Ok(())
+    }
+
+    /// Close a question prompt without answers (Go DismissQuestion parity).
+    pub fn dismiss_question(&self, req_id: &str) -> Result<(), SdkError> {
+        Self::check(
+            self.req(reqwest::Method::POST, &format!("/api/v1/questions/{req_id}"))
+                .json(&serde_json::json!({"dismissed": true}))
                 .send()?,
         )?;
         Ok(())
@@ -331,6 +503,7 @@ impl Sdk {
         let token = self.token.clone();
         std::thread::spawn(move || {
             let mut backoff = Duration::from_secs(1);
+            let mut reconnected = false;
             loop {
                 let mut req = reqwest::blocking::Client::builder()
                     .timeout(None)
@@ -350,6 +523,12 @@ impl Sdk {
                     }
                 };
                 backoff = Duration::from_secs(1);
+                if reconnected {
+                    // Signal the UI to resync (running/modals) and repair the
+                    // transcript after a dropped stream (Go RequestResyncMsg).
+                    let _ = tx.send(Event::Other { kind: "sse.reconnected".into(), raw: String::new() });
+                }
+                reconnected = true;
                 use std::io::BufRead;
                 let reader = std::io::BufReader::new(resp);
                 let (mut kind, mut data) = (String::from("message"), String::new());

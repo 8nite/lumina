@@ -718,7 +718,9 @@ func (s *Server) runTurn(id string, in agent.TurnInput) {
 	if s.Exec == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// 120-round auto-continue turns can run long (slow gateways); 10m cut
+	// them mid-task and forced a manual `continue`. Give one turn 30m.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	out, err := s.Exec(ctx, id, in)
 	if err != nil {

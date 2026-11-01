@@ -1,11 +1,10 @@
 # Lumina — local-first AI coding & open-world agent harness
 
-> **Branch `rust-revamp`:** full Rust port of the Go daemon + CLI + TUI
-> (`src/`, `cargo build` → `target/debug/lumina`, or `make rust-build`).
-> The React SPA in `web/` is unchanged and embedded the same way. Go sources
-> remain for reference; `make build` still builds the Go binary, `make
-> rust-build` / `make rust-test` the Rust one. Both speak the same daemon API
-> (`GET /openapi.json`) and SQLite schema.
+> **Rust-first:** the daemon + CLI + TUI live in `src/` (`make build` →
+> `bin/lumina`, `make test` → `cargo test`, 89 green). The React SPA in `web/`
+> is unchanged and embedded the same way. Go sources (`cmd/`, `internal/`,
+> `pkg/`) remain for reference (`make build-go` / `make test-go`). Both speak
+> the same daemon API (`GET /openapi.json`) and SQLite schema.
 
 See `plan.md` for the full architecture & implementation plan,
 and `test-plan.md` for the verification matrix (all suites PASS).
@@ -13,7 +12,7 @@ and `test-plan.md` for the verification matrix (all suites PASS).
 ## Quickstart
 
 ```bash
-make build                       # web SPA + static Go binary -> bin/lumina
+make build                       # web SPA + Rust binary -> bin/lumina
 ./bin/lumina --help
 ./bin/lumina serve                # daemon on 127.0.0.1:7432
 ./bin/lumina run "explain this repo" --agent plan
@@ -281,21 +280,23 @@ context/delta/tool/completed/failed`, `permission.asked/resolved`, …).
   automatically; terminal `turn.completed`/`failed` is never shed).
 - **Non-loopback bind refused** — set `LUMINA_TOKEN` first, then
   `lumina attach http://<host>:7432` from the other machine.
-- **`session delete`** — not implemented via CLI; remove the row from
-  `lumina.db` (see `LUMINA_DB`) or use the daemon API.
+- **`session delete <id>`** — hard-deletes the session row + turns (also `DELETE /api/v1/sessions/{id}`).
 
 ## Layout
 
 - `cmd/lumina` — Go CLI: TUI, `run`, `serve`, `web`, `attach`, `session`, `plugin`, `kb`, `evolve`
 - `internal/*` — Go daemon packages (config, server, security, rules, plugins, llm, agent, tools, mcp, kb, harness, tui)
 - `pkg/sdk` — Go typed client for the daemon HTTP + SSE API
-- `src/` — **Rust port** (branch `rust-revamp`): `main.rs` (CLI), `server.rs`
-  (axum daemon), `security.rs` (fence), `config.rs`, `rules.rs`, `llm.rs`
-  (streaming + router), `agent.rs` (turn loop, subagents, compaction),
-  `tools.rs` (+`patch`, `todowrite`), `mcp.rs`, `plugins.rs` (Node bridge),
+- `src/` — **Rust daemon + CLI + TUI**: `main.rs` (CLI incl. `vault check`),
+  `server.rs` (axum daemon), `security.rs` (fence), `config.rs`, `rules.rs`,
+  `llm.rs` (streaming + router), `agent.rs` (turn loop, vault boundary, loop
+  guards, subagents, compaction), `vault.rs` (session secret vault +
+  `{placeholder_xxx}`), `tools.rs` (+`patch`, `todowrite`, `task_output`,
+  background `bash`/`subagent`), `mcp.rs`, `plugins.rs` (Node bridge),
   `kb.rs` (graphify RAG), `harness.rs` (Harness²), `checkpoints.rs`
-  (shadow-git), `store.rs` (rusqlite), `approve.rs` (permission broker),
-  `sdk.rs`, `tui.rs` (ratatui), `pty.rs`, `copilot.rs`, `websearch.rs`
+  (shadow-git), `store.rs` (rusqlite), `approve.rs` (permission broker +
+  question dismiss), `sdk.rs`, `tui.rs` (ratatui), `pty.rs`, `copilot.rs`,
+  `websearch.rs`
 - `web/` — React + Vite + Tailwind workspace SPA (embedded via `//go:embed` / `rust-embed`)
 - `memory/` — durable Markdown memory + `memory/graphify-out/`
 - `docs/` — screenshots and test evidence
