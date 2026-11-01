@@ -31,4 +31,4 @@ tags: [index, memory, lumina]
 - [[effort-stepdown]] — `chat_responses`/`chat_openai` retry down the effort ladder on effort-rejection 400s (`effort_step_down` + `is_effort_error`); live-verified `iceman` max → OK.
 - [[effort-ladder]] — Canonical effort ladder de-hardcoded (`none`→`max` union; verbatim advertised passthrough, per-model pickers, TUI 8-step `EFFORTS`).
 - [[session-resume-workspace]] — Web/CLI session resume mismatch (`.` vs absolute `workspace_dir`); `normalize_workspace()` in `src/store.rs` + legacy `.` fallback, regression test.
-- [[stuck-session-fix]] — Stuck-session fix (56d41a74): `read_repeat_nudge` (4th same-path read), SSE channel 256→1024, `:4089` owned by ai-manager — do not kill.
+- [[stuck-session-fix]] — Stuck-session fix (56d41a74): `read_repeat_nudge` (4th same-path read), SSE channel 256→1024, `:4089` owned by ai-manager — do not kill; + no-progress gate, TurnRelease guard, drive_one retry, request-id prompt idempotency (6ad0f21); + follow-up task inheritance + 12-round idle nudge (7614829e continue spin).

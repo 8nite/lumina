@@ -220,6 +220,13 @@
       "output_tokens": 0,
       "files": 28,
       "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 4 nodes added for stuck-session-fix.md"
+    },
+    {
+      "date": "2026-11-01T15:19:31.436170+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 1 node + 2 edges for prompt request-id idempotency (stuck-session-fix.md fourth case, 6ad0f21); deduped stale repeat lines; MEMORY.md index updated"
     }
   ],
   "total_input_tokens": 0,

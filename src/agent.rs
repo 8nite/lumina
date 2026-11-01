@@ -171,7 +171,19 @@ impl Runner {
                 });
             }
         }
-        for t in store.turns(session_id)? {
+        let history = store.turns(session_id)?;
+        // Follow-up prompts ("continue", "done?") carry no intent by
+        // themselves: inherit the session's original task for gate
+        // decisions, or the gates stay blind exactly when the user says
+        // the least (7614829e "continue" turn: 124 tools, zero edits, no
+        // gate fired). First non-tool user turn is the task by
+        // construction (tool results only ever follow a prompt).
+        let first_task = history
+            .iter()
+            .find(|t| t.role == "user" && !t.text.trim_start().starts_with("[tool result "))
+            .map(|t| t.text.clone())
+            .unwrap_or_default();
+        for t in &history {
             // Replay persisted history, skipping the user turn just stored
             // above (re-added below) to avoid sending it twice.
             // Vault boundary: the provider sees refs, never values.
@@ -180,7 +192,7 @@ impl Runner {
             }
             if t.role == "user" || t.role == "assistant" {
                 let sub = store.vault.substitute(session_id, &t.text).map_err(AgentError::Msg)?;
-                messages.push(llm::Message { role: t.role, content: sub, thinking: String::new() });
+                messages.push(llm::Message { role: t.role.clone(), content: sub, thinking: String::new() });
             }
         }
         // Vault boundary: store raw, send vaulted.
@@ -239,7 +251,10 @@ impl Runner {
         // No-progress gate input (stuck session 81bdb764: a fix request
         // ended after 11 explore calls with zero edits and duplicated
         // filler). Plan mode is research-only by design, so it is exempt.
-        let work_requested = agent != Agent::Plan && looks_like_work(&user_text);
+        // The original task counts, not just this prompt, so bare
+        // follow-ups ("continue") keep the gate armed.
+        let work_requested =
+            agent != Agent::Plan && (looks_like_work(&user_text) || looks_like_work(&first_task));
         let (final_text, usage) = self
             .loop_until_done(
                 router,
@@ -313,6 +328,12 @@ impl Runner {
         // rounds, then releases as-is (no breakage risk without changes,
         // so no pointer — unlike the unverified tail below).
         let mut progress_rounds = 0usize;
+        // Idle-round nudge (stuck session 7614829e "continue" turn: 124
+        // tools over ~40 rounds — 43 todowrite re-plans, 66 explore bashes
+        // — zero edits, no finish attempt for the end-gates to catch).
+        // Counts consecutive mutation-free rounds; task_output-only
+        // polling rounds are waiting, not idling, and don't count.
+        let mut idle_rounds = 0usize;
         // Same-file re-read ledger: paging one file with different
         // offsets evades the identical-call key above (the stuck session
         // re-read SessionView.tsx 10x). Nudge once per file per turn.
@@ -454,8 +475,19 @@ impl Runner {
                 }
                 snapshotted = true;
             }
+            let mut round_acted = false;
+            let mut round_only_polls = true;
             for tc in &calls {
                 on_stage(&format!("tool: {}", tool_label(&tc.name, &tc.args)));
+                if tc.name.eq_ignore_ascii_case("edit")
+                    || tc.name.eq_ignore_ascii_case("write")
+                    || tc.name.eq_ignore_ascii_case("patch")
+                {
+                    round_acted = true;
+                }
+                if !tc.name.eq_ignore_ascii_case("task_output") {
+                    round_only_polls = false;
+                }
                 // Resolve direction: the model only ever saw refs, so its
                 // args carry them. Resolve before execution (tools get
                 // values). Fail closed on vault errors.
@@ -570,6 +602,14 @@ impl Runner {
                 messages.push(llm::Message { role: "user".into(), content: tool_msg_sub, thinking: String::new() });
                 store.add_turn(session_id, "user", &tool_msg)?;
             }
+            // Idle accounting for the nudge below: a round that attempted
+            // a mutation resets the count; pure background-poll rounds
+            // neither reset nor advance it.
+            if round_acted {
+                idle_rounds = 0;
+            } else if !round_only_polls {
+                idle_rounds += 1;
+            }
             // Continuation nudge: the model must not stop with a partial
             // summary while work remains. Checkpoint every 8 rounds so long
             // tasks restate done-vs-remaining and keep going.
@@ -582,6 +622,16 @@ impl Runner {
                 nudge.push_str(&format!(
                     " Loop guard: this is the {repeat_streak}-th identical tool round in a row with no new result. Do NOT call the same tool with the same arguments again — change approach (different args or tool) or give the final text answer now."
                 ));
+            }
+            // Idle-round nudge: advisory only (research turns legitimately
+            // explore), but a work request 12 rounds deep with zero edits
+            // is spinning — prod it to act or name the blocker. Fires every
+            // 12th idle round so long loops keep getting prodded.
+            if work_requested && idle_rounds > 0 && idle_rounds.is_multiple_of(12) {
+                nudge.push_str(&format!(
+                    " Progress note: {idle_rounds} rounds with no edit/write/patch yet — if exploration is done, make the change now (then verify it); otherwise state what is still missing."
+                ));
+                on_stage("idling…");
             }
             // Steered input joins the active turn (Go takeSteered parity):
             // stored raw, sent vaulted, answered before anything else.
@@ -1600,6 +1650,109 @@ mod guard_tests {
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1, "no guard round trip for plain answers");
         assert_eq!(out.text, "sunny");
+    }
+
+    /// Task inheritance: a bare follow-up ("continue") keeps the
+    /// no-progress gate armed via the session's original task (stuck
+    /// session 7614829e "continue" turn: 124 tools, zero edits, silent).
+    #[tokio::test]
+    async fn followup_inherits_work_from_original_task() {
+        let (router, cfg, hits) = scripted_e2e(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"still fine\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"still fine\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"blocked: need the file\"}}]}\n\n",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        store.add_turn(&sess.id, "user", "fix the orange glow").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, "continue", "", &[], |_, _| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "bare follow-up must still force action rounds");
+        assert!(out.text.contains("blocked: need the file"), "released with the final text, got {out:?}");
+        let turns = store.turns(&sess.id).unwrap();
+        assert_eq!(
+            turns.iter().filter(|t| t.text.contains("No changes made yet")).count(),
+            2,
+            "both action demands must hit the transcript"
+        );
+    }
+
+    /// Idle-round nudge: 12 mutation-free rounds on a work request prod
+    /// the model mid-loop (observable as an `idling…` stage); the turn
+    /// still ends through the normal no-progress gate afterwards.
+    #[tokio::test]
+    async fn idle_rounds_nudge_then_gate_releases() {
+        let mut payloads: Vec<String> = (0..12)
+            .map(|i| {
+                let body = serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": i.to_string(),
+                                "function": {
+                                    "name": "read",
+                                    "arguments": serde_json::json!({"path": format!("a{i:02}.txt")}).to_string()
+                                }
+                            }]
+                        }
+                    }]
+                });
+                format!("data: {body}\n\n")
+            })
+            .collect();
+        // scripted_e2e takes 'static strs; leak the round payloads.
+        let leaked: Vec<&'static str> = payloads
+            .drain(..)
+            .map(|s| Box::leak(s.into_boxed_str()) as &'static str)
+            .collect();
+        let mut all = leaked;
+        all.push("data: {\"choices\":[{\"delta\":{\"content\":\"almost\"}}]}\n\n");
+        all.push("data: {\"choices\":[{\"delta\":{\"content\":\"almost\"}}]}\n\n");
+        all.push("data: {\"choices\":[{\"delta\":{\"content\":\"done-ish\"}}]}\n\n");
+        let (router, cfg, hits) = scripted_e2e(all);
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..12 {
+            std::fs::write(dir.path().join(format!("a{i:02}.txt")), "x").unwrap();
+        }
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let runner = Runner::new();
+        let stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let s2 = stages.clone();
+        let out = runner
+            .run_prompt(
+                &store,
+                &router,
+                &cfg,
+                &sess.id,
+                "fix the thing",
+                "",
+                &[],
+                |_, _| {},
+                move |st: &str| {
+                    s2.lock().unwrap().push(st.to_string());
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 15, "12 reads + 2 refused finishes + release");
+        assert!(
+            stages.lock().unwrap().iter().any(|s| s.contains("idling")),
+            "idle nudge must surface as a stage, got {:?}",
+            stages.lock().unwrap()
+        );
+        assert!(out.text.contains("done-ish"), "released with the final text, got {out:?}");
     }
 }
 

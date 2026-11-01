@@ -1110,7 +1110,7 @@
    "contributor": null,
    "file_type": "concept",
    "norm_label": "tui default effort xhigh",
-   "rationale": "TUI default effort ''\u2192xhigh in Go New(), Rust App, and web; /effort auto still resets to provider default; matrix tests updated.",
+   "rationale": "TUI default effort ''→xhigh in Go New(), Rust App, and web; /effort auto still resets to provider default; matrix tests updated.",
    "source_file": "resync-variants.md",
    "source_location": "resync-variants.md:14",
    "source_url": null
@@ -2046,6 +2046,51 @@
    "rationale": "round-N model-call failure retried once after 5s cooldown, then persisted as Turn failed assistant turn with resume pointer so mid-work deaths leave a transcript trace; daemon stderr kept at .lumina/daemon.log.",
    "source_file": "stuck-session-fix.md",
    "source_location": "stuck-session-fix.md:third-case",
+   "source_url": null
+  },
+  {
+   "id": "stuck_prompt_idempotency",
+   "label": "Prompt Request-ID Idempotency (duplicate submit 7614829e, landed 6ad0f21)",
+   "author": null,
+   "captured_at": "2026-11-01",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": null,
+   "file_type": "concept",
+   "norm_label": "prompt request-id idempotency duplicate submit",
+   "rationale": "Same prompt POSTed twice while running:true steered into the live run; client/SDK retry re-POST flaw. Fix: one request_id per submit reused across retries, daemon {session,request_id} 600s seen-key answers resubmit with live status + deduped:true without touching inbox/claim/queue; App send single-flights. Test prompt_idempotency_dedups_within_ttl.",
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:fourth-case",
+   "source_url": null
+  },
+  {
+   "id": "stuck_followup_task_inheritance",
+   "label": "Follow-up Task Inheritance (bare continue keeps gate armed, 7614829e)",
+   "author": null,
+   "captured_at": "2026-11-01",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": null,
+   "file_type": "concept",
+   "norm_label": "follow-up task inheritance bare continue gate",
+   "rationale": "First non-tool user turn is the session task; work_requested = looks_like_work(prompt) OR looks_like_work(first_task), so bare follow-ups (continue) keep the no-progress gate armed. Test followup_inherits_work_from_original_task.",
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:fifth-case",
+   "source_url": null
+  },
+  {
+   "id": "stuck_idle_round_nudge",
+   "label": "Idle-Round Nudge (12 mutation-free rounds prod, 7614829e)",
+   "author": null,
+   "captured_at": "2026-11-01",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": null,
+   "file_type": "concept",
+   "norm_label": "idle-round nudge mutation-free prod",
+   "rationale": "Consecutive mutation-free rounds counter (edit/write/patch resets; task_output-only polls neither reset nor advance); work request 12 idle rounds deep injects advisory prod (idling stage) every 12th round. Test idle_rounds_nudge_then_gate_releases; turn still ends via no-progress gate.",
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:fifth-case",
    "source_url": null
   }
  ],
@@ -3808,6 +3853,54 @@
    "source_file": "stuck-session-fix.md",
    "source_location": "stuck-session-fix.md:third-case",
    "weight": 1.0
+  },
+  {
+   "source": "stuck_prompt_idempotency",
+   "target": "stuck_drive_one_retry",
+   "relation": "references",
+   "confidence": "EXTRACTED",
+   "confidence_score": 1.0,
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:fourth-case"
+  },
+  {
+   "source": "stuck_prompt_idempotency",
+   "target": "loops_turn_claim",
+   "relation": "references",
+   "confidence": "EXTRACTED",
+   "confidence_score": 1.0,
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:fourth-case"
+  },
+  {
+   "source": "stuck_followup_task_inheritance",
+   "target": "stuck_no_progress_gate",
+   "relation": "extends",
+   "confidence": "EXTRACTED",
+   "confidence_score": 1.0,
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:fifth-case",
+   "weight": 1.0
+  },
+  {
+   "source": "stuck_idle_round_nudge",
+   "target": "stuck_no_progress_gate",
+   "relation": "extends",
+   "confidence": "EXTRACTED",
+   "confidence_score": 1.0,
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:fifth-case",
+   "weight": 1.0
+  },
+  {
+   "source": "stuck_idle_round_nudge",
+   "target": "loop_identical_guard",
+   "relation": "references",
+   "confidence": "EXTRACTED",
+   "confidence_score": 1.0,
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:fifth-case",
+   "weight": 1.0
   }
  ],
  "hyperedges": [
@@ -3867,5 +3960,5 @@
    "source_file": "prompt-e2e.md"
   }
  ],
- "built_at_commit": "147f6c88aa715262a87986e9694a27654a8365c6"
+ "built_at_commit": "6ad0f211751b8832ee943f265614faa800298e84"
 }

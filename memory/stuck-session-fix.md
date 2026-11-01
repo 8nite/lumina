@@ -116,8 +116,6 @@ Err path persisted nothing (turn.failed is SSE-only). Fix in
 `tracing::warn!` (daemon stderr now kept at `.lumina/daemon.log`).
 Tests: `drive_one_retries_transient_failure` (500 then green),
 `drive_one_persists_failure_note` (500 always → 2 attempts + note).
-81bdb764 quit-early case: fix request ended after 11 explore calls, zero edits, duplicated filler. Added no-progress gate (looks_like_work, 2 forced rounds, silent release) + TurnRelease Drop guard so a panicking drain never wedges the session. Backend-continuation audit: detached drain survives browser close; approval/question bounded 600s.
-d3539f35: turn died on model-call error with no transcript trace. drive_one now retries once after 5s then persists Turn failed note with resume pointer. Daemon stderr kept at .lumina/daemon.log.
 
 ## Fourth case (7614829e, 2026-11-01): same prompt submitted twice
 
@@ -136,3 +134,35 @@ live status (`steered`/`accepted` + `deduped:true`) without touching the
 inbox, claim, or queue. `web/src/App.tsx` `send()` additionally
 single-flights concurrent submits. Test:
 `prompt_idempotency_dedups_within_ttl`.
+7614829e duplicate-prompt fix landed (6ad0f21): request_id idempotency in daemon prompt (seen-key map 600s, deduped status), client and SDK reuse one key across retries, App send single-flights. Live-verified deduped:true on resubmit. Cargo 122 pass, clippy at baseline, web tsc+build green.
+
+## Fifth case (7614829e, 2026-11-01): bare "continue" spun 124 tools, zero edits, no gate
+
+Same orange-glow session: a follow-up `continue` prompt carries no intent
+by itself, so `looks_like_work("continue")` is false and the no-progress
+gate stayed disarmed while the model ran ~40 rounds (43 todowrite
+re-plans, 66 explore bashes, SessionView re-reads) with zero edits and no
+finish attempt for the end-gates to catch. Fix in `src/agent.rs`
+(uncommitted): inherit the session's original task — first non-tool `user`
+turn — for gate decisions (`work_requested` = current prompt OR first
+task); plus an idle-round nudge — consecutive mutation-free rounds counter
+(`edit`/`write`/`patch` resets; `task_output`-only polling rounds neither
+reset nor advance), advisory prod every 12th idle round on work requests
+(`idling…` stage). Tests:
+`followup_inherits_work_from_original_task` (bare follow-up forces action
+rounds, both demands hit transcript), `idle_rounds_nudge_then_gate_releases`
+(12 reads surface `idling` stage, turn still ends via no-progress gate).
+
+## Fifth case (7614829e "continue" turn, 2026-11-01): gates blind on follow-ups + todo/bash spin
+
+"continue" turn ran 15:20:10→15:31:50 (~124 tools: 43 todowrite re-plans
+stuck at 0/3, 66 explore bashes, 9 reads, 6 greps), zero edits, ended
+with duplicated filler and no gate fired — the prompt text "continue"
+matches no work keyword, so `work_requested` was false. Fixes in
+`src/agent.rs`: (1) inherit the session's original task (first non-tool
+user turn) for gate decisions, so bare follow-ups keep both end-gates
+armed; (2) idle-round nudge — consecutive mutation-free rounds on a work
+request append an advisory prod every 12th round (`idling…` stage;
+task_output-only polls don't count). Tests:
+`followup_inherits_work_from_original_task`,
+`idle_rounds_nudge_then_gate_releases`.
