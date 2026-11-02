@@ -156,8 +156,9 @@ function ToolRow(props: { name: string; body: string; error: boolean; live?: boo
   const [open, setOpen] = useState(false);
   const summary = oneLine(props.body) || (props.live ? 'running…' : '(no output)');
   const shell = props.name === 'bash' || props.name === 'task_output';
+  const color = props.error ? '#ef4444' : toolColor(props.name);
   return (
-    <div className="rounded-[6px] border border-[var(--v2-border-base)]">
+    <div className="rounded-[6px] border border-[var(--v2-border-base)]" style={{ borderLeft: `2px solid ${color}` }}>
       <button
         className="flex w-full items-center gap-1.5 px-2 py-1 text-left"
         onClick={() => setOpen(!open)}
@@ -165,14 +166,14 @@ function ToolRow(props: { name: string; body: string; error: boolean; live?: boo
         aria-expanded={open}
       >
         <span
-          className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${props.error ? 'bg-red-500' : props.live ? 'animate-pulse bg-amber-400' : ''}`}
-          style={!props.error && !props.live ? { background: toolColor(props.name) } : undefined}
+          className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${props.error ? 'bg-red-500' : props.live ? 'animate-pulse' : ''}`}
+          style={{ background: props.live && !props.error ? 'var(--c-warn)' : color }}
         />
-        <span className="shrink-0 font-mono text-[11px] font-medium" style={{ color: props.error ? '#ef4444' : toolColor(props.name) }}>{props.name}</span>
+        <span className="shrink-0 font-mono text-[11px] font-medium" style={{ color }}>{props.name}</span>
         <span
           dir="auto"
-          className={`min-w-0 flex-1 truncate text-[11px] ${shell ? 'font-mono text-[var(--v2-text-base)]' : 'text-[var(--v2-text-muted)]'}`}
-          style={shell ? { fontWeight: 440, letterSpacing: '-0.04px' } : undefined}
+          className={`min-w-0 flex-1 truncate text-[11px] ${shell ? 'font-mono' : ''}`}
+          style={{ color, fontWeight: 440, letterSpacing: '-0.04px' }}
         >
           {summary}
         </span>
@@ -231,7 +232,11 @@ function TodoPill(props: { turns: Turn[] }) {
   let raw: string | null = null;
   for (let i = props.turns.length - 1; i >= 0; i--) {
     const t = props.turns[i];
-    if ((t.role === 'tool' || t.role === 'tool_error') && parseTool(t.text).name === 'todowrite') {
+    // Persisted tool outputs are stored as `user` turns (`[tool result …]`,
+    // see isToolTurn below); live SSE rows arrive as `tool`/`tool_error`.
+    // Matching only `tool` roles loses the whole history on every
+    // `turn.completed` reconcile, so the pill can never settle at 3/3.
+    if ((t.role === 'tool' || t.role === 'tool_error' || (t.role === 'user' && isToolText(t.text))) && parseTool(t.text).name === 'todowrite') {
       raw = parseTool(t.text).body;
       break;
     }
@@ -256,7 +261,7 @@ function TodoPill(props: { turns: Turn[] }) {
             <path d="M5 8 7.5 11 11 5.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" />
           )}
         </svg>
-        {done && <span className="shrink-0 tabular-nums text-[var(--v2-text-muted)]">{done[1]}/{done[2]}</span>}
+        {done && <span className="shrink-0 tabular-nums" style={{ color: 'var(--c-edit)', fontWeight: 600 }}>{done[1]}/{done[2]}</span>}
         {active && <span dir="auto" className="min-w-0 max-w-[260px] truncate text-[var(--v2-text-base)]">{active}</span>}
       </button>
       {open && (
@@ -302,6 +307,9 @@ export function SessionView(props: {
   // v2 working-event formats: terminal error, per-turn file changes, queued prompts.
   error: string | null;
   onRetry: () => void;
+  onStop: () => void;
+  onSteerQueued: (i: number) => void;
+  onCancelQueued: (i: number) => void;
   changed: { files: string[]; stat: string } | null;
   queue: QueuedPrompt[];
   onFile?: (t: FileTarget) => void;
@@ -394,7 +402,7 @@ export function SessionView(props: {
               const run = [t.agent, shortModel(t.model), fmtTime(t.created_at)].filter(Boolean).join(' · ');
               return (
                 <div key={i}>
-                  {run && <div className="mb-1 text-[12px] text-[var(--v2-text-faint)]">{run}</div>}
+                  {run && <div className="mb-1 text-[12px] font-medium" style={{ color: 'var(--c-read)' }}>{run}</div>}
                   <div
                     className="rounded-[8px] px-4 py-3 text-[13px] leading-5 text-[var(--v2-text-base)] select-text"
                     style={{ background: 'var(--user-bubble)', border: '1px solid var(--user-border)' }}
@@ -428,7 +436,7 @@ export function SessionView(props: {
                     : [];
               return (
                 <div key={i}>
-                  <div className="mb-1 text-[12px] text-[var(--v2-text-faint)]">thinking</div>
+                  <div className="mb-1 text-[12px] font-medium" style={{ color: 'var(--c-mem)' }}>thinking</div>
                   <div
                     className="space-y-1 rounded-[8px] px-4 py-3 text-[13px] leading-5 text-[var(--v2-text-muted)] select-text"
                     style={{ background: 'var(--v2-bg-base)', border: '1px dashed var(--v2-border-base)' }}
@@ -454,7 +462,7 @@ export function SessionView(props: {
                 </div>
                 {i === lastAssistant && !props.working && (
                   <div className="flex items-center gap-2 text-[12px] text-[var(--v2-text-faint)]">
-                    {summaryText && <span>{summaryText}</span>}
+                    {summaryText && <span style={{ color: 'var(--c-agent)' }}>{summaryText}</span>}
                     {fmtTime(t.created_at) && <span>{fmtTime(t.created_at)}</span>}
                     <button className="v2-row rounded px-1.5 py-0.5 hover:text-[var(--v2-text-base)]" onClick={copyLast} title="Copy response">
                       {copied ? 'Copied ✓' : '⧉ Copy'}
@@ -522,12 +530,12 @@ export function SessionView(props: {
             <div className="mb-1 flex h-9 items-center gap-2 text-[13px]">
               <span className="v2-shimmer font-medium" role="status">Working</span>
               {props.elapsedMs > 0 && (
-                <span className="text-[12px] tabular-nums text-[var(--v2-text-muted)]">{Math.floor(props.elapsedMs / 1000)}s</span>
+                <span className="text-[12px] tabular-nums" style={{ color: 'var(--c-shell)', fontWeight: 600 }}>{Math.floor(props.elapsedMs / 1000)}s</span>
               )}
-              {props.stage && <span className="truncate text-[12px] text-[var(--v2-text-muted)]">· {props.stage}</span>}
+              {props.stage && <span className="truncate text-[12px]" style={{ color: 'var(--c-search)' }}>· {props.stage}</span>}
               <span className="flex-1" />
               {formatCtx(props.ctx) && (
-                <span className="rounded border border-[var(--v2-border-base)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--v2-text-muted)]">
+                <span className="rounded border px-1.5 py-0.5 font-mono text-[11px]" style={{ borderColor: 'var(--c-agent)', color: 'var(--c-agent)' }}>
                   {formatCtx(props.ctx)}
                 </span>
               )}
@@ -545,12 +553,6 @@ export function SessionView(props: {
                   />
                 ))}
               </div>
-            )}
-            {props.liveThinking && (
-              <details className="mb-2 text-[12px] text-[var(--v2-text-muted)]">
-                <summary className="cursor-pointer hover:text-[var(--v2-text-base)]">thinking</summary>
-                <div className="mt-1 whitespace-pre-wrap select-text">{props.liveThinking.slice(-2000)}</div>
-              </details>
             )}
             {props.liveText && (
               <div className="whitespace-pre-wrap text-[13px] leading-5 text-[var(--v2-text-base)] select-text">
@@ -578,7 +580,7 @@ export function SessionView(props: {
               </span>
             )}
             {props.queue.length > 0 && (
-              <span className="rounded-full border border-[var(--v2-border-base)] px-2.5 py-1 text-[12px] tabular-nums text-[var(--v2-text-muted)]" style={{ background: 'var(--v2-bg-base)' }}>
+              <span className="rounded-full border border-[var(--v2-border-base)] px-2.5 py-1 text-[12px] tabular-nums" style={{ background: 'var(--v2-bg-base)', color: 'var(--c-warn)', fontWeight: 600 }}>
                 {props.queue.length} queued
               </span>
             )}
@@ -587,8 +589,8 @@ export function SessionView(props: {
           </div>
         )}
         {/* v2 queue panel: attached surface above the composer listing prompts
-            queued behind the active turn. Display-only: the daemon has no
-            queue reorder/cancel endpoint, so rows offer no actions. */}
+            queued behind the active turn. Each row can steer into the running
+            turn now or cancel back into the composer. */}
         {props.queue.length > 0 && (
           <div
             className="relative z-0 -mb-3 rounded-t-[12px] bg-[var(--v2-bg-base)] px-1.5 pt-1.5 shadow-[var(--v2-elevation-raised)]"
@@ -617,6 +619,26 @@ export function SessionView(props: {
                       </span>
                     )}
                   </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {q.files.length === 0 && (
+                      <button
+                        className="rounded px-1.5 py-0.5 text-[11px] font-medium hover:opacity-80"
+                        style={{ color: 'var(--c-search)' }}
+                        title="Inject into the running turn now"
+                        onClick={() => props.onSteerQueued(i)}
+                      >
+                        Steer
+                      </button>
+                    )}
+                    <button
+                      className="rounded px-1.5 py-0.5 text-[11px] font-medium hover:opacity-80"
+                      style={{ color: '#ef4444' }}
+                      title="Remove from queue — text returns to the message box"
+                      onClick={() => props.onCancelQueued(i)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
@@ -633,6 +655,7 @@ export function SessionView(props: {
             value={props.input}
             onChange={props.onInput}
             onSend={props.onSend}
+            onStop={props.onStop}
             agent={props.agent}
             onAgent={props.onAgent}
             model={props.model}

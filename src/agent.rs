@@ -32,12 +32,31 @@ pub struct TurnOutcome {
 pub enum AgentError {
     #[error("agent: {0}")]
     Msg(String),
+    /// Cooperative stop (POST /stop): not a failure — the turn ends
+    /// cleanly with a "Stopped by user." note, no retry.
+    #[error("stopped by user")]
+    Stopped,
     #[error(transparent)]
     Llm(#[from] llm::LlmError),
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
     #[error(transparent)]
     Tool(#[from] crate::tools::ToolError),
+}
+
+/// Assistant text persisted (and SSE-completed) when a stop lands.
+pub const STOPPED_TEXT: &str = "Stopped by user.";
+
+/// Persist a cooperative stop: flush pending reasoning, then a plain
+/// assistant note so the transcript (and `continue`) reads sanely.
+fn persist_stopped(store: &Store, session_id: &str, thinking_buf: &str) {
+    if !thinking_buf.trim().is_empty() {
+        let capped: String = thinking_buf.chars().take(4000).collect();
+        if let Ok(resolved) = store.vault.resolve(session_id, &capped) {
+            let _ = store.add_turn(session_id, "thinking", &resolved);
+        }
+    }
+    let _ = store.add_turn(session_id, "assistant", STOPPED_TEXT);
 }
 
 pub struct Runner {
@@ -74,8 +93,8 @@ impl Runner {
             ToolSpec { name: "grep".into(), description: "Regex-search workspace files.".into(), schema: obj(&["pattern", "include"]) },
             ToolSpec { name: "lsp".into(), description: "Code intelligence: symbols/refs (grep-backed alias).".into(), schema: obj(&["pattern", "include"]) },
             ToolSpec { name: "glob".into(), description: "List workspace paths by glob.".into(), schema: obj(&["pattern"]) },
-            ToolSpec { name: "kb_query".into(), description: "Query Markdown+graphify memory before grepping code. Prefer for durable knowledge.".into(), schema: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}, "budget": {"type": "integer"}}}) },
-            ToolSpec { name: "memory_write".into(), description: "Save a durable fact to ./memory/<topic>.md (deduped, secrets rejected).".into(), schema: obj(&["topic", "content"]) },
+            ToolSpec { name: "kb_query".into(), description: "Query the workspace knowledge base (Markdown+graphify) AFTER intent is known. Only when AGENTS.md/rules declare a KB dir; the tool says when no KB is configured (then skip). One call with request keywords, budget 4000; follow [[wikilinks]] only if needed.".into(), schema: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}, "budget": {"type": "integer"}}}) },
+            ToolSpec { name: "memory_write".into(), description: "Save a durable fact to the rule-declared KB dir (<kb>/<topic>.md, deduped, secrets rejected). Post-completion only after a verified fix; never mid-turn speculation.".into(), schema: obj(&["topic", "content"]) },
             ToolSpec { name: "skill".into(), description: "Load a full SKILL.md body by name (only name+description are advertised).".into(), schema: obj(&["name"]) },
             ToolSpec { name: "question".into(), description: "Ask the user clarifying questions (interactive sessions only). Options are {label, description}; multiple:true allows several picks; headless runs get best-guess guidance.".into(), schema: serde_json::json!({"type": "object", "properties": {"questions": {"type": "array", "items": {"type": "object", "properties": {"question": {"type": "string"}, "header": {"type": "string"}, "multiple": {"type": "boolean"}, "options": {"type": "array", "items": {"type": "object", "properties": {"label": {"type": "string"}, "description": {"type": "string"}}, "required": ["label"]}}}, "required": ["question"]}}}, "required": ["questions"]}) },
             ToolSpec { name: "websearch".into(), description: "Search the web for current info (needs a provider key; pick with [websearch] provider).".into(), schema: obj(&["query", "provider"]) },
@@ -100,7 +119,7 @@ impl Runner {
         if agent == Agent::Plan {
             s.push_str("PLAN MODE: research and blueprint only. Never edit source files; scoped writes to plan.md or .lumina/plans/*.md only.\n");
         }
-        s.push_str("Tool guidance: use native tools, not bash equivalents — read (not bash cat/head/tail), grep (not bash grep/rg), glob (not bash find/ls); prefer kb_query over grep for durable knowledge; batch independent reads; quote file:line references. After tool results arrive, keep going until done; call more tools if anything remains.\n");
+        s.push_str("Tool guidance: use native tools, not bash equivalents — read (not bash cat/head/tail), grep (not bash grep/rg), glob (not bash find/ls); KB protocol is lazy: read the user request FIRST, use `question` when intent is ambiguous, then at most one `kb_query` with request keywords (budget 4000) and only when a KB is configured (the tool reports when none exists — then skip KB and proceed with code/tools); never preload memory bodies into the prompt, carry IDs/stubs; `memory_write` runs post-completion only after a verified fix, never mid-turn speculation; batch independent reads; quote file:line references. After tool results arrive, keep going until done; call more tools if anything remains.\n");
         s.push_str(crate::vault::VAULT_GUIDANCE);
         s.push('\n');
         s.push_str(&bundle.skills_block());
@@ -218,10 +237,13 @@ impl Runner {
         // turn total below (background deliveries included).
         let sub_usage = std::sync::Arc::new(std::sync::Mutex::new(crate::llm::Usage::default()));
         let sub_usage_exec = sub_usage.clone();
+        let kb_override = cfg.kb.memory_dir.clone();
         let reg = Registry {
-            kb_query: Some(std::sync::Arc::new(|ws, q, b| {
-                crate::kb::query(ws, q, b).map_err(|e| e.to_string())
+            kb_query: Some(std::sync::Arc::new(move |ws, q, b| {
+                let ov = if kb_override.trim().is_empty() { None } else { Some(kb_override.as_str()) };
+                crate::kb::query_in(ws, q, b, ov).map_err(|e| e.to_string())
             })),
+            kb_memory_dir: cfg.kb.memory_dir.clone(),
             bundle: Some(bundle),            websearch_provider: cfg.websearch.provider.clone(),
             websearch_disabled: cfg.websearch.disabled,
             plugins: self.plugins.clone(),
@@ -380,6 +402,13 @@ impl Runner {
         // 4 edits). Nudge once per turn, then stay quiet.
         let mut bash_nudged = false;
         for round in 0..self.max_steps {
+            // Cooperative stop (web Stop button / POST /stop): end the
+            // turn at the next round boundary instead of running to the
+            // step ceiling.
+            if store.stop_requested(session_id) {
+                persist_stopped(store, session_id, &thinking_buf);
+                return Err(AgentError::Stopped);
+            }
             let (tx, mut rx) = mpsc::unbounded_channel::<Chunk>();
             let req = Request {
                 model: model.into(),
@@ -402,7 +431,22 @@ impl Runner {
             }
         });
             let mut calls = Vec::new();
-            while let Some(c) = rx.recv().await {
+            // Poll the stream with a short timeout so a pending stop lands
+            // mid-response instead of waiting out the 600s stream timeout.
+            let mut stopped_midstream = false;
+            loop {
+                let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+                let c = match chunk {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break, // pump finished
+                    Err(_) => {
+                        if store.stop_requested(session_id) {
+                            stopped_midstream = true;
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 if !c.delta.is_empty() || !c.thinking.is_empty() {
                     on_event(&c.delta, &c.thinking);
                     last_text.push_str(&c.delta);
@@ -414,6 +458,11 @@ impl Runner {
                 if c.done {
                     break;
                 }
+            }
+            if stopped_midstream {
+                handle.abort();
+                persist_stopped(store, session_id, &thinking_buf);
+                return Err(AgentError::Stopped);
             }
             let u = handle
                 .await
@@ -1154,9 +1203,14 @@ async fn run_subtask(
         })
         .collect();
     let reg = Registry {
-        kb_query: Some(std::sync::Arc::new(|ws, q, b| {
-            crate::kb::query(ws, q, b).map_err(|e| e.to_string())
-        })),
+        kb_query: Some({
+            let kb_override = cfg.kb.memory_dir.clone();
+            std::sync::Arc::new(move |ws, q, b| {
+                let ov = if kb_override.trim().is_empty() { None } else { Some(kb_override.as_str()) };
+                crate::kb::query_in(ws, q, b, ov).map_err(|e| e.to_string())
+            })
+        }),
+        kb_memory_dir: cfg.kb.memory_dir.clone(),
         bundle: Some(bundle),
         websearch_provider: cfg.websearch.provider.clone(),
         websearch_disabled: cfg.websearch.disabled,

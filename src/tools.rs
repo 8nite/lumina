@@ -55,6 +55,9 @@ pub struct Outcome {
 pub struct Registry {
     /// Attached KB engine (agent wires `kb::query` here; absent → clean error).
     pub kb_query: Option<KbQueryFn>,
+    /// Explicit KB dir override (colon-separated, from `[kb] memory_dir`).
+    /// Empty = rule-md + `LUMINA_MEMORY_DIR` + legacy resolution in `kb`.
+    pub kb_memory_dir: String,
     /// Loaded skill/agent/command bundle for the `skill` tool.
     pub bundle: Option<Bundle>,
     /// `[websearch] provider` selection ("" = auto across keyed providers).
@@ -95,7 +98,7 @@ pub type KbQueryFn = Arc<dyn Fn(&Path, &str, usize) -> Result<String, String> + 
 
 impl Registry {
     pub fn new() -> Self {
-        Self { kb_query: None, bundle: None, websearch_provider: String::new(), websearch_disabled: false, plugins: None, subagent: None, disabled_tools: HashSet::new() }
+        Self { kb_query: None, kb_memory_dir: String::new(), bundle: None, websearch_provider: String::new(), websearch_disabled: false, plugins: None, subagent: None, disabled_tools: HashSet::new() }
     }
 
     pub fn call(
@@ -175,7 +178,7 @@ impl Registry {
             "grep" | "lsp" => do_grep(sc, &args),
             "glob" => do_glob(sc, &args),
             "kb_query" => do_kb_query(self, sc, &args),
-            "memory_write" => do_memory_write(sc, &args),
+            "memory_write" => do_memory_write(self, sc, &args),
             "skill" => do_skill(self, &args),
             "question" => do_question(sc, &args),
             "websearch" => do_websearch(self, &args),
@@ -888,10 +891,11 @@ fn do_kb_query(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::V
         .map_err(ToolError::Msg)
 }
 
-fn do_memory_write(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+fn do_memory_write(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
     let topic = str_arg(args, &["topic", "name"]);
     let content = str_arg(args, &["content", "body"]);
-    crate::kb::memory_write(&sc.workspace, &topic, &content)
+    let ov = if reg.kb_memory_dir.trim().is_empty() { None } else { Some(reg.kb_memory_dir.as_str()) };
+    crate::kb::memory_write_in(&sc.workspace, &topic, &content, ov)
         .map(|s| Outcome { output: s, truncated: false })
         .map_err(|e| ToolError::Msg(e.to_string()))
 }
@@ -1597,6 +1601,42 @@ mod extended_tests {
         assert!(reg.call(&ctx2(d.path()), "todowrite", &empty).is_err());
         let out = reg.call(&ctx2(d.path()), "todowrite", &HashMap::new()).unwrap();
         assert_eq!(out.output, "Todos cleared");
+    }
+
+    #[test]
+    fn todos_progress_reaches_3_of_3() {
+        // The web TodoPill parses the LATEST todowrite output with
+        // `(\d+)\/(\d+) completed` and shows `In progress: …` when present:
+        // a full run must end in exactly "3/3 completed" with no stale tail.
+        let d = tempfile::tempdir().unwrap();
+        let reg = Registry::new();
+        let sc = ctx2(d.path());
+        let send = |items: serde_json::Value| {
+            let mut a = HashMap::new();
+            a.insert("todos".into(), items);
+            reg.call(&sc, "todowrite", &a).unwrap().output
+        };
+        let out = send(serde_json::json!([
+            {"content": "a", "status": "completed"},
+            {"content": "b", "status": "in_progress"},
+            {"content": "c", "status": "pending"},
+        ]));
+        assert!(out.contains("Todos updated: 1/3 completed"), "{out}");
+        assert!(out.contains("In progress: b"), "{out}");
+        let out = send(serde_json::json!([
+            {"content": "a", "status": "completed"},
+            {"content": "b", "status": "completed"},
+            {"content": "c", "status": "in_progress"},
+        ]));
+        assert!(out.contains("Todos updated: 2/3 completed"), "{out}");
+        assert!(out.contains("In progress: c"), "{out}");
+        let out = send(serde_json::json!([
+            {"content": "a", "status": "completed"},
+            {"content": "b", "status": "completed"},
+            {"content": "c", "status": "completed"},
+        ]));
+        assert!(out.contains("Todos updated: 3/3 completed"), "{out}");
+        assert!(!out.contains("In progress"), "{out}");
     }
 
     #[test]

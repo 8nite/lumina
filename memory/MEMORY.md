@@ -34,3 +34,5 @@ tags: [index, memory, lumina]
 - [[stuck-session-fix]] — Stuck-session fix (56d41a74): `read_repeat_nudge` (4th same-path read), SSE channel 256→1024, `:4089` owned by ai-manager — do not kill; + no-progress gate, TurnRelease guard, drive_one retry, request-id prompt idempotency (6ad0f21); + follow-up task inheritance + 12-round idle nudge (7614829e continue spin); + subagent budget 8 / proxy-read ledger / mid-loop verify prod (cc686408, uncommitted).
 - [[loop-harness-audit]] — Turn-loop vs reference-agent audit (12 fixes: atomic compaction, turn-reuse retry, loop guards, SSE seq ids, idempotency + steer inbox).
 - [[harness-silent-turn-death]] — `String::truncate` mid-UTF8 panic killing the turn worker silently; fixed with `crate::tools::truncate_to` (char-boundary floor) at 5 sites, no-progress releases now carry a NOT-done pointer.
+- [[kb-lazy-resolution]] — Lazy rule-based KB resolution (request-first, one `kb_query`, per-workspace dir resolver, post-completion writes).
+- [[todo-pill-3of3]] — TodoPill 3/3 fix (match user-role `[tool result todowrite]` turns, not just role tool; `SessionView.tsx` `isToolText` mirror).

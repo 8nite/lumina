@@ -89,8 +89,14 @@ impl Host {
         self.plugins.iter().map(|p| p.display().to_string()).collect()
     }
 
-    fn materialize() -> Result<PathBuf, PluginError> {
-        let p = std::env::temp_dir().join(format!("lumina-host-{}.mjs", std::process::id()));
+    fn materialize(&self) -> Result<PathBuf, PluginError> {
+        // ponytail: unique filename per Host so parallel tests never clash.
+        // Single file (no dir) to avoid temp-dir leaks; the OS cleans /tmp.
+        let p = std::env::temp_dir().join(format!(
+            "lumina-host-{}-{}.mjs",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         // Refresh on every start (dev iterations of the worker apply immediately).
         std::fs::write(&p, HOST_JS)?;
         Ok(p)
@@ -101,9 +107,9 @@ impl Host {
         if g.is_some() {
             return Ok(());
         }
-        let sock = std::env::temp_dir().join(format!("lumina-plugins-{}.sock", uuid::Uuid::new_v4()));
+        let sock = std::env::temp_dir().join(format!("lumina-plugins-{}-{}.sock", std::process::id(), uuid::Uuid::new_v4()));
         let _ = std::fs::remove_file(&sock);
-        let script = Self::materialize()?;
+        let script = self.materialize()?;
         let defs: Vec<Value> = self
             .plugins
             .iter()
@@ -115,11 +121,20 @@ impl Host {
             .arg(&sock)
             .arg("--plugins")
             .arg(serde_json::to_string(&defs)?)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| PluginError::Msg(format!("plugin: node v22 required ({e})")))?;
-        // Wait for the socket (worker unlinks + binds on boot).
+        if let Ok(Some(status)) = child.try_wait() {
+            eprintln!("plugin worker exited immediately: {status}");
+            return Err(PluginError::Msg(format!(
+                "plugin: node worker exited during boot ({status})"
+            )));
+        }
+        // Wait for the socket (worker unlinks + binds on boot). Capture the
+        // worker's stderr into the daemon log on boot failure.
+        let mut last_err = String::new();
         for _ in 0..50 {
             if sock.exists() {
                 *g = Some(Proc { child, sock });
@@ -127,7 +142,18 @@ impl Host {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
             if let Ok(Some(_)) = child.try_wait() {
-                return Err(PluginError::Msg("plugin: node worker exited during boot".into()));
+                use std::io::Read as _;
+                if let Some(stderr) = child.stderr.as_mut() {
+                    let mut buf = String::new();
+                    let _ = stderr.read_to_string(&mut buf);
+                    last_err = buf.lines().take(5).collect::<Vec<_>>().join(" | ");
+                }
+                let msg = if last_err.is_empty() {
+                    "plugin: node worker exited during boot".to_string()
+                } else {
+                    format!("plugin: node worker exited during boot: {last_err}")
+                };
+                return Err(crate::plugins::PluginError::Msg(msg));
             }
         }
         let _ = child.kill();

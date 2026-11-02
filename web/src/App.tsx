@@ -712,7 +712,7 @@ export default function App() {
     }
   };
 
-  const send = async (delivery: 'steer' | 'queue' = 'steer', overrideText?: string) => {
+  const send = async (delivery: 'steer' | 'queue' = 'queue', overrideText?: string) => {
     if (sendInflight.current) return;
     sendInflight.current = true;
     try {
@@ -762,6 +762,31 @@ export default function App() {
       }
       return;
     }
+    // Steer joins the active turn at the next round boundary: show it in
+    // the timeline now (the daemon persists it on inject) and keep the
+    // spinner. Text only — the steer path drops images server-side, so
+    // attached images stay in the composer for an explicit queue send.
+    if (delivery === 'steer' && working && s) {
+      if (atts.length) setAttachments(atts);
+      setTurns((t) => [...t, { role: 'user', text, agent: s.agent, model: s.model, created_at: new Date().toISOString() }]);
+      try {
+        await api.prompt(s.id, text, [], effort || undefined, delivery);
+        setStage('steered ✓');
+      } catch (err) {
+        try {
+          const st = await api.sessionState(s.id);
+          if (st.running) {
+            setStage('submit timed out — turn still running, catching up…');
+            return;
+          }
+        } catch {
+          /* state unreachable; fall through to failure */
+        }
+        setTurns((t) => t.slice(0, -1));
+        alert(String(err));
+      }
+      return;
+    }
     const shown = text + atts.map((a) => `\n[file: ${a.name}]`).join('');
     setTurns((t) => [...t, { role: 'user', text: shown, agent: s.agent, model: s.model, created_at: new Date().toISOString() }]);
     setWorking(true);
@@ -795,7 +820,69 @@ export default function App() {
 
   const retry = () => {
     if (!session || !lastPrompt.current) return;
-    void send('steer', lastPrompt.current);
+    void send('queue', lastPrompt.current);
+  };
+
+  // Cooperative stop: the daemon ends the running turn at the next round
+  // boundary (turn.completed reconciles the spinner + transcript via SSE;
+  // the 15s watchdog covers a missed event). The server drops the pending
+  // queue with the stop, so mirror that locally.
+  const stopTurn = async () => {
+    if (!session || !working) return;
+    setStage('stopping…');
+    setQueuedBoth([]);
+    try {
+      await api.stop(session.id);
+    } catch (err) {
+      alert(String(err));
+    }
+  };
+
+  // Cancel one queued prompt: drop it from the chain and restore its
+  // payload into the composer (text appends, images re-attach).
+  const cancelQueued = async (i: number) => {
+    const s = session;
+    if (!s) return;
+    const item = queuedRef.current[i];
+    if (!item) return;
+    setQueuedBoth(queuedRef.current.filter((_, j) => j !== i));
+    try {
+      const r = await api.cancelQueued(s.id, i);
+      if (r.text) setInput((prev) => (prev ? prev + '\n' + r.text : r.text));
+      if (r.images?.length) {
+        setAttachments((prev) => [
+          ...prev,
+          ...r.images.map((im) => ({ name: im.name, mime: im.media_type, data: im.data })),
+        ]);
+      }
+    } catch (err) {
+      // Index raced a chained delivery: put the row back, panel resyncs
+      // on the next turn.started.
+      const cur = queuedRef.current;
+      setQueuedBoth([...cur.slice(0, i), item, ...cur.slice(i)]);
+      alert(String(err));
+    }
+  };
+
+  // Steer one queued prompt into the running turn now: drop it from the
+  // chain and show its text in the timeline (the daemon persists it on
+  // inject, like the composer Steer button).
+  const steerQueued = async (i: number) => {
+    const s = session;
+    if (!s) return;
+    const item = queuedRef.current[i];
+    if (!item) return;
+    setQueuedBoth(queuedRef.current.filter((_, j) => j !== i));
+    setTurns((t) => [...t, { role: 'user', text: item.text, agent: s.agent, model: s.model, created_at: new Date().toISOString() }]);
+    try {
+      await api.steerQueued(s.id, i);
+      setStage('steered ✓');
+    } catch (err) {
+      setTurns((t) => t.slice(0, -1));
+      const cur = queuedRef.current;
+      setQueuedBoth([...cur.slice(0, i), item, ...cur.slice(i)]);
+      alert(String(err));
+    }
   };
 
   const host = (() => {
@@ -991,6 +1078,9 @@ export default function App() {
                     elapsedMs={elapsedMs}
                     error={turnError}
                     onRetry={retry}
+                    onStop={() => void stopTurn()}
+                    onSteerQueued={(i) => void steerQueued(i)}
+                    onCancelQueued={(i) => void cancelQueued(i)}
                     changed={changed}
                     queue={queued}
                     working={working}

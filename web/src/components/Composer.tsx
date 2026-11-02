@@ -9,6 +9,7 @@ export function Composer(props: {
   value: string;
   onChange: (v: string) => void;
   onSend: (delivery?: 'steer' | 'queue') => void;
+  onStop?: () => void;
   agent: string;
   onAgent: (a: string) => void;
   model: string;
@@ -29,7 +30,6 @@ export function Composer(props: {
 }) {
   const [open, setOpen] = useState<null | 'agent' | 'model' | 'perm' | 'effort'>(null);
   const [custom, setCustom] = useState('');
-  const [queueArmed, setQueueArmed] = useState(false);
   const boxRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -49,7 +49,7 @@ export function Composer(props: {
       className="rounded-[12px] bg-[var(--v2-bg-base)] p-4 shadow-[var(--v2-elevation-raised)]"
       style={{ border: '1px solid var(--v2-border-base)', scrollbarGutter: 'stable' }}
     >
-      {(props.attachments.length > 0 || props.working || queueArmed) && (
+      {(props.attachments.length > 0 || props.working) && (
         <div className="mb-2 flex flex-wrap items-center gap-1.5">
           {props.attachments.map((a, i) => (
             <span key={i} className="flex items-center gap-1 rounded-[6px] border border-[var(--v2-border-base)] bg-[var(--v2-bg-layer-02)] px-2 py-0.5 font-mono text-[11px] text-[var(--v2-text-base)]" title={`${a.mime}, ${(a.data.length * 3 / 4 / 1024).toFixed(0)}KB`}>
@@ -58,13 +58,8 @@ export function Composer(props: {
             </span>
           ))}
           {props.working && (
-            <span className="rounded-[6px] border border-[var(--v2-border-base)] px-2 py-0.5 text-[11px] text-[var(--v2-text-muted)]">
-              working… (enter queues)
-            </span>
-          )}
-          {queueArmed && (
-            <span className="rounded-[6px] border border-[var(--v2-border-base)] px-2 py-0.5 text-[11px] text-[var(--v2-text-muted)]">
-              will queue — Enter to queue, Esc to cancel
+            <span className="rounded-[6px] border px-2 py-0.5 text-[11px] font-medium" style={{ borderColor: 'var(--c-shell)', color: 'var(--c-shell)' }}>
+              working… (enter queues · clear box to stop)
             </span>
           )}
         </div>
@@ -96,20 +91,16 @@ export function Composer(props: {
           }
         }}
         onKeyDown={(e) => {
-          if (e.key === 'x' && e.ctrlKey) {
+          // Ctrl/Cmd+Enter steers into the running turn; plain Enter
+          // queues behind it (queue is the default delivery).
+          if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
             e.preventDefault();
-            setQueueArmed(true);
-            return;
-          }
-          if (e.key === 'Escape') {
-            setQueueArmed(false);
+            props.onSend('steer');
             return;
           }
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
-            const q = queueArmed || props.working;
-            setQueueArmed(false);
-            props.onSend(q ? 'queue' : 'steer');
+            props.onSend('queue');
           }
         }}
         placeholder={props.placeholder ?? 'Ask anything... "Help me debug this issue"'}
@@ -206,13 +197,35 @@ export function Composer(props: {
           🖼
         </button>
         <button
-          onClick={() => { const q = queueArmed || props.working; setQueueArmed(false); props.onSend(q ? 'queue' : 'steer'); }}
-          className="flex h-7 w-7 items-center justify-center rounded-[6px] text-[var(--v2-text-base)] hover:bg-[var(--v2-overlay-hover)]"
-          style={{ background: 'var(--v2-bg-layer-02)' }}
-          title="Send"
+          onClick={() => props.onSend('steer')}
+          className="mr-1 rounded-[6px] px-2 py-0.5 text-[12px] text-[var(--v2-text-muted)] hover:text-[var(--v2-text-base)]"
+          style={props.working ? { background: 'var(--v2-bg-layer-02)' } : undefined}
+          title="Steer into the running turn (Ctrl+Enter) — text joins the active turn; idle starts a new turn. Text only; attached images stay in the composer"
         >
-          ↑
+          Steer
         </button>
+        {/* Stop takes the send slot while a turn runs and there is
+            nothing to send: empty box + no attachments. Typing anything
+            swaps the send button back in. */}
+        {props.working && props.value.trim() === '' && props.attachments.length === 0 && props.onStop ? (
+          <button
+            onClick={props.onStop}
+            className="flex h-7 w-7 items-center justify-center rounded-[6px] text-red-500 hover:bg-red-500/10"
+            style={{ background: 'var(--v2-bg-layer-02)' }}
+            title="Stop the running turn"
+          >
+            ■
+          </button>
+        ) : (
+          <button
+            onClick={() => props.onSend('queue')}
+            className="flex h-7 w-7 items-center justify-center rounded-[6px] text-[var(--v2-text-base)] hover:bg-[var(--v2-overlay-hover)]"
+            style={{ background: 'var(--v2-bg-layer-02)' }}
+            title="Send (queue — default)"
+          >
+            ↑
+          </button>
+        )}
       </div>
     </div>
   );

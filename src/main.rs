@@ -494,7 +494,22 @@ fn cmd_kb(args: &[String]) -> MainResult {
             Ok(())
         }
         Some("status") => {
-            for rel in ["memory/graphify-out/graph.json", "graphify-out/graph.json"] {
+            let mut shown = false;
+            for dir in kb::resolve_memory_dirs(&wpath) {
+                let rel = dir.strip_prefix(&wpath).map(|r| r.display().to_string()).unwrap_or_else(|_| "memory".into());
+                let p = dir.join("graphify-out/graph.json");
+                if p.exists() {
+                    let g = kb::Graph::load(&p).map_err(|e| format!("{e}"))?;
+                    println!("{rel}/graphify-out/graph.json: {} nodes, {} edges", g.nodes.len(), g.edges.len());
+                } else {
+                    println!("{rel}/graphify-out/graph.json: missing");
+                }
+                shown = true;
+            }
+            if !shown {
+                println!("(no knowledge base configured — no memory/knowledge dir in AGENTS.md/rules)");
+            }
+            for rel in ["graphify-out/graph.json"] {
                 let p = wpath.join(rel);
                 if p.exists() {
                     let g = kb::Graph::load(&p).map_err(|e| format!("{e}"))?;

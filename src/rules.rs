@@ -144,7 +144,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             mode: "subagent".into(),
             model: String::new(),
             path: String::new(),
-            body: "You are a general-purpose subagent. Research the workspace, run safe diagnostics, and complete multi-step tasks. Prefer kb_query and grep before broad edits. Summarize what you did with file references.".into(),
+            body: "You are a general-purpose subagent. Research the workspace, run safe diagnostics, and complete multi-step tasks. Read the request first; use `question` when intent is ambiguous, then at most one `kb_query` with request keywords (budget 4000) only when a KB is configured (skip when the tool reports none); prefer code grep otherwise. Summarize what you did with file references.".into(),
             tools: HashMap::new(),
         },
         AgentDef {
@@ -153,7 +153,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             mode: "subagent".into(),
             model: String::new(),
             path: String::new(),
-            body: "You are an explore subagent. Search and read code (read, glob, grep), memory (kb_query, skill), and the web (webfetch, websearch). Do not edit files. Report findings with file and line references.".into(),
+            body: "You are an explore subagent. Read the request first; use `question` when intent is ambiguous, then search code (read, glob, grep), memory (`kb_query` once with request keywords, budget 4000, only when a KB is configured — skip when the tool reports none; `skill`), and the web (webfetch, websearch). Do not edit files. Report findings with file and line references.".into(),
             tools: HashMap::new(),
         },
     ]

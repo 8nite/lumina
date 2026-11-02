@@ -439,13 +439,37 @@ fn gate_file(
         return Err(PatchError::Msg("patch: empty path".into()));
     }
     let resolved = resolve_target(workspace, p);
-    if !resolved.starts_with(workspace) && !crate::security::is_whitelisted_write(&resolved.to_string_lossy()) {
+    // ponytail: canonicalize lexical `..`/`.` before the fence check so
+    // `../evil.txt` cannot pass `starts_with` via a non-normalized join.
+    // Collapse WITHOUT resolving symlinks (no fs touch).
+    let mut canon = std::path::PathBuf::new();
+    for comp in resolved.components() {
+        use std::path::Component::*;
+        match comp {
+            Prefix(x) => {
+                canon.push(x.as_os_str());
+            }
+            RootDir => {
+                canon.push("/");
+            }
+            CurDir => {}
+            ParentDir => {
+                // Lexical pop; a pop past the anchor means the path left
+                // the workspace. `pop()` returns false at the root edge.
+                if !canon.pop() {
+                    return Err(PatchError::Msg(format!("patch: path escapes workspace: {p}")));
+                }
+            }
+            Normal(x) => canon.push(x),
+        }
+    }
+    if !canon.starts_with(workspace) && !crate::security::is_whitelisted_write(&canon.to_string_lossy()) {
         return Err(PatchError::Msg(format!("patch: path escapes workspace: {p}")));
     }
-    if crate::security::is_credential_path(&resolved.to_string_lossy()) {
+    if crate::security::is_credential_path(&canon.to_string_lossy()) {
         return Err(PatchError::Msg(format!("patch: credential path denied: {p}")));
     }
-    if agent_plan && !crate::security::plan_allows_write(workspace, &resolved.to_string_lossy()) {
+    if agent_plan && !crate::security::plan_allows_write(workspace, &canon.to_string_lossy()) {
         return Err(PatchError::Msg(format!(
             "patch: plan-mode agents may only change plan.md or .lumina/plans/*.md (got {p})"
         )));

@@ -145,7 +145,8 @@ impl Store {
                PRIMARY KEY(session_id, request_id));
              CREATE TABLE IF NOT EXISTS steered(
                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, text TEXT, created_at TEXT);
-             CREATE INDEX IF NOT EXISTS idx_steered_session ON steered(session_id);",
+             CREATE INDEX IF NOT EXISTS idx_steered_session ON steered(session_id);
+              CREATE TABLE IF NOT EXISTS stops(session_id TEXT PRIMARY KEY);",
         )?;
         for ddl in [
             "ALTER TABLE sessions ADD COLUMN inflight_owner TEXT DEFAULT ''",
@@ -634,6 +635,22 @@ mod tests {
     }
 
     #[test]
+    fn stop_flag_roundtrip() {
+        let s = mem();
+        assert!(!s.stop_requested("s1"));
+        s.request_stop("s1");
+        // Non-consuming: the running turn clears it when honored.
+        assert!(s.stop_requested("s1"));
+        assert!(s.stop_requested("s1"));
+        s.clear_stop("s1");
+        assert!(!s.stop_requested("s1"));
+        // Re-request is idempotent (INSERT OR REPLACE).
+        s.request_stop("s1");
+        s.request_stop("s1");
+        assert!(s.stop_requested("s1"));
+    }
+
+    #[test]
     fn sanitize_redacts() {
         let t = "key sk-abc123xyz789 here and AKIAIOSFODNN7EXAMPLE plus Bearer tok123";
         let out = sanitize_export(t);
@@ -661,6 +678,34 @@ mod tests {
         let last = red["transcript"].as_array().unwrap().last().unwrap();
         assert_eq!(last["role"], "thinking");
         assert!(!last["text"].as_str().unwrap().contains("sk-abc123"));
+    }
+
+    #[test]
+    fn transcript_json_preserves_todowrite_progress_to_3_of_3() {
+        // Contract with the web TodoPill: the agent persists every tool
+        // output as role "user" with a "[tool result <name>]" prefix, and
+        // the pill scans the transcript backwards for the LATEST todowrite
+        // turn. A 1/3 → 2/3 → 3/3 run must keep all three turns in order
+        // with roles and text intact, or the pill can never settle at 3/3.
+        let s = mem();
+        let a = s.create_session("/repo", "build", "bypass", "").unwrap();
+        for done in 1..=3 {
+            s.add_turn(&a.id, "user", &format!("do step {done}")).unwrap();
+            s.add_turn(&a.id, "user", &format!("[tool result todowrite]\nTodos updated: {done}/3 completed")).unwrap();
+        }
+        let v = s.transcript_json(&a.id, false).unwrap();
+        let tx = v["transcript"].as_array().unwrap();
+        assert_eq!(tx.len(), 6);
+        let todos: Vec<&str> = tx
+            .iter()
+            .filter(|t| {
+                t["role"].as_str() == Some("user")
+                    && t["text"].as_str().unwrap_or("").starts_with("[tool result todowrite]")
+            })
+            .map(|t| t["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(todos.len(), 3);
+        assert!(todos[2].contains("3/3 completed"), "{todos:?}");
     }
 }
 
@@ -704,6 +749,31 @@ impl Store {
             .unwrap_or_default();
         let _ = db.execute("DELETE FROM steered WHERE session_id=?", params![session]);
         rows.join("\n\n").trim().to_string()
+    }
+
+    /// Cooperative stop flag: set by POST /stop, noticed at turn round
+    /// boundaries (and mid-stream polls). DB-backed like steered so the
+    /// flag survives daemon restarts mid-turn.
+    pub fn request_stop(&self, session: &str) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute("INSERT OR REPLACE INTO stops(session_id) VALUES(?)", params![session]);
+    }
+
+    /// Non-consuming check: the running turn clears the flag when it
+    /// honors the stop, so a set flag always means "stop now".
+    pub fn stop_requested(&self, session: &str) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row("SELECT COUNT(*) FROM stops WHERE session_id=?", params![session], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// Clear the flag (stop honored, or stop arrived for an idle session).
+    pub fn clear_stop(&self, session: &str) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute("DELETE FROM stops WHERE session_id=?", params![session]);
     }
 
     /// Retry idempotency: true when (session, request_id) was already

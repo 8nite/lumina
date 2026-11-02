@@ -272,6 +272,9 @@ impl Library {
     }
 
     /// Promote a validated lesson note with rationale attributes.
+    /// Notes are Markdown with frontmatter + `[[wikilinks]]` (graphify
+    /// source of truth); the library manifest is re-stamped and a
+    /// deterministic `graphify reflect` is attempted best-effort.
     pub fn promote(&self, name: &str, body: &str, rationale: &str) -> Result<(), HarnessError> {
         std::fs::create_dir_all(&self.dir)?;
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -279,8 +282,33 @@ impl Library {
         if !doc.contains("[[") {
             doc.push_str("\nSee also: [[harness-evolution]]\n");
         }
-        Ok(std::fs::write(self.dir.join(format!("{name}.md")), doc)?)
+        std::fs::write(self.dir.join(format!("{name}.md")), doc)?;
+        // Keep the library graphify manifest fresh (md files only).
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            let mut rel: Vec<String> = rd
+                .flatten()
+                .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            rel.sort();
+            let _ = std::fs::create_dir_all(self.dir.join("graphify-out"));
+            let doc = serde_json::json!({"root": ".", "files": rel});
+            let _ = std::fs::write(
+                self.dir.join("graphify-out/manifest.json"),
+                serde_json::to_string_pretty(&doc).unwrap_or_default(),
+            );
+        }
+        crate::kb::try_graphify_reflect(&self.dir);
+        Ok(())
     }
+}
+
+/// Rule-declared KB dir for this workspace (harness RAG source of truth).
+/// Delegates to `kb::primary_memory_dir`: rule-md mentions first
+/// (`AGENTS.md` / `.lumina/rules/*.md`), then `LUMINA_MEMORY_DIR`, then
+/// legacy `workspace/memory`. All harness RAG is Markdown + graphify.
+pub fn memory_dir(workspace: &Path) -> PathBuf {
+    crate::kb::primary_memory_dir(workspace)
 }
 
 
@@ -290,11 +318,17 @@ pub fn offline_pass(workspace: &Path) -> Result<String, HarnessError> {
     let loader = Loader { workspace: workspace.to_path_buf() };
     loader.ensure()?;
     let cur = loader.get("tool_guidance.md").unwrap_or_default();
+    // Lazy KB protocol (mirrors the agent system prompt): read intent
+    // first, `question` when ambiguous, one `kb_query` after intent is
+    // known and only when a KB is configured. Idempotent: re-running
+    // evolve must not duplicate the block.
+    let lazy = "\n- KB protocol is lazy: read the user request FIRST, use `question` when intent is ambiguous, then at most one `kb_query` with request keywords (budget 4000) and only when a KB is configured (skip when the tool reports none); `memory_write` post-completion only.\n";
     let mut files = HashMap::new();
-    files.insert(
-        "tool_guidance.md".into(),
-        format!("{cur}\n- Prefer kb_query before grep for project questions.\n"),
-    );
+    let mut next = if cur.contains("KB protocol is lazy") { cur } else { format!("{cur}{lazy}") };
+    if !next.contains("kb_query") {
+        next.push_str("- Prefer kb_query (once, after intent) over grep for project questions when a KB is configured.\n");
+    }
+    files.insert("tool_guidance.md".into(), next);
     let cand = Candidate {
         id: "guidance-refresh".into(),
         rationale: "re-ground tool guidance in current rules bundle".into(),
@@ -314,7 +348,23 @@ pub fn offline_pass(workspace: &Path) -> Result<String, HarnessError> {
         "# evolve run",
         &format!("offline pass landed {}", landed.join(",")),
     );
-    Ok(format!("evolve landed: {} @ {}", landed.join(","), commit))
+    // Harness RAG lands in the rule-declared KB dir as Markdown + graphify
+    // (best-effort): post-completion lesson only, never mid-turn. When no
+    // KB is configured the write is skipped — the harness never invents one.
+    let kb_dir = memory_dir(workspace);
+    if crate::kb::has_kb(workspace) {
+        let _ = crate::kb::memory_write(
+            workspace,
+            &format!("harness-evolve-{date}"),
+            &format!(
+                "Harness evolve landed {} @ {}.\nKB dir: {}\nSee also: [[harness-evolution]]\n",
+                landed.join(","),
+                commit,
+                kb_dir.display()
+            ),
+        );
+    }
+    Ok(format!("evolve landed: {} @ {} (kb: {})", landed.join(","), commit, kb_dir.display()))
 }
 
 #[cfg(test)]

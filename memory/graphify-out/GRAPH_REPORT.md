@@ -1,11 +1,11 @@
-# Graph Report - memory  (2026-11-02, refreshed inline incl. stuck-session fix + drive_one retry + prompt idempotency + follow-up inheritance/idle nudge + subagent budget/verify prod + harness-silent-turn-death)
+# Graph Report - memory  (2026-11-02, refreshed inline incl. stuck-session fix + drive_one retry + prompt idempotency + follow-up inheritance/idle nudge + subagent budget/verify prod + harness-silent-turn-death + kb-lazy-resolution + todo-pill-3of3)
 
 ## Corpus Check
-- 30 files · ~8400 words
+- 31 files · ~8550 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 145 nodes · 196 links · 4 communities
+- 149 nodes · 202 links · 4 communities
 - Extraction: 89% EXTRACTED · 8% INFERRED · 0% AMBIGUOUS · INFERRED: 11 edges (avg confidence: 0.83)
 - Token cost: 0 input · 0 output
 
@@ -53,7 +53,7 @@ Nodes (7): Lumina plan.md Implementation (M0-M6), Go plus Web Verification Gate,
 
 ### Community 1 - "Memory Index and Live Wiring"
 Cohesion: 0.40
-Nodes (26): lumina Live Wiring, Lumina Memory Index, Steer Queue Inbox While Working, TUI Thinking Toggle plus Web Tool Pills, Turn Delta Tool Completed Streaming Events, Long-Session Hardening Pass, Per-Session Prompt Single-Flight, Terminal SSE plus Auto-Reconnect, Web Permission Modal Answers permission.asked, Live Context Gauge (turn.context), TUI Space Key Types, Provider-Sourced Context Window, Router Context Cache with Caps, Dual Routing Session Headers, Session State Resync Endpoint, TUI Resync Timeline Rebuild, Missed-Started Recovery, Effort Variant Picker, TUI Default Effort XHigh, Gateway Models Effort Note, Web Session-Gone Recovery, Web Model Refresh on Open, Zen limit.context Window, Zen reasoning.effort Ladder, Zen 28-Model Live Verification, Composer Model Filter, App Default Model Label, applyModel setSession Refresh, Model Switch Live Verification, models.list Plugin Hook, Zen Canonical-ID Twin Merge, Core Generic-Parse / Plugin Enrich Split, Zen Plugin Rust Tests, Zen-Go Twin Endpoint Binding, Zen Twin Suppression Rule, Effort Step-Down Retry, effort_step_down and is_effort_error Helpers, rules/ Plural-Dir Convention, rules.rs Discovery and Fence Tests, Canonical Effort Ladder (none..max), Advertised Effort Passthrough, Per-Model Effort Picker, Web/CLI Workspace Dir Mismatch, Workspace Path Normalization, Daemon TMPDIR May Not Exist
+Nodes (28): lumina Live Wiring, Lumina Memory Index, Lazy Rule-Based KB Resolution, Per-Workspace KB Dir Resolver and Post-Completion Write, Steer Queue Inbox While Working, TUI Thinking Toggle plus Web Tool Pills, Turn Delta Tool Completed Streaming Events, Long-Session Hardening Pass, Per-Session Prompt Single-Flight, Terminal SSE plus Auto-Reconnect, Web Permission Modal Answers permission.asked, Live Context Gauge (turn.context), TUI Space Key Types, Provider-Sourced Context Window, Router Context Cache with Caps, Dual Routing Session Headers, Session State Resync Endpoint, TUI Resync Timeline Rebuild, Missed-Started Recovery, Effort Variant Picker, TUI Default Effort XHigh, Gateway Models Effort Note, Web Session-Gone Recovery, Web Model Refresh on Open, Zen limit.context Window, Zen reasoning.effort Ladder, Zen 28-Model Live Verification, Composer Model Filter, App Default Model Label, applyModel setSession Refresh, Model Switch Live Verification, models.list Plugin Hook, Zen Canonical-ID Twin Merge, Core Generic-Parse / Plugin Enrich Split, Zen Plugin Rust Tests, Zen-Go Twin Endpoint Binding, Zen Twin Suppression Rule, Effort Step-Down Retry, effort_step_down and is_effort_error Helpers, rules/ Plural-Dir Convention, rules.rs Discovery and Fence Tests, Canonical Effort Ladder (none..max), Advertised Effort Passthrough, Per-Model Effort Picker, Web/CLI Workspace Dir Mismatch, Workspace Path Normalization, Daemon TMPDIR May Not Exist
 
 ### Community 2 - "Subagent Background Web Tools"
 Cohesion: 0.40

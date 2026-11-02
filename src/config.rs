@@ -112,6 +112,11 @@ pub struct KbConfig {
     /// Rebuild workspace AST graph on git commit (Go parity; honored by hooks).
     #[serde(default)]
     pub auto_commit_ast_hook: bool,
+    /// Explicit KB dir override (workspace-relative or absolute,
+    /// colon-separated for several). Wins over rule-md mentions and
+    /// `LUMINA_MEMORY_DIR`. Empty = rule-md resolution (see `kb`).
+    #[serde(default)]
+    pub memory_dir: String,
 }
 fn default_idle() -> u64 {
     15
@@ -445,14 +450,16 @@ mod tests {
 
     #[test]
     fn websearch_disabled_and_ast_hook_parse() {
-        let f = write_tmp("[websearch]\ndisabled = true\n[kb]\nauto_commit_ast_hook = true\n");
+        let f = write_tmp("[websearch]\ndisabled = true\n[kb]\nauto_commit_ast_hook = true\nmemory_dir = \"docs/notes\"\n");
         let cfg = Config::load(Some(f.path().into())).unwrap();
         assert!(cfg.websearch.disabled);
         assert!(cfg.kb.auto_commit_ast_hook);
+        assert_eq!(cfg.kb.memory_dir, "docs/notes");
         let f2 = write_tmp("");
         let cfg2 = Config::load(Some(f2.path().into())).unwrap();
         assert!(!cfg2.websearch.disabled);
         assert!(!cfg2.kb.auto_commit_ast_hook);
+        assert!(cfg2.kb.memory_dir.is_empty());
     }
 }
 

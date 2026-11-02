@@ -128,6 +128,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route("/api/v1/sessions/:id", get(get_session).patch(patch_session).delete(delete_session))
         .route("/api/v1/sessions/:id/prompt", axum::routing::post(prompt))
+        .route("/api/v1/sessions/:id/stop", axum::routing::post(stop_turn))
+        .route("/api/v1/sessions/:id/queue/cancel", axum::routing::post(queue_cancel))
+        .route("/api/v1/sessions/:id/queue/steer", axum::routing::post(queue_steer))
         .route("/api/v1/sessions/:id/fork", axum::routing::post(fork))
         .route("/api/v1/sessions/:id/export", get(export))
         .route("/api/v1/sessions/:id/revert", axum::routing::post(revert))
@@ -322,7 +325,7 @@ pub fn ev(kind: &str, session: &str, data: serde_json::Value) -> serde_json::Val
 }
 
 /// A prompt chained behind a running turn (server-side queue).
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub(crate) struct QueuedPrompt {
     text: String,
     effort: String,
@@ -502,7 +505,13 @@ async fn prompt(
         let _release = TurnRelease { store: st2.store.clone(), running: st2.running.clone(), id: id2.clone(), owner };
         let first = drive_one(&st2, &runner, &id2, &_release.owner, first_q).await;
         // The request may be gone (disconnect); the drain continues anyway.
+        let stopped = matches!(&first, Ok(d) if d.stopped);
         let _ = first_tx.send(first);
+        if stopped {
+            // Stop honored: the turn ended by request and the pending
+            // queue/steer inbox was dropped with it — no chained drain.
+            return;
+        }
         let mut runner2 = Runner::new();
         runner2.approval = Some(st2.gate.clone());
         if let Ok(Some(sess)) = st2.store.get_session(&id2) {
@@ -536,7 +545,7 @@ async fn prompt(
     // 504 that tempts the client into a duplicate submit. The drain task is
     // detached and continues either way.
     match tokio::time::timeout(std::time::Duration::from_secs(50), first_rx).await {
-        Ok(Ok(Ok(text))) => Json(serde_json::json!({"session": id, "text": text})).into_response(),
+        Ok(Ok(Ok(done))) => Json(serde_json::json!({"session": id, "text": done.text})).into_response(),
         Ok(Ok(Err(s))) => {
             if s.contains("not found") {
                 (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": s}))).into_response()
@@ -550,8 +559,112 @@ async fn prompt(
     }
 }
 
+/// Cooperative stop: flag the running turn to end at the next round
+/// boundary (or mid-stream poll) and drop everything chained behind it
+/// (pending steer inbox + queued turns) so the session idles out. The
+/// active turn emits turn.completed ("Stopped by user.") when it lands.
+/// Idle sessions are a noop — the flag is only ever set while running,
+/// so a stale flag can never kill a later turn.
+async fn stop_turn(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    if !st.running.lock().unwrap().contains(&id) {
+        return (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "idle", "session_id": id}))).into_response();
+    }
+    st.store.request_stop(&id);
+    // Halt the whole chain: anything chained behind the active turn must
+    // not start once it lands.
+    let _ = st.store.take_steered(&id);
+    st.queued.lock().unwrap().remove(&id);
+    st.emit(ev("turn.progress", &id, serde_json::json!({"stage": "stopping…"})));
+    (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "stopping", "session_id": id}))).into_response()
+}
+
+#[derive(Deserialize)]
+struct QueueIndexBody {
+    index: usize,
+}
+
+/// Cancel one queued prompt: drop it from the chain and hand its payload
+/// back so the client can restore it into the composer.
+async fn queue_cancel(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(b): Json<QueueIndexBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let removed = st
+        .queued
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .and_then(|q| q.remove(b.index));
+    match removed {
+        Some(qp) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "canceled", "session_id": id,
+                "text": qp.text, "images": qp.images,
+            })),
+        ),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "queued prompt not found"}))),
+    }
+}
+
+/// Steer one queued prompt into the running turn now: drop it from the
+/// chain and buffer its text via the steer inbox (answered at the next
+/// round boundary). Text-only like all steer traffic: an item carrying
+/// images is refused in place — cancel restores those into the composer
+/// intact. When the session is idle the text waits in the inbox for the
+/// next turn.
+async fn queue_steer(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(b): Json<QueueIndexBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    enum Pop {
+        /// Refused (carries images): already restored to its exact slot.
+        Refused,
+        Ready(String),
+    }
+    // Single lock for pop + check + maybe-restore: a refused item goes
+    // back to its exact slot instead of being lost or reordered.
+    let popped = {
+        let mut map = st.queued.lock().unwrap();
+        let q = match map.get_mut(&id) {
+            Some(q) => q,
+            None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "queued prompt not found"}))),
+        };
+        let Some(qp) = q.remove(b.index) else {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "queued prompt not found"})));
+        };
+        if qp.images.is_empty() {
+            Pop::Ready(qp.text)
+        } else {
+            q.insert(b.index.min(q.len()), qp);
+            Pop::Refused
+        }
+    };
+    match popped {
+        Pop::Refused => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "queued prompt has attachments; cancel it to edit and resend"})),
+        ),
+        Pop::Ready(text) => {
+            st.store.steer(&id, &text);
+            let preview: String = text.chars().take(80).collect();
+            let preview = if text.chars().count() > 80 { format!("{preview}…") } else { preview };
+            st.emit(ev("turn.progress", &id, serde_json::json!({"stage": format!("steered: {preview}")})));
+            (StatusCode::ACCEPTED, Json(serde_json::json!({"status": "steered", "session_id": id, "text": text})))
+        }
+    }
+}
+
 /// Run one queued turn: events, context gauge, standing-ops. Returns text or error string.
-async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: QueuedPrompt) -> Result<String, String> {
+#[derive(Debug)]
+struct DriveDone {
+    text: String,
+    stopped: bool,
+}
+
+async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: QueuedPrompt) -> Result<DriveDone, String> {
     st.emit(ev("turn.started", id, serde_json::json!({"text": q.text})));
     let tx = st.events.clone();
     let sid = id.to_string();
@@ -601,13 +714,31 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: Que
     let mut out = runner
         .run_prompt(&st.store, &st.router, &st.cfg, id, &user_turn, &q.effort, &q.images, &mut on_event, &mut on_stage, &mut on_tool)
         .await;
-    if out.is_err() {
+    // No retry on a cooperative stop: the user asked to end the turn.
+    let stopped = matches!(out, Err(crate::agent::AgentError::Stopped));
+    if !stopped && out.is_err() {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         out = runner
             .run_prompt(&st.store, &st.router, &st.cfg, id, &user_turn, &q.effort, &q.images, &mut on_event, &mut on_stage, &mut on_tool)
             .await;
     }
     hb.abort();
+    if matches!(out, Err(crate::agent::AgentError::Stopped)) {
+        // Stop honored: the loop already persisted the note. Complete
+        // (not fail) so clients reconcile via the normal completed path,
+        // and clear the flag so it can't leak into a later turn.
+        // No context snapshot here: resolving max_tokens would cost a
+        // gateway round trip on a path whose whole point is to stop.
+        st.store.clear_stop(id);
+        let ms = started.elapsed().as_millis() as u64;
+        st.emit(ev("turn.completed", id, serde_json::json!({
+            "text": crate::agent::STOPPED_TEXT, "model": "", "duration_ms": ms,
+            "input_tokens": 0, "output_tokens": 0,
+            "context_tokens": 0, "max_tokens": 0,
+        })));
+        standing_ops(st, id);
+        return Ok(DriveDone { text: crate::agent::STOPPED_TEXT.to_string(), stopped: true });
+    }
     match out {
         Ok(outcome) => {
             let ms = started.elapsed().as_millis() as u64;
@@ -619,7 +750,7 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: Que
             })));
             st.emit(ev("turn.context", id, serde_json::json!({"context_tokens": used, "max_tokens": max})));
             standing_ops(st, id);
-            Ok(outcome.text)
+            Ok(DriveDone { text: outcome.text, stopped: false })
         }
         Err(e) => {
             let s = e.to_string();
@@ -729,6 +860,9 @@ pub fn openapi_spec() -> serde_json::Value {
             "/api/v1/sessions/{id}": "fetch / patch agent,permission,model,title",
             "/api/v1/sessions/{id}/state": "resync: session + running + pending permission/question",
             "/api/v1/sessions/{id}/prompt": "submit turn (request_id dedups client retries)",
+            "/api/v1/sessions/{id}/stop": "cooperative stop: end running turn + drop queued chain",
+            "/api/v1/sessions/{id}/queue/cancel": "drop queued prompt, payload returns for composer restore",
+            "/api/v1/sessions/{id}/queue/steer": "steer queued prompt text into the running turn",
             "/api/v1/sessions/{id}/fork": "branch at turn",
             "/api/v1/sessions/{id}/export": "transcript (?sanitize=1)",
             "/api/v1/sessions/{id}/revert": "shadow-git undo (?turn=)",
@@ -1050,32 +1184,49 @@ struct KbQueryBody {
     directory: String,
 }
 
-async fn kb_query(Json(b): Json<KbQueryBody>) -> impl IntoResponse {
+async fn kb_query(State(st): State<AppState>, Json(b): Json<KbQueryBody>) -> impl IntoResponse {
     let ws = if b.directory.is_empty() {
         std::env::current_dir().unwrap_or_else(|_| ".".into())
     } else {
         PathBuf::from(b.directory)
     };
-    match crate::kb::query(&ws, &b.query, b.budget) {
+    let ov = if st.cfg.kb.memory_dir.trim().is_empty() { None } else { Some(st.cfg.kb.memory_dir.as_str()) };
+    match crate::kb::query_in(&ws, &b.query, b.budget, ov) {
         Ok(text) => Json(serde_json::json!({"query": b.query, "context": text})).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
 
-/// Browse ./memory/*.md + graphify-out docs (?path= to read one).
+/// Browse rule-declared KB dirs (*.md) + graphify-out docs (?path= to read one).
 async fn kb_browse(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
     let base = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    // Allowed roots: each resolved KB dir (+ its graphify-out), the legacy
+    // memory/ tree, and the workspace code graph. Anything else is 403.
+    let mut roots: Vec<String> = crate::kb::resolve_memory_dirs(&base)
+        .iter()
+        .map(|d| {
+            d.strip_prefix(&base)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| "memory".into())
+        })
+        .collect();
+    for legacy in ["memory", "graphify-out"] {
+        if !roots.contains(&legacy.to_string()) {
+            roots.push(legacy.into());
+        }
+    }
     if let Some(p) = q.get("path") {
-        // Contain reads to memory/ + graphify-out/ (credential fence applies at the tool layer).
+        // Contain reads to the allowed roots (credential fence applies at the tool layer).
         let abs = base.join(p);
-        let first: String = std::path::Path::new(p)
-            .iter()
-            .next()
-            .map(|c| c.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let ok_prefix = first == "memory" || first == "graphify-out";
-        if !ok_prefix {
-            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "path must be under memory/ or graphify-out/"}))).into_response();
+        let first_two = {
+            let mut it = std::path::Path::new(p).iter();
+            let a = it.next().map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
+            let b = it.next().map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
+            if b == "graphify-out" { format!("{a}/graphify-out") } else { a }
+        };
+        let ok = roots.iter().any(|r| first_two == *r || p == r || p.starts_with(&format!("{r}/")));
+        if !ok {
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "path must be under a rule-declared KB dir, memory/, or graphify-out/"}))).into_response();
         }
         return match std::fs::read_to_string(&abs) {
             Ok(text) => Json(serde_json::json!({"path": p, "content": text.chars().take(32_000).collect::<String>()})).into_response(),
@@ -1083,8 +1234,17 @@ async fn kb_browse(Query(q): Query<HashMap<String, String>>) -> impl IntoRespons
         };
     }
     let mut files = Vec::new();
-    for dir in ["memory", "memory/graphify-out", "graphify-out"] {
-        let d = base.join(dir);
+    let mut dirs: Vec<String> = roots.clone();
+    for r in &roots {
+        if !r.ends_with("graphify-out") {
+            dirs.push(format!("{r}/graphify-out"));
+        }
+    }
+    dirs.push("graphify-out".into());
+    dirs.sort();
+    dirs.dedup();
+    for dir in dirs {
+        let d = base.join(&dir);
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
             if e.path().extension().map(|x| x == "md" || x == "json" || x == "html").unwrap_or(false) {
@@ -1654,7 +1814,9 @@ mod drive_tests {
             drive_state(vec![("500 Internal Server Error", ""), ("200 OK", FINISH)]);
         let q = QueuedPrompt { text: "hi there".into(), effort: String::new(), images: Vec::new() };
         let out = drive_one(&st, &runner, &id, "test-owner", q).await;
-        assert_eq!(out.unwrap(), "recovered", "retry must recover the turn");
+        let done = out.unwrap();
+        assert_eq!(done.text, "recovered", "retry must recover the turn");
+        assert!(!done.stopped);
         assert_eq!(hits.load(Ordering::SeqCst), 2, "one failed attempt plus one retry");
         let user_turns = st.store.turns(&id).unwrap().into_iter().filter(|t| t.role == "user" && t.text == "hi there").count();
         assert_eq!(user_turns, 1, "retry must reuse the user turn, not duplicate it");
@@ -1675,6 +1837,88 @@ mod drive_tests {
         assert_eq!(last.role, "assistant");
         assert!(last.text.contains("Turn failed"), "failure note must persist, got {:?}", last.text);
         assert!(last.text.contains("continue"), "note must carry the resume pointer");
+    }
+
+    /// Pre-set stop flag: the turn ends immediately without touching the
+    /// gateway, persists the stop note, and clears the flag — no retry.
+    #[tokio::test]
+    async fn drive_one_honors_stop_flag() {
+        let (st, runner, id, hits) = drive_state(vec![("200 OK", FINISH)]);
+        st.store.request_stop(&id);
+        let q = QueuedPrompt { text: "hi there".into(), effort: String::new(), images: Vec::new() };
+        let out = drive_one(&st, &runner, &id, "test-owner", q).await;
+        let done = out.unwrap();
+        assert!(done.stopped, "stop flag must end the turn as stopped");
+        assert_eq!(done.text, crate::agent::STOPPED_TEXT);
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "stop must not call the gateway");
+        assert!(!st.store.stop_requested(&id), "stop flag must clear once honored");
+        let turns = st.store.turns(&id).unwrap();
+        let last = turns.last().unwrap();
+        assert_eq!(last.role, "assistant");
+        assert!(last.text.contains("Stopped by user"), "stop note must persist, got {:?}", last.text);
+    }
+
+    fn queued(
+        st: &AppState,
+        id: &str,
+        items: Vec<(&str, bool)>,
+    ) {
+        // (text, with_image): image payloads stand in for real attachments.
+        let mut map = st.queued.lock().unwrap();
+        let q = map.entry(id.to_string()).or_default();
+        for (text, with_image) in items {
+            q.push_back(QueuedPrompt {
+                text: text.into(),
+                effort: String::new(),
+                images: if with_image {
+                    vec![crate::llm::ImageAttachment {
+                        name: "a.png".into(),
+                        media_type: "image/png".into(),
+                        data: "AAA".into(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+    }
+
+    /// Cancel drops the item and hands its payload back for restore.
+    #[tokio::test]
+    async fn queue_cancel_returns_payload() {
+        let (st, _runner, id, _hits) = drive_state(vec![]);
+        queued(&st, &id, vec![("first", false), ("with pic", true)]);
+        let (code, Json(v)) = queue_cancel(State(st.clone()), Path(id.clone()), Json(QueueIndexBody { index: 1 })).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["text"], "with pic");
+        assert_eq!(v["images"][0]["name"], "a.png");
+        assert_eq!(v["images"][0]["media_type"], "image/png");
+        assert_eq!(st.queued.lock().unwrap().get(&id).map(|q| q.len()), Some(1));
+        let (code, _) = queue_cancel(State(st.clone()), Path(id.clone()), Json(QueueIndexBody { index: 5 })).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
+    /// Steer moves text-only items into the steer inbox, in order.
+    #[tokio::test]
+    async fn queue_steer_moves_text_to_inbox() {
+        let (st, _runner, id, _hits) = drive_state(vec![]);
+        queued(&st, &id, vec![("now please", false), ("later", false)]);
+        let (code, Json(v)) = queue_steer(State(st.clone()), Path(id.clone()), Json(QueueIndexBody { index: 0 })).await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(v["text"], "now please");
+        assert_eq!(st.store.take_steered(&id), "now please");
+        assert_eq!(st.queued.lock().unwrap().get(&id).map(|q| q.len()), Some(1));
+    }
+
+    /// Steer refuses items with attachments in place (cancel restores them).
+    #[tokio::test]
+    async fn queue_steer_refuses_attachments() {
+        let (st, _runner, id, _hits) = drive_state(vec![]);
+        queued(&st, &id, vec![("with pic", true)]);
+        let (code, _) = queue_steer(State(st.clone()), Path(id.clone()), Json(QueueIndexBody { index: 0 })).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(st.queued.lock().unwrap().get(&id).map(|q| q.len()), Some(1));
+        assert_eq!(st.store.take_steered(&id), "", "refused steer must not touch the inbox");
     }
 }
 

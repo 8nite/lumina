@@ -183,6 +183,15 @@ export const api = {
   },
   revert: (id: string) => req<{ status: string }>('POST', `/api/v1/sessions/${id}/revert`, {}),
   unrevert: (id: string) => req<{ status: string }>('POST', `/api/v1/sessions/${id}/unrevert`, {}),
+  stop: (id: string) => req<{ status: string }>('POST', `/api/v1/sessions/${id}/stop`, {}),
+  cancelQueued: (id: string, index: number) =>
+    req<{ status: string; text: string; images: { name: string; media_type: string; data: string }[] }>(
+      'POST',
+      `/api/v1/sessions/${id}/queue/cancel`,
+      { index },
+    ),
+  steerQueued: (id: string, index: number) =>
+    req<{ status: string; text: string }>('POST', `/api/v1/sessions/${id}/queue/steer`, { index }),
   answerPermission: (reqId: string, decision: string) =>
     req<{ status: string }>('POST', `/api/v1/permissions/${reqId}`, { decision }),
   answerQuestion: (reqId: string, answers: string[][]) =>

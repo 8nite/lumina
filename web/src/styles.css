@@ -95,13 +95,14 @@ pre,
   background: transparent;
 }
 
-/* v2 working shimmer (TextShimmer): gradient sweep across the status text. */
+/* v2 working shimmer (TextShimmer): vibrant gradient sweep across the status text. */
 .v2-shimmer {
   background: linear-gradient(
     90deg,
-    var(--v2-text-faint) 35%,
-    var(--v2-text-base) 50%,
-    var(--v2-text-faint) 65%
+    var(--c-agent) 0%,
+    var(--c-read) 35%,
+    var(--c-edit) 65%,
+    var(--c-agent) 100%
   );
   background-size: 200% 100%;
   -webkit-background-clip: text;

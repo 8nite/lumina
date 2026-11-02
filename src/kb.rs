@@ -349,17 +349,307 @@ impl Default for Sweeper {
     }
 }
 
-/// Re-stamp `memory/graphify-out/manifest.json` from the current `./memory`
-/// notes (cheap freshness anchor for the standing-ops pass).
+/// Per-session KB override: `LUMINA_MEMORY_DIR` (colon-separated, workspace-
+/// relative or absolute). Covers "each session might have different path"
+/// without touching rule files.
+pub fn kb_override() -> Option<String> {
+    std::env::var("LUMINA_MEMORY_DIR").ok().filter(|s| !s.trim().is_empty())
+}
+
+/// Workspace rule texts (declare this workspace's KB): AGENTS.md /
+/// CLAUDE.md / .lumina/rules/*.md. A mention here wins even before the
+/// dir exists (`memory_write` creates it) — this is the per-workspace
+/// "users config rule md files" source of truth.
+fn workspace_rule_texts(workspace: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in [
+        workspace.join("AGENTS.md"),
+        workspace.join("CLAUDE.md"),
+    ] {
+        if let Ok(b) = std::fs::read_to_string(&p) {
+            out.push(b);
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(workspace.join(".lumina/rules")) {
+        for e in rd.flatten() {
+            if e.path().extension().map(|x| x == "md").unwrap_or(false) {
+                if let Ok(b) = std::fs::read_to_string(e.path()) {
+                    out.push(b);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Global rule texts (cross-device vocabulary only): they never create a
+/// per-workspace KB by themselves — a global mention counts only when the
+/// resolved dir already exists in the workspace.
+fn global_rule_texts() -> Vec<String> {
+    let mut out = Vec::new();
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/root"));
+    for p in [home.join(".config/lumina/AGENTS.md"), home.join(".claude/CLAUDE.md")] {
+        if let Ok(b) = std::fs::read_to_string(&p) {
+            out.push(b);
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(home.join(".config/lumina/rules")) {
+        for e in rd.flatten() {
+            if e.path().extension().map(|x| x == "md").unwrap_or(false) {
+                if let Ok(b) = std::fs::read_to_string(e.path()) {
+                    out.push(b);
+                }
+            }
+        }
+    }
+    out
+}
+
+static ASSIGN_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+fn assign_re() -> &'static regex::Regex {
+    ASSIGN_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(?:memory_dir|kb_dir|knowledge_dir|kb_path|memory_path|knowledge_base)\s*[:=]\s*[`"']?([./\w\-:]+)[`"']?"#).unwrap()
+    })
+}
+
+static PATH_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+fn path_re() -> &'static regex::Regex {
+    PATH_RE.get_or_init(|| {
+        regex::Regex::new(r#"[`"']?((?:\./)?(?:[\w\-.]+/)+[\w\-.]*(?:\*\.md|\*|[\w\-.]+)?)[`"']?"#).unwrap()
+    })
+}
+
+/// Extract workspace-relative KB dir candidates from one rule text.
+/// Accepts explicit `memory_dir: docs/notes` assignments, keyword-named
+/// paths (`./memory/`, `memory/*.md`, `docs/knowledge/`, `kb/`), and
+/// notes-file paths on KB-context lines (`memory|knowledge|durable|
+/// notes|wikilink|graphify-out|manifest` nearby — covers `docs/notes`-
+/// style custom dirs). Source files (`*.rs`, `*.ts`, bare `src/`) are
+/// never KB dirs. Returns cleaned dir strings; callers resolve them
+/// against the workspace and filter escapes.
+pub fn explicit_kb_dirs_from_text(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |s: &str, out: &mut Vec<String>| {
+        let mut c = s.trim().trim_matches(|c| c == '`' || c == '"' || c == '\'').trim().to_string();
+        if c.is_empty() {
+            return;
+        }
+        // Strip file globs / file names down to the containing dir.
+        for suffix in ["/*.md", "/*", "*.md"] {
+            if let Some(stripped) = c.strip_suffix(suffix) {
+                c = stripped.to_string();
+                break;
+            }
+        }
+        if c.ends_with(".md") {
+            if let Some(parent) = Path::new(&c).parent() {
+                c = parent.to_string_lossy().into_owned();
+            }
+        }
+        // `memory/graphify-out` is the graph dir — the KB dir is its parent.
+        if let Some(stripped) = c.strip_suffix("/graphify-out") {
+            c = stripped.to_string();
+        }
+        c = c.trim_start_matches("./").trim_end_matches('/').to_string();
+        if c.is_empty() || c == "." {
+            return;
+        }
+        // Safety: no escapes, no absolute-outside-workspace here (resolved later).
+        if c.contains("..") || c.starts_with('/') {
+            return;
+        }
+        // Tooling trees are never a workspace KB.
+        if c.split('/').any(|seg| {
+            seg.starts_with('.') || matches!(seg, "skills" | "plugins" | "scripts" | "harness")
+        }) {
+            return;
+        }
+        // Source files are never KB dirs (`src/kb.rs`, `web/app.ts`).
+        // Notes dirs either carry a KB keyword or came from a `*.md`
+        // path (already stripped to its parent above); a bare `src/`
+        // or `web/` does not qualify.
+        if let Some(last) = c.rsplit('/').next() {
+            if last.contains('.') {
+                return;
+            }
+        }
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    };
+    for cap in assign_re().captures_iter(text) {
+        push(&cap[1], &mut out);
+    }
+    // Pass 1 (keyword-named paths anywhere): `memory` / `knowledge` /
+    // whole-component `kb` in the path itself. `graphify` alone is the
+    // graph tool, not a notes dir.
+    for cap in path_re().captures_iter(text) {
+        let cand = cap[1].trim_start_matches("./").trim_end_matches('/').to_string();
+        if cand.split('/').any(|seg| seg.starts_with('.')) {
+            continue;
+        }
+        let lc = cand.to_lowercase();
+        let is_kb = lc.split('/').any(|seg| seg.contains("memory") || seg.contains("knowledge") || seg == "kb");
+        if is_kb {
+            push(&cand, &mut out);
+        }
+    }
+    // Pass 2 (KB-context lines): a path sharing a line with a KB cue
+    // counts when it is keyword-named or a notes file (`*.md` — covers
+    // `Durable notes live in ./docs/notes/*.md`). Bare source dirs
+    // (`src/`, `src/kb.rs`) on cue lines are still rejected. `kb` alone
+    // is NOT a cue (it fires on every `kb.rs` / `kb_query` mention).
+    const CUES: &[&str] = &[
+        "memory", "knowledge", "durable", "notes", "wikilink", "graphify-out", "manifest", "knowledge base",
+    ];
+    for line in text.lines() {
+        let ll = line.to_lowercase();
+        if !CUES.iter().any(|c| ll.contains(c)) {
+            continue;
+        }
+        for cap in path_re().captures_iter(line) {
+            let raw = cap[1].to_string();
+            let cand = raw.trim_start_matches("./").trim_end_matches('/').to_string();
+            let lc = cand.to_lowercase();
+            let keyword = lc.split('/').any(|seg| {
+                seg.contains("memory") || seg.contains("knowledge") || seg.contains("notes") || seg == "kb"
+            });
+            let notes_file = raw.trim_end().ends_with(".md") || raw.contains("*.md");
+            if keyword || notes_file {
+                push(&raw, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn resolve_override_dirs(workspace: &Path, ov: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for part in ov.split(':') {
+        let p = part.trim();
+        if p.is_empty() || p.contains("..") {
+            continue;
+        }
+        let cand = if Path::new(p).is_absolute() { PathBuf::from(p) } else { workspace.join(p) };
+        if !out.contains(&cand) {
+            out.push(cand);
+        }
+    }
+    out
+}
+
+/// Resolve the workspace's knowledge-base dirs from (in order):
+/// 1. explicit `override_dir` arg or `LUMINA_MEMORY_DIR` env,
+/// 2. workspace rule-md mentions (AGENTS.md / CLAUDE.md / .lumina/rules/),
+/// 3. global rule-md mentions, but only when the dir already exists,
+/// 4. legacy `workspace/memory` when it already holds `.md` notes.
+///
+/// Returns an empty vec when no KB is configured — callers must then SKIP
+/// KB use (never invent a dir, never dump unrelated files).
+pub fn resolve_memory_dirs(workspace: &Path) -> Vec<PathBuf> {
+    if let Some(ov) = kb_override() {
+        let dirs = resolve_override_dirs(workspace, &ov);
+        if !dirs.is_empty() {
+            return dirs;
+        }
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    // Workspace declarations win even before the dir exists (writes create it).
+    for text in workspace_rule_texts(workspace) {
+        for cand in explicit_kb_dirs_from_text(&text) {
+            let p = workspace.join(&cand);
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    // Global mentions are vocabulary, not workspace structure: only honor
+    // them when the dir already holds notes here.
+    for text in global_rule_texts() {
+        for cand in explicit_kb_dirs_from_text(&text) {
+            let p = workspace.join(&cand);
+            if out.contains(&p) {
+                continue;
+            }
+            if p.is_dir() {
+                out.push(p);
+            }
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    // Backwards compat: the lumina repo itself (and long-standing
+    // workspaces) declare `./memory/*.md` in AGENTS.md, but a workspace
+    // without any rule mention still gets its existing memory/ dir so
+    // `lumina kb query` keeps working where notes already live.
+    let legacy = workspace.join("memory");
+    if let Ok(rd) = std::fs::read_dir(&legacy) {
+        let has_md = rd.flatten().any(|e| e.path().extension().map(|x| x == "md").unwrap_or(false));
+        if has_md {
+            return vec![legacy];
+        }
+    }
+    Vec::new()
+}
+
+/// First resolved KB dir, or legacy `workspace/memory` (for writes/CLI).
+pub fn primary_memory_dir(workspace: &Path) -> PathBuf {
+    resolve_memory_dirs(workspace).into_iter().next().unwrap_or_else(|| workspace.join("memory"))
+}
+
+/// True when this workspace declares (or already holds) a knowledge base.
+pub fn has_kb(workspace: &Path) -> bool {
+    !resolve_memory_dirs(workspace).is_empty()
+}
+
+/// Workspace-relative prefix for manifest entries (`memory`, `docs/notes`).
+fn mem_rel(workspace: &Path, mem_dir: &Path) -> String {
+    match mem_dir.strip_prefix(workspace) {
+        Ok(r) if !r.as_os_str().is_empty() => r.to_string_lossy().replace('\\', "/"),
+        _ => "memory".to_string(),
+    }
+}
+
+/// Best-effort deterministic `graphify reflect` for one memory dir:
+/// aggregates `graphify-out/memory/` outcomes into
+/// `graphify-out/reflections/LESSONS.md`. No LLM, no network; all
+/// failures are swallowed (missing binary, missing outcomes dir).
+pub fn try_graphify_reflect(mem_dir: &Path) {
+    let out = mem_dir.join("graphify-out/reflections/LESSONS.md");
+    let mem_outcomes = mem_dir.join("graphify-out/memory");
+    if !mem_outcomes.is_dir() {
+        return;
+    }
+    if let Some(d) = out.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::process::Command::new("graphify")
+        .args(["reflect", "--memory-dir", &mem_outcomes.display().to_string(), "--out", &out.display().to_string()])
+        .output();
+}
+
+/// Re-stamp every resolved KB dir's `graphify-out/manifest.json` from its
+/// current `*.md` notes (cheap freshness anchor for the standing-ops pass).
 pub fn refresh_memory_manifest(workspace: &Path) -> Result<bool, KbError> {
-    let dir = workspace.join("memory");
-    let Ok(rd) = std::fs::read_dir(&dir) else { return Ok(false) };
-    let files: Vec<String> = rd
-        .flatten()
-        .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
-        .map(|e| format!("memory/{}", e.file_name().to_string_lossy()))
-        .collect();
-    manifest_stamp(workspace, &dir.join("graphify-out"), &files)?;
+    let dirs = resolve_memory_dirs(workspace);
+    if dirs.is_empty() {
+        return Ok(false);
+    }
+    for dir in &dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let prefix = mem_rel(workspace, dir);
+        let files: Vec<String> = rd
+            .flatten()
+            .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+            .map(|e| format!("{prefix}/{}", e.file_name().to_string_lossy()))
+            .collect();
+        manifest_stamp(workspace, &dir.join("graphify-out"), &files)?;
+        try_graphify_reflect(dir);
+    }
     Ok(true)
 }
 
@@ -385,32 +675,78 @@ fn pathdiff_rel(base: &Path, p: &Path) -> String {
     }
 }
 
-/// Cold-start reflect: LESSONS.md + MEMORY.md when the graph is stale.
+/// Cold-start reflect: LESSONS.md + MEMORY.md from each resolved KB dir.
+/// Empty when no KB is configured (callers then skip, never invent).
 pub fn reflect(workspace: &Path) -> String {
+    reflect_dirs(workspace, &resolve_memory_dirs(workspace))
+}
+
+/// Same as [`reflect`] but over an explicit dir list (override path).
+fn reflect_dirs(workspace: &Path, dirs: &[PathBuf]) -> String {
     let mut out = String::new();
-    for rel in ["memory/graphify-out/reflections/LESSONS.md", "memory/MEMORY.md", "MEMORY.md"] {
-        let p = workspace.join(rel);
+    for dir in dirs {
+        let prefix = mem_rel(workspace, dir);
+        for rel in ["graphify-out/reflections/LESSONS.md", "MEMORY.md"] {
+            let p = dir.join(rel);
+            if let Ok(b) = std::fs::read_to_string(&p) {
+                out.push_str(&format!("\n--- {prefix}/{rel} ---\n{b}\n"));
+            }
+        }
+    }
+    // Legacy root MEMORY.md (pre-resolution workspaces).
+    if out.is_empty() {
+        let p = workspace.join("MEMORY.md");
         if let Ok(b) = std::fs::read_to_string(&p) {
-            out.push_str(&format!("\n--- {rel} ---\n{b}\n"));
+            out.push_str(&format!("\n--- MEMORY.md ---\n{b}\n"));
         }
     }
     if out.is_empty() {
-        out.push_str("(no MEMORY.md or LESSONS.md yet — run `lumina kb update <topic> \"<note>\"` to seed memory)\n");
+        out.push_str("(no knowledge base configured for this workspace — no memory/knowledge dir mentioned in AGENTS.md/rules and no memory/*.md found; skipping KB)\n");
     }
     out
 }
 
-/// Four-phase retrieval: reflect → constrained vocab → graph traversal →
-/// wikilink read. Returns budgeted context text for the agent.
+/// Four-phase retrieval with clarify-before-KB and rule-based dirs:
+/// vague queries and KB-less workspaces return guidance instead of a
+/// misleading dump. Returns budgeted context text for the agent.
 pub fn query(workspace: &Path, q: &str, budget: usize) -> Result<String, KbError> {
+    query_in(workspace, q, budget, None)
+}
+
+/// Override-aware query: `override_dir` (colon-separated) wins over
+/// `LUMINA_MEMORY_DIR` env and rule-md resolution. Empty override falls
+/// back to the standard chain.
+pub fn query_in(
+    workspace: &Path,
+    q: &str,
+    budget: usize,
+    override_dir: Option<&str>,
+) -> Result<String, KbError> {
     let budget = if budget == 0 { 4000 } else { budget };
+    // Clarify-before-KB: a query with no signal means intent is unknown.
+    // Tell the agent to ask first instead of burning a full-corpus scan.
+    if q.trim().len() < 3 {
+        return Ok("kb: query too vague (empty or <3 chars) — clarify user intent first (use the `question` tool for ambiguous requests), then re-query with 2-6 request keywords, budget 4000.".into());
+    }
+    let dirs: Vec<PathBuf> = match override_dir.filter(|s| !s.trim().is_empty()) {
+        Some(ov) => resolve_override_dirs(workspace, ov),
+        None => resolve_memory_dirs(workspace),
+    };
+    if dirs.is_empty() {
+        let mut out = String::from("## reflect\n");
+        out.push_str(&reflect_dirs(workspace, &[]));
+        out.push_str("\nkb: no knowledge base configured for this workspace (no memory/knowledge dir mentioned in AGENTS.md/rules and no memory/*.md found) — skipping KB; proceed with code/tools, ask the user if durable memory is needed.\n");
+        return Ok(out);
+    }
     let lq_words: Vec<String> = q.to_lowercase().split_whitespace().map(|w| w.to_string()).collect();
     let mut out = String::from("## reflect\n");
-    out.push_str(&reflect(workspace));
-    let graph_paths = [
-        workspace.join("memory/graphify-out/graph.json"),
-        workspace.join("graphify-out/graph.json"),
-    ];
+    out.push_str(&reflect_dirs(workspace, &dirs));
+    let mut graph_paths: Vec<PathBuf> = Vec::new();
+    for dir in &dirs {
+        graph_paths.push(dir.join("graphify-out/graph.json"));
+    }
+    // Workspace code graph (AST, 0 LLM tokens) alongside memory graphs.
+    graph_paths.push(workspace.join("graphify-out/graph.json"));
     let mut seeds: Vec<String> = Vec::new();
     for gp in &graph_paths {
         if !gp.exists() {
@@ -439,49 +775,63 @@ pub fn query(workspace: &Path, q: &str, budget: usize) -> Result<String, KbError
     // Recursive [[wikilink]] resolution from graph seeds, plus fallbacks
     // when the graph is missing or silent (note filenames matching query
     // words + every [[link]] in MEMORY.md — the index is only useful if
-    // something follows its pointers).
-    let mem = workspace.join("memory");
+    // something follows its pointers). Resolved per-KB-dir, not hardcoded.
     let mut fb: Vec<String> = Vec::new();
+    let mut fb_dir: PathBuf = dirs[0].clone();
     if seeds.is_empty() {
-        if let Ok(rd) = std::fs::read_dir(&mem) {
-            let mut names: Vec<String> = rd
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-            names.sort();
-            for n in names {
-                if !n.ends_with(".md") {
-                    continue;
-                }
-                let stem = n.trim_end_matches(".md").to_lowercase();
-                if stem == "memory" || stem.is_empty() {
-                    continue;
-                }
-                if lq_words.iter().any(|w| {
-                    let w = w.as_str();
-                    !w.is_empty() && (stem.contains(w) || w.contains(&stem))
-                }) {
-                    fb.push(stem);
-                }
-                if fb.len() >= 6 {
-                    break;
+        for dir in &dirs {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                let mut names: Vec<String> = rd
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                for n in names {
+                    if !n.ends_with(".md") {
+                        continue;
+                    }
+                    let stem = n.trim_end_matches(".md").to_lowercase();
+                    if stem == "memory" || stem.is_empty() {
+                        continue;
+                    }
+                    if lq_words.iter().any(|w| {
+                        let w = w.as_str();
+                        !w.is_empty() && (stem.contains(w) || w.contains(&stem))
+                    }) {
+                        fb.push(stem.clone());
+                        fb_dir = dir.clone();
+                    }
+                    if fb.len() >= 6 {
+                        break;
+                    }
                 }
             }
-        }
-        if let Ok(body) = std::fs::read_to_string(mem.join("MEMORY.md")) {
-            for link in wikilinks(&body) {
-                if fb.len() >= 8 {
-                    break;
+            if fb.len() >= 6 {
+                fb_dir = dir.clone();
+                break;
+            }
+            if let Ok(body) = std::fs::read_to_string(dir.join("MEMORY.md")) {
+                for link in wikilinks(&body) {
+                    if fb.len() >= 8 {
+                        break;
+                    }
+                    if !fb.contains(&link) {
+                        fb.push(link);
+                    }
                 }
-                if !fb.contains(&link) {
-                    fb.push(link);
-                }
+            }
+            if !fb.is_empty() {
+                fb_dir = dir.clone();
+                break;
             }
         }
     }
     let all_seeds: Vec<String> = seeds.iter().cloned().chain(fb).take(8).collect();
+    // Graph seeds resolve against the first KB dir; filename fallbacks
+    // against the dir that produced them.
+    let seed_dir = if seeds.is_empty() { fb_dir } else { dirs[0].clone() };
     for s in all_seeds.iter().take(6) {
-        for (name, body) in resolve_wikilinks(&mem, s, 6) {
+        for (name, body) in resolve_wikilinks(&seed_dir, s, 6) {
             let chunk = format!("\n### [[{name}]]\n{body}\n");
             if out.len() + chunk.len() > budget + 2000 {
                 break;
@@ -502,9 +852,24 @@ fn secret_re() -> &'static regex::Regex {
     })
 }
 
-/// Dedup-on-write memory synthesis. Refuses live-secret-shaped content
+/// Dedup-on-write memory synthesis into the rule-declared KB dir
 /// (2-layer guard: shape deny + MEMORY.md pointer guidance).
+/// Writes are post-completion only (see system prompt); mid-turn
+/// speculation is a caller bug. Refuses live-secret-shaped content.
 pub fn memory_write(workspace: &Path, topic: &str, content: &str) -> Result<String, KbError> {
+    memory_write_in(workspace, topic, content, None)
+}
+
+/// Override-aware write: `override_dir` wins over env + rule resolution.
+/// Explicit CLI use falls back to `workspace/memory` so `kb update` works
+/// even before any rule declares a KB; autonomous agent writes should only
+/// run when `has_kb` (the system prompt enforces this).
+pub fn memory_write_in(
+    workspace: &Path,
+    topic: &str,
+    content: &str,
+    override_dir: Option<&str>,
+) -> Result<String, KbError> {
     if topic.trim().is_empty() || content.trim().is_empty() {
         return Err(KbError::Msg("memory_write: missing topic/content".into()));
     }
@@ -513,7 +878,10 @@ pub fn memory_write(workspace: &Path, topic: &str, content: &str) -> Result<Stri
             "memory_write: content looks like a live secret — store a ${placeholder} pointer, never the value".into(),
         ));
     }
-    let dir = workspace.join("memory");
+    let dir = match override_dir.filter(|s| !s.trim().is_empty()) {
+        Some(ov) => resolve_override_dirs(workspace, ov).into_iter().next().unwrap_or_else(|| workspace.join("memory")),
+        None => primary_memory_dir(workspace),
+    };
     std::fs::create_dir_all(&dir)?;
     // Base prevents traversal; memory writes stay inside ./memory.
     let mut name = match PathBuf::from(topic).file_name() {
@@ -561,15 +929,18 @@ pub fn memory_write(workspace: &Path, topic: &str, content: &str) -> Result<Stri
         c.push('\n');
         std::fs::write(&idx, c)?;
     }
-    // Keep the graphify manifest fresh so kb queries never go stale.
+    // Keep the graphify manifest fresh so kb queries never go stale,
+    // then best-effort deterministic reflect (LESSONS.md aggregation).
     if let Ok(rd) = std::fs::read_dir(&dir) {
+        let prefix = mem_rel(workspace, &dir);
         let files: Vec<String> = rd
             .flatten()
             .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
-            .map(|e| format!("memory/{}", e.file_name().to_string_lossy()))
+            .map(|e| format!("{prefix}/{}", e.file_name().to_string_lossy()))
             .collect();
         let _ = manifest_stamp(workspace, &dir.join("graphify-out"), &files);
     }
+    try_graphify_reflect(&dir);
     Ok(format!("wrote {}", p.display()))
 }
 
@@ -672,5 +1043,67 @@ mod fallback_tests {
         let out = query(ws, "magic fruit", 4000).unwrap();
         assert!(out.contains("kiwi"), "{out}");
         assert!(out.contains("[[fruit]]"), "{out}");
+    }
+
+    #[test]
+    fn vague_query_asks_to_clarify_first() {
+        let d = tempfile::tempdir().unwrap();
+        for q in ["", "  ", "hi"] {
+            let out = query(d.path(), q, 4000).unwrap();
+            assert!(out.contains("clarify"), "{q} -> {out}");
+        }
+    }
+
+    #[test]
+    fn no_kb_dir_skips_with_guidance() {
+        let d = tempfile::tempdir().unwrap();
+        // No AGENTS.md mention and no memory/*.md: KB-less workspace.
+        let out = query(d.path(), "how does auth work", 4000).unwrap();
+        assert!(out.contains("no knowledge base configured"), "{out}");
+        assert!(!has_kb(d.path()));
+    }
+
+    #[test]
+    fn rule_declared_custom_dir_is_used() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path();
+        std::fs::write(ws.join("AGENTS.md"), "# rules\n\nDurable notes live in ./docs/notes/*.md\n").unwrap();
+        std::fs::create_dir_all(ws.join("docs/notes")).unwrap();
+        std::fs::write(ws.join("docs/notes/MEMORY.md"), "# idx\n\n- [[apple]]\n").unwrap();
+        std::fs::write(ws.join("docs/notes/apple.md"), "the custom fruit is mango\n").unwrap();
+        assert!(has_kb(ws));
+        assert_eq!(resolve_memory_dirs(ws), vec![ws.join("docs/notes")]);
+        let out = query(ws, "custom fruit mango", 4000).unwrap();
+        assert!(out.contains("mango"), "{out}");
+        let w = memory_write(ws, "banana", "yellow [[apple]]").unwrap();
+        assert!(w.contains("docs/notes/banana.md"), "{w}");
+        assert!(ws.join("docs/notes/banana.md").exists());
+        // Manifest is workspace-relative to the custom dir.
+        let man = std::fs::read_to_string(ws.join("docs/notes/graphify-out/manifest.json")).unwrap();
+        assert!(man.contains("docs/notes/banana.md"), "{man}");
+    }
+
+    #[test]
+    fn override_dir_wins_over_rules() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path();
+        std::fs::write(ws.join("AGENTS.md"), "notes in ./memory/*.md\n").unwrap();
+        std::fs::create_dir_all(ws.join("custom")).unwrap();
+        std::fs::write(ws.join("custom/MEMORY.md"), "- [[z]]\n").unwrap();
+        let out = query_in(ws, "zebra zone", 4000, Some("custom")).unwrap();
+        assert!(!out.contains("no knowledge base"), "{out}");
+        let w = memory_write_in(ws, "t", "body [[z]]", Some("custom")).unwrap();
+        assert!(w.contains("custom/t.md"), "{w}");
+    }
+
+    #[test]
+    fn explicit_dirs_parse() {
+        assert_eq!(explicit_kb_dirs_from_text("memory_dir: docs/notes"), vec!["docs/notes".to_string()]);
+        let v = explicit_kb_dirs_from_text("Durable notes live in ./memory/*.md");
+        assert!(v.contains(&"memory".to_string()), "{v:?}");
+        let v2 = explicit_kb_dirs_from_text("knowledge base: ./kb/");
+        assert!(v2.iter().any(|s| s.contains("kb")), "{v2:?}");
+        // Escapes are dropped.
+        assert!(explicit_kb_dirs_from_text("see ../outside/memory/x").is_empty());
     }
 }
