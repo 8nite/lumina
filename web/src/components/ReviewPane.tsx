@@ -108,7 +108,7 @@ function ReviewChanges(props: { workspace: string; focus?: { path: string; line?
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.workspace]);
 
-  // opencode v2: clicking a file mention in chat focuses that file here.
+  // clicking a file mention in chat focuses that file here.
   useEffect(() => {
     if (!props.focus) return;
     setFiles((fs) => fs.map((f) => (f.path === props.focus!.path || f.path.endsWith('/' + props.focus!.path) ? { ...f, collapsed: false } : f)));

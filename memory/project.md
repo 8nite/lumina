@@ -1,11 +1,11 @@
 ---
-date_modified: 2026-10-30
+date_modified: 2026-11-02
 tags: [architecture, lumina, harness2, graphify, plugins, permissions, sessions]
 ---
 
 # Lumina Project Architecture
 
-- **Repo:** `8nite/lumina` (blueprint in [[plan]]).
+- **Repo:** `lumina` (blueprint in [[plan]]).
 - **Stack:** Pure-Go (`CGO_ENABLED=0`) Go 1.22+ single-binary daemon (`lumina serve`) + Bubble Tea TUI + embedded React 19 / TypeScript / Vite / Tailwind Web UI (`//go:embed`) + pure-Go SQLite (`modernc.org/sqlite`) for session/turn-tree/trace state.
 - **Lumina Parity (Rules, Plugins, Modes, Sessions):**
   - **Rules & Extensions (`internal/rules`):** Merges global `~/.config/lumina/AGENTS.md` + `instructions/*.md` (with optional read-only `~/.claude/CLAUDE.md` import) + repo/subdir `AGENTS.md`, plus lazy `skills/<name>/SKILL.md`, `agents/*.md`, and `commands/*.md`.

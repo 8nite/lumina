@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Lumina Rust port — live end-to-end suite (real BYO-LLM backend).
 # Usage: ./tests/e2e-live.sh [--base URL] [--workdir DIR]
-# Requires: daemon up, network + configured provider (opencode_go default).
+# Requires: daemon up, network + configured provider.
 # All workspaces are scratch dirs under /tmp; router/model state is restored.
 set -u
 BASE="http://127.0.0.1:4089"

@@ -88,8 +88,8 @@ pub fn split_model(s: &str) -> (String, String) {
 }
 
 /// Canonical reasoning ladder, low to high: none < minimal < low < medium <
-/// high < xhigh < max. This is the union of provider API vocabularies
-/// (opencode advertises minimal/none); per-model SELECTABILITY comes from
+/// high < xhigh < max. This is the union of provider API vocabularies;
+/// per-model SELECTABILITY comes from
 /// each model's advertised `supported_efforts` (see `efforts_or_default`),
 /// never from this list alone.
 pub fn normalize_effort(s: &str) -> &str {
@@ -218,7 +218,7 @@ pub fn effort_step_down(effort: &str) -> Option<&'static str> {
     })
 }
 
-/// True when a 400 body blames the reasoning effort (e.g. opencode zen:
+/// True when a 400 body blames the reasoning effort:
 /// "does not support reasoning_effort='max'"). Transport-level signal for
 /// the step-down retry; values are never parsed out of the message.
 pub fn is_effort_error(body: &str) -> bool {
@@ -732,7 +732,7 @@ async fn chat_openai(
     for (k, v) in extra_headers {
         http = http.header(*k, v.clone());
     }
-    // Session routing (stable per request; opencode zen routes on these).
+    // Session routing (stable per request).
     // Effort step-down (responses parity): retry down the ladder on an
     // effort-rejection 400 instead of failing the turn.
     let sid = uuid::Uuid::new_v4().to_string();
@@ -1176,7 +1176,7 @@ fn is_zero(n: &u32) -> bool {
 /// Live model listing for pickers (`lumina models`, TUI /model, web picker).
 /// Metadata failures mean "unknown" — never fail a turn over listing.
 /// OpenAI-style model listing (GET /models; OpenRouter `context_length`).
-/// Provider-specific schemas (e.g. opencode zen `limit.context`) belong in
+/// Provider-specific schemas belong in
 /// plugins via the `models.list` hook, not here.
 async fn openai_models(def: &ProviderDef, extra: &[(&str, String)]) -> Result<Vec<ModelMeta>, LlmError> {
     let url = format!("{}/models", def.base_url.trim_end_matches('/'));
@@ -1604,8 +1604,7 @@ mod tests {
     }
 
     /// Core parses only generic OpenAI/OpenRouter metadata (`context_length`,
-    /// `supported_efforts`). Provider-specific schemas (opencode zen
-    /// `limit.context`, `capabilities.reasoning.effort`) stay unknown here —
+    /// `supported_efforts`). Provider-specific schemas stay unknown here —
     /// a plugin enriches them via the `models.list` hook.
     #[tokio::test]
     async fn openai_models_parses_generic_window_and_efforts() {

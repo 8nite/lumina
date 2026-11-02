@@ -128,7 +128,7 @@ function renderInline(
       i += um[0].length;
       continue;
     }
-    // file path mention → diff-view link (opencode v2: click opens file).
+    // file path mention → diff-view link (click opens file).
     const fmatch = fileRe.exec(rest);
     if (fmatch && fmatch.index === 0) {
       const prefix = fmatch[1];

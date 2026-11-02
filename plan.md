@@ -8,7 +8,7 @@
 > Rust equivalents listed in `AGENTS.md`. Architecture, behaviour and
 > guarantees described here still hold.
 
-> **Repository:** `8nite/lumina`  
+> **Repository:** `lumina`  
 > **Summary:** A local-first, self-improving AI coding & open-world agent harness featuring a decoupled client–server daemon (`lumina serve`), Lumina-style Web UI + Terminal TUI frontends, **`Plan` ↔ `Build` primary agent modes (`Tab`)**, **Lumina-compatible JS/TS plugins + `AGENTS.md` rule hierarchy**, granular approval modes (`Shift+Tab`: `ask` / `auto-edit` / `auto-approve` / `bypass`), seamless session continuation (`-c` / `-s` / `fork` / `run`), vendor-neutral BYO-LLM routing, **Harness²** recursive self-improvement, and **Markdown + `graphify` Knowledge-Graph RAG** — with **zero Google services**.
 
 ---
@@ -102,7 +102,7 @@ flowchart TB
 
 ---
 
-## 4. Repository Layout (`8nite/lumina`)
+## 4. Repository Layout (`lumina`)
 
 ```text
 lumina/
@@ -225,7 +225,7 @@ Modeled directly on the host's live `~/.config/lumina/plugins/` (`rtk.ts`, `work
 | `tool.execute.after` | Observe tool args, result, duration, and `sessionID` asynchronously | Deployment regression triggers (`standing-ops` e2e gate), audit logging |
 | `shell.env` | Inject/override environment variables (`output.env`) per `bash`/PTY call | Per-session `TMPDIR` or tool PATH injection |
 | `permission.ask` | Return `"allow"` / `"deny"` / `"ask"` before prompting user | Custom organizational auto-approval policies |
-| `models.list` | Replace/enrich `output.models` for a provider's `/models` listing | `plugins/opencode-zen.mjs`: Zen catalog + `limit.context`/`capabilities.reasoning.effort` for opencode providers |
+| `models.list` | Replace/enrich `output.models` for a provider's `/models` listing | `plugins/opencode-zen.mjs`: Zen catalog + `limit.context`/`capabilities.reasoning.effort` for upstream providers |
 | `event` | Subscribe to daemon lifecycle events (`session.created`, `session.idle`, `session.deleted`) | Scratch cleanup on `session.deleted` |
 
 - **Execution Isolation:** Runs in a single persistent local Node v22 child process (`host.mjs`) over a local Unix domain socket with per-hook timeouts (`5s` default, configurable for heavy attachment hooks) so a buggy plugin never crashes `lumina serve`.
@@ -404,7 +404,7 @@ Versioned on local Git ref `refs/lumina/harness` so workspace `git status` stays
 ## 11. Phased Implementation Plan & Runnable Verification Gates
 
 ### Milestone 0 — Repo Skeleton, Config, Rules (`AGENTS.md`) & Security Core
-- Initialize Go module (`github.com/8nite/lumina`), `pnpm` workspace (`web/`), `Makefile`, and pure-Go SQLite (`modernc.org/sqlite`) schema.
+- Initialize Go module (`github.com/lumina`), `pnpm` workspace (`web/`), `Makefile`, and pure-Go SQLite (`modernc.org/sqlite`) schema.
 - Implement `internal/config` (TOML + hot-reload + `api_key_env`/`api_key_cmd` + Google-domain blocklist), `internal/rules` (`AGENTS.md` + `rules/*.md` + `skills/` + `agents/` + `commands/` discovery), and `internal/security` (`plan` vs `build` structural fence + 4-mode permission broker: `ask` / `auto-edit` / `auto-approve` / `bypass`, immutable credential-file hard-deny even in `bypass`, per-session `TMPDIR` lifecycle).
 - **Verification Gate:** `CGO_ENABLED=0 go test ./internal/config ./internal/rules ./internal/security ./internal/server` — verifies `AGENTS.md` precedence, confirms `plan` mode blocks code mutations even when `--bypass` is set (allowing only `plan.md` / `.lumina/plans/*.md`), confirms `--bypass` in `build` mode still hard-denies `.env`/`auth.json`/`lumina.json`/`*.googleapis.com`, and validates `/openapi.json`.
 

@@ -333,7 +333,6 @@ mod frontmatter_tests {
 
     #[test]
     fn rules_dir_loads_as_layer() {
-        // opencode v2 plural-dir convention: .lumina/rules/*.md (was instructions/).
         let d = tempfile::tempdir().unwrap();
         let ws = d.path();
         std::fs::create_dir_all(ws.join(".lumina/rules")).unwrap();

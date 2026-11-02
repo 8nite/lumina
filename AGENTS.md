@@ -1,6 +1,6 @@
 # Lumina — workspace rules
 
-This repo (`8nite/lumina`) is a **Rust + React** monorepo: `src/` (Rust)
+This repo (`lumina`) is a **Rust + React** monorepo: `src/` (Rust)
 is the maintained stack. The Go tree (`cmd/`, `internal/`, `pkg/`,
 `go.mod`/`go.sum`) was deleted from this branch (`rust-revamp`) on
 2026-11-01 after green parity baselines on both stacks; `main` is still

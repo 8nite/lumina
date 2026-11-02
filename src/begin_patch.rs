@@ -1,4 +1,4 @@
-//! opencode `*** Begin Patch ***` envelope (Add/Update/Delete/Move + `@@`
+//! `*** Begin Patch ***` envelope (Add/Update/Delete/Move + `@@`
 //! context hunks). The multi-file
 //! counterpart to edit/write — one call can create, rewrite, move, and
 //! delete files atomically per hunk, failing with partial progress.
@@ -162,7 +162,7 @@ fn parse_chunks(lines: &[String], start: usize, end: usize, path: &str) -> Resul
     Ok((chunks, i))
 }
 
-/// Unwrap `cat <<EOF ... EOF` quoting (opencode parity).
+/// Unwrap `cat <<EOF ... EOF` quoting.
 fn strip_patch_heredoc(input: &str) -> String {
     let mut lines = input.splitn(2, '\n');
     let first = lines.next().unwrap_or("");
@@ -324,7 +324,7 @@ fn patch_match(lines: &[String], pattern: &[String], off: usize, cmp: fn(&str, &
     pattern.iter().enumerate().all(|(j, p)| lines.get(off + j).is_some_and(|l| cmp(l, p)))
 }
 
-/// Fuzzy seek: exact, rstrip, trim, normalized (opencode parity).
+/// Fuzzy seek: exact, rstrip, trim, normalized.
 fn patch_seek(lines: &[String], pattern: &[String], start: usize, eof: bool) -> Option<usize> {
     if pattern.is_empty() {
         return None;

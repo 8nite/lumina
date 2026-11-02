@@ -409,7 +409,6 @@ fn do_read(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Out
     if offset - 1 > lines.len() {
         return Ok(Outcome { output: String::new(), truncated: false });
     }
-    // 1-based "line: content" matches opencode read.ts so models can cite
     // lines and edits stay prefix-free.
     let out: Vec<String> = (offset - 1..end).map(|i| format!("{}: {}", i + 1, lines[i])).collect();
     Ok(Outcome { output: out.join("\n"), truncated: end < lines.len() })
@@ -438,7 +437,6 @@ fn do_edit(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Out
     if !text.contains(&old) {
         return Err(ToolError::Msg("edit: old_string not found".into()));
     }
-    // opencode parity: replaceAll replaces every occurrence.
     let updated = if is_truthy(args.get("replaceAll")) || is_truthy(args.get("replace_all")) {
         text.replace(&old, &new)
     } else {
@@ -936,7 +934,6 @@ fn do_question(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result
     }
 }
 
-/// Decode the question-tool input (opencode Question.Prompt shape:
 /// {question, header, options: [{label, description}], multiple}).
 /// Bare strings ("q1") and legacy {text, options:[string]} also parse.
 fn parse_questions(args: &HashMap<String, serde_json::Value>) -> Result<Vec<crate::approve::Question>, ToolError> {
@@ -1011,7 +1008,6 @@ fn parse_questions(args: &HashMap<String, serde_json::Value>) -> Result<Vec<crat
     Ok(qs)
 }
 
-/// Render replies model-side (opencode QuestionTool.toModelContent parity).
 fn format_question_answers(qs: &[crate::approve::Question], answers: &[Vec<String>]) -> String {
     let mut parts = Vec::new();
     for (i, q) in qs.iter().enumerate() {
@@ -1375,7 +1371,6 @@ mod tests {
         let reg = Registry::new();
         let sc = ctx(d.path(), Agent::Build, PermissionMode::Bypass);
         reg.call(&sc, "write", &args(&[("path", "a.txt"), ("content", "hi\nthere")])).unwrap();
-        // Line-numbered output (opencode read.ts parity).
         let out = reg.call(&sc, "read", &args(&[("path", "a.txt")])).unwrap();
         assert_eq!(out.output, "1: hi\n2: there");
         assert!(!out.truncated);
@@ -1510,7 +1505,6 @@ mod extended_tests {
         let out = reg.call(&sc, "question", &q).unwrap();
         assert!(out.output.contains("best guess"), "{}", out.output);
         assert!(out.output.contains("pick one?"), "{}", out.output);
-        // formatQuestionAnswers mirrors opencode's toModelContent.
         let qs = parse_questions(&q).unwrap();
         assert_eq!(qs.len(), 2);
         assert!(qs[0].multiple && qs[0].options[0].description == "first");

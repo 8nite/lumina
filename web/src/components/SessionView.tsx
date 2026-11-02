@@ -65,7 +65,7 @@ export function formatSummary(s: TurnSummary | null): string {
 }
 
 // --- v2-style conversation rows -------------------------------------------
-// Row model mirrors opencode v2 session-ui/timeline rows under the default
+// Row model mirrors session-ui/timeline rows under the default
 // compact preset: user message, grouped tool calls (read group collapsed,
 // shell monospace, error cards collapsed), thinking, error card, turn diff.
 // Data comes from Lumina's transcript (tool turns are `name: output`) +
@@ -151,7 +151,7 @@ function fmtTime(iso?: string): string {
 }
 
 function ToolRow(props: { name: string; body: string; error: boolean; live?: boolean; duration_ms?: number }) {
-  // opencode v2: every finished tool row starts collapsed to a one-line
+  // every finished tool row starts collapsed to a one-line
   // preview; click toggles the full body.
   const [open, setOpen] = useState(false);
   const summary = oneLine(props.body) || (props.live ? 'running…' : '(no output)');
@@ -412,7 +412,7 @@ export function SessionView(props: {
             }
             // Thinking arrives as one dialog per pause (flushed live on
             // pause/tool boundaries, persisted per round server-side).
-            // opencode v2: thinking streams arrive as packed sentences, so
+            // thinking streams arrive as packed sentences, so
             // split into one indented line per sentence for scanability
             // (short fragments stay on one line).
             if (t.role === 'thinking') {

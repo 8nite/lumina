@@ -29,7 +29,7 @@ pub struct PendingQuestion {
     pub questions: Vec<Question>,
 }
 
-/// One option in a user question (opencode Question.Prompt shape).
+/// One option in a user question.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QuestionOption {
     #[serde(default)]
@@ -39,7 +39,7 @@ pub struct QuestionOption {
 }
 
 /// One user question: `{question, header, options: [{label, description}],
-/// multiple}` (opencode parity).
+/// multiple}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {
     #[serde(default)]

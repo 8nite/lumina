@@ -1,7 +1,7 @@
 # Lumina Web-Mode E2E + Auto-Compact Stress Test
 
 Date: 2026-10-29 (re-executed same day, fresh run below; prior run archived in
-git history). Target: `8nite/lumina` worktree `<workspace-checkout>`.
+git history). Target: `lumina` worktree `<workspace-checkout>`.
 Daemon: `bin/lumina serve --port 17432` with `LUMINA_DB=/tmp/lumina-e2e-*/lumina.db`
 and `LUMINA_CONFIG=/tmp/lumina-nonexistent-e2e.toml` (offline: zero providers,
 canned replies). Workspace: temp git repo `/tmp/lumina-ws-e2e-*`. Browser:

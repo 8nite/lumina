@@ -968,7 +968,7 @@ async fn models(State(st): State<AppState>, Query(q): Query<ModelsQ>) -> impl In
 }
 
 /// `models.list` plugin hook: lets plugins replace/enrich the core model
-/// list (e.g. opencode zen catalog + zen schema metadata). Runs on the
+/// list. Runs on the
 /// blocking pool; a silent/missing plugin keeps the core list.
 fn plugin_models(
     st: &AppState,

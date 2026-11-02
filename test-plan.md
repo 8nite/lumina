@@ -5,7 +5,7 @@
 > map to `cargo clippy --tests` / `cargo test` on the Rust tree in `src/`;
 > the test IDs and behaviours remain the reference matrix.
 
-Verification matrix for `8nite/lumina` against `plan.md` (§1–§14) and `AGENTS.md`.
+Verification matrix for `lumina` against `plan.md` (§1–§14) and `AGENTS.md`.
 
 ## Test Environment & Isolation Rules
 
@@ -324,7 +324,7 @@ no secrets — real `POST github.com/login/device/code` issued a user code
 (after correcting the client_id to `Iv1.b507a08c87ecfe98`), and a dummy-token
 exchange hit the real endpoint shape (auth rejected, not 404).
 
-### E2E run 2026-10-31 — opencode-v2 web copy (working events, layout, formats)
+### E2E run 2026-10-31 — v2 web copy (working events, layout, formats)
 
 Isolation honored: `LUMINA_DB=/tmp/lumina-e2e-*/lumina.db`, ports
 `17435` (+ dead-provider `17436` via `LUMINA_CONFIG`), scratch in

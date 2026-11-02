@@ -1,15 +1,15 @@
-// opencode-zen: serves the opencode Zen model catalog (plus Zen schema
-// metadata) to any connected opencode provider (e.g. opencode_go).
+// serves the Zen model catalog (plus Zen schema
+// metadata) to any connected provider.
 //
 // Why a plugin: the Zen catalog endpoint and its schema
-// (`limit.context`, `capabilities.reasoning.effort`) are opencode-specific.
+// (`limit.context`, `capabilities.reasoning.effort`) are provider-specific.
 // Core only parses generic OpenAI/OpenRouter metadata and fetches
 // `<base_url>/models`; this plugin merges the Zen catalog on top via the
 // generic `models.list` hook, so core stays provider-neutral.
 //
-// Per https://opencode.ai docs: the same API key works for Go and Zen.
-// Go catalog:  https://opencode.ai/zen/go/v1/models (or /inference/go/...)
-// Zen catalog: https://opencode.ai/zen/v1/models
+// Per upstream docs: the same API key works for Go and Zen.
+// Go catalog:  <base_url>/zen/go/v1/models (or /inference/go/...)
+// Zen catalog: <base_url>/zen/v1/models
 // A Go id like `muse-spark-1.3-contributor` and its Zen twin `muse-spark-1.3`
 // share `canonical_id` (`meta/muse-spark-1.3`). Twins are endpoint-bound:
 // each id 400s on the other endpoint ("Model is unavailable"), so the plugin
@@ -17,10 +17,9 @@
 // Zen twin. Zen-only ids translate across endpoints and are listed.
 //
 // Install:
-//   cp plugins/opencode-zen.mjs ~/.config/lumina/plugins/
+//   cp plugins/<plugin>.mjs ~/.config/lumina/plugins/
 // Requires the provider to use api_key_env or api_key_cmd (never a pasted
 // secret — the plugin runs your own configured command locally).
-// Test override: OPENCODE_ZEN_MODELS_URL=http://127.0.0.1:PORT/zen
 export default async ({ $ }) => ({
   "models.list": async (input) => {
     const provider = input.provider || "";

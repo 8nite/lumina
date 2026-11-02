@@ -552,7 +552,6 @@ mod tests {
 
     #[test]
     fn tooling_docs_cover_rules_dir() {
-        // opencode v2 plural-dir convention: rules/ (was instructions/).
         for t in [
             ".lumina/rules/coding.md",
             "/home/u/.config/lumina/rules/style.md",

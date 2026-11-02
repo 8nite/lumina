@@ -1,4 +1,4 @@
-//! GitHub device flow for Copilot (`lumina auth device`, TUI /connect).
+//! GitHub device flow for Copilot (`lumina auth --provider copilot`, TUI /connect).
 //! Web auth via github.com device
 //! codes, tokens in `~/.config/lumina/tokens/<provider>.json` (0600).
 

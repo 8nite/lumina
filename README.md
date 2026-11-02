@@ -1,11 +1,11 @@
 # Lumina — local-first AI coding & open-world agent harness
 
-> **Rust-only (branch `rust-revamp`):** the daemon + CLI + TUI live in `src/`
+> **Rust + React monorepo:** the daemon + CLI + TUI live in `src/`
 > (`make build` → `bin/lumina`, `make test` → `cargo test`). The React SPA
-> in `web/` is embedded at build time. The Go tree (`cmd/`, `internal/`,
-> `pkg/`) was removed from this branch after a module-by-module parity
-> audit; every feature it had is in `src/` (see `memory/rust-port.md`).
-> `main` is still Go until this branch is tested and merged.
+> in `web/` is embedded into the binary at build time (`rust-embed`,
+> `web/dist/`). The legacy Go tree (`cmd/`, `internal/`, `pkg/`) was
+> removed after a module-by-module parity audit; every feature it had is
+> in `src/` (see `memory/rust-port.md`).
 
 See `plan.md` for the full architecture & implementation plan,
 and `test-plan.md` for the verification matrix (all suites PASS).
@@ -66,9 +66,11 @@ improver = "openrouter/deepseek/deepseek-r1"
 [kb]
 idle_debounce_minutes = 15
 standing_ops = false           # auto-distill transcripts into ./memory/
+auto_commit_ast_hook = false   # rebuild workspace graph on git commit
 
 [websearch]                    # needs a provider key to do anything
-provider = ""                  # exa | firecrawl | parallel | tavily | tinyfish
+provider = ""                  # exa | firecrawl | parallel | tavily | tinyfish | random | auto
+disabled = false               # kill-switch: removes the websearch tool
 ```
 
 Env overrides: `LUMINA_CONFIG` (config path), `LUMINA_DB` (SQLite path),
@@ -79,7 +81,7 @@ Env overrides: `LUMINA_CONFIG` (config path), `LUMINA_DB` (SQLite path),
 | Command | What it does |
 |---|---|
 | `lumina [--agent plan\|build] [-c] [-s <id>] [--auto-edit\|-y\|--bypass]` | Open the Terminal TUI (starts a daemon in-process if `:4089` is free). `-c` resumes the latest session for the directory, `-s` resumes one by id. `[defaults]` apply unless a flag overrides them. |
-| `lumina run [flags] "<prompt>"` | Headless one-shot. Flags work in any position, `--flag=value` too: `--agent`, `--plan`, `-c`, `-s <id>`, `-m model`, `--format text\|json`, `--auto-edit`, `-y`, `--bypass`, `--effort low\|medium\|high\|xhigh\|max`, `--attach <image>` (repeatable, 8MB cap each), `--` to end flags. |
+| `lumina run [flags] "<prompt>"` | Headless one-shot. Flags work in any position, `--flag=value` too: `--agent`, `--plan`, `-c`, `-s <id>`, `-m model`, `--format text\|json`, `--auto-edit`, `-y`, `--bypass`, `--effort auto\|none\|minimal\|low\|medium\|high\|xhigh\|max`, `--attach <image>` (repeatable, 8MB cap each), `--` to end flags. |
 | `lumina serve [--host 127.0.0.1] [--port 4089]` | Headless daemon (REST + SSE + PTY). Non-loopback binds require `LUMINA_TOKEN`. |
 | `lumina web` | Ensure the daemon is up, then point your browser at it (embedded SPA). |
 | `lumina attach <url>` | Run the TUI against a remote/LAN daemon (needs `LUMINA_TOKEN` set). |
@@ -87,12 +89,13 @@ Env overrides: `LUMINA_CONFIG` (config path), `LUMINA_DB` (SQLite path),
 | `lumina session show <id>` | Turn-by-turn transcript. |
 | `lumina session fork <id> [turn]` | Branch a session (optionally at a turn). |
 | `lumina session export <id> [--sanitize]` | Markdown transcript; `--sanitize` redacts secrets. |
+| `lumina session delete <id>` | Hard-delete the session row + turns. |
 | `lumina plugin list \| doctor` | Show discovered JS/TS plugins; check the Node v22 host. |
 | `lumina kb query "<q>" \| reflect \| status` | Query the Markdown+graphify graph, print `LESSONS.md`+`MEMORY.md`, show graph freshness. |
 | `lumina kb update <topic> "<note>"` | Append a durable fact to `./memory/<topic>.md` (deduped). |
 | `lumina evolve [session-id]` | Harness² self-improvement pass (`Propose → Probe → Compose`, quality-floor gated). |
-| `lumina models --provider <name>` | List live models for a provider. |
-| `lumina auth device --provider <name> [--github-url URL]` | GitHub device flow; token stored `0600`, never printed. |
+| `lumina models [--provider <name>]` | List live models for a provider (or all configured providers). |
+| `lumina auth --provider <name> [--github-url URL]` | GitHub device flow (`lumina device …` also works); token stored `0600`, never printed. |
 | `lumina pair [--lan]` | Print the attach URL + token for another machine. |
 | `lumina openapi --out <file>` | Dump the daemon OpenAPI 3.1 spec (source of the web TS SDK). |
 
@@ -108,10 +111,11 @@ The TUI talks to the daemon exclusively through `src/sdk.rs`. Keys:
   names); `↑↓` navigate, `Tab` accepts, `Esc` dismisses
 - Approval modal — `←/→` (or `h`/`l`) choose **Allow Once / Allow Session / Deny**, `Enter` answers
 
-Slash commands: `/plan`, `/build`, `/model [filter]`, `/variant [auto|low|medium|high|xhigh|max]`,
+Slash commands: `/plan`, `/build`, `/model [filter]`, `/variant [auto|none|minimal|low|medium|high|xhigh|max]` (`/effort` alias),
 `/mode [ask|auto-edit|auto-approve|bypass]`,
 `/connect [provider] [github-url]`, `/compact`, `/thinking [show|hide]`, `/undo`, `/redo`,
-`/resume`, `/continue`, `/fork`, `/graphify`, `/evolve`, `/init`.
+`/resume`, `/continue`, `/fork`, `/graphify <query>`, `/evolve`, `/init`, `/clear`, `/help`
+(plus any workspace `.lumina/commands/*.md` custom commands).
 
 The header shows the current reasoning variant (`variant:xhigh`, `variant:auto`
 by default; `/variant` picks it per turn) plus a live context gauge (`ctx ~12.6k/128k`, provider-advertised
@@ -133,7 +137,7 @@ executor = "copilot/gpt-4o"
 Connect interactively: TUI `/model` (pick a live model, persists), TUI
 `/connect` (pick provider → enter GitHub URL → open link → auto-poll to
 connected), web sidebar **Copilot web auth** (device code), or terminal
-`lumina auth device --provider copilot [--github-url URL]` (prints URL +
+`lumina auth --provider copilot [--github-url URL]` (prints URL +
 code, stores the token `0600` daemon-side, never shown). List live models
 any time with `lumina models --provider copilot`.
 
@@ -146,8 +150,8 @@ any time with `lumina models --provider copilot`.
 |---|---|---|---|---|
 | Reads (`read`, `glob`, `grep`, `kb_query`) | allow | allow | allow | allow |
 | File edits | ask | allow | allow | allow |
-| Safe shell (`git status/diff`, `cargo test`) | allow | allow | allow | allow |
-| General shell | ask | ask | allow | allow (no prompts) |
+| Shell matching `[permissions.bash]` `allow` globs | allow | allow | allow | allow |
+| Other general shell | ask | ask | allow | allow (no prompts) |
 | Destructive shell (`rm -rf`, `git push --force`) | ask | ask | ask | allow |
 | Credential files / Google domains | **deny** | **deny** | **deny** | **deny** |
 
@@ -172,7 +176,7 @@ Drop-in Markdown customization, reloaded on every turn (no restart):
 - `~/.config/lumina/AGENTS.md` — global system instructions (Layer 1:
   under the immutable security core, above repo rules).
 - `~/.config/lumina/rules/*.md` — one extra layer per file (plural `rules/`
-  follows the opencode v2 extension-dir convention: `agents/`, `commands/`,
+  follows the v2 extension-dir convention: `agents/`, `commands/`,
   `skills/`).
 - `~/.config/lumina/skills/<name>/SKILL.md` — auto-discovered; only
   `name` + `description` frontmatter is advertised until the model calls
@@ -240,7 +244,7 @@ composer), and active sessions with a right **Review** pane (Unified/Split diffs
 per-file sections) plus Terminal, Graph, Memory, Harness, and Copilot-connect
 tabs. Composer footer holds the agent (`plan`/`build`), live model picker
 (router tiers + Copilot `/models` + custom id), reasoning-effort variants
-(`auto`/`low`/`medium`/`high`/`xhigh`/`max`), an image **attach button**
+(`auto`/`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`), an image **attach button**
 (8MB cap each; vision-capable models describe attached images), and approval mode
 (`Default` = ask). `Tab` / `Shift+Tab` flip agent and approval without
 leaving the keyboard; the Servers modal switches which daemon the app talks
@@ -262,13 +266,15 @@ shadow-Git `/undo` + `/redo` through the API, plan-mode scoped writes
 ## Daemon API (for scripts)
 
 `GET /openapi.json` is the schema. Main routes under `/api/v1`: `sessions`
-(create/list/`?latest=1`), `sessions/{id}` (get/patch agent, permission,
-model, title), `prompt` (submit; `delivery: steer|queue` while running),
-`fork`, `export[?sanitize=1]`, `revert`/`unrevert`, `permissions/{reqId}`,
-`files`, `git/diff`, `git/branch`, `pty` (WebSocket), `providers`, `router`,
-`models?provider=`, `auth/device/{start,poll}`, `kb/query`, `harness`,
+(list/create/`?latest=1`), `sessions/{id}` (get/patch agent, permission,
+model, title, delete), `prompt` (submit; `delivery: steer|queue` while running),
+`fork`, `export[?sanitize=1]`, `revert`/`unrevert`, `compact`, `state`,
+`permissions/{reqId}`, `questions/{reqId}`, `files`,
+`git/diff`, `git/branch`, `pty` (WebSocket), `providers`, `router`,
+`models?provider=`, `auth/device/{start,poll}`, `kb/query`, `kb/` (browse),
+`mcp/tools`, `commands`, `agents`, `harness`,
 `harness/evolve`, plus the `events` SSE stream (`turn.started/progress/
-context/delta/tool/completed/failed`, `permission.asked/resolved`, …).
+context/delta/tool/completed/failed`, `permission.asked/resolved`, `question.asked/resolved`, …).
 
 ## Troubleshooting
 
@@ -288,15 +294,16 @@ context/delta/tool/completed/failed`, `permission.asked/resolved`, …).
 ## Layout
 
 - `src/` — **Rust daemon + CLI + TUI**: `main.rs` (CLI incl. `vault check`),
-  `server.rs` (axum daemon), `security.rs` (fence), `config.rs`, `rules.rs`,
+  `server.rs` (axum daemon, `rust-embed` SPA at `web/dist/`), `security.rs` (fence), `config.rs`, `rules.rs`,
   `llm.rs` (streaming + router), `agent.rs` (turn loop, vault boundary, loop
   guards, subagents, compaction), `vault.rs` (session secret vault +
-  `{placeholder_xxx}`), `tools.rs` (+`patch`, `todowrite`, `task_output`,
-  background `bash`/`subagent`), `mcp.rs`, `plugins.rs` (Node bridge),
-  `kb.rs` (graphify RAG), `harness.rs` (Harness²), `checkpoints.rs`
+  `{placeholder_xxx}`), `tools.rs` (+`todowrite`, `task_output`,
+  background `bash`/`subagent`), `begin_patch.rs` (`*** Begin Patch ***`
+  engine), `mcp.rs`, `plugins.rs` + `plugins_host.mjs` (Node bridge), `kb.rs` (graphify RAG),
+  `harness.rs` (Harness²), `checkpoints.rs`
   (shadow-git), `store.rs` (rusqlite), `approve.rs` (permission broker +
   question dismiss), `sdk.rs`, `tui.rs` (ratatui), `pty.rs`, `copilot.rs`,
   `websearch.rs`
-- `web/` — React + Vite + Tailwind workspace SPA (embedded via `//go:embed` / `rust-embed`)
+- `web/` — React + Vite + Tailwind workspace SPA, embedded via `rust-embed`
 - `memory/` — durable Markdown memory + `memory/graphify-out/`
 - `docs/` — screenshots and test evidence

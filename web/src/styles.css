@@ -2,8 +2,8 @@
 @tailwind components;
 @tailwind utilities;
 
-/* v2-style design tokens (copied from opencode v2 web shell).
-   Light default like opencode (#fafafa deep); dark via [data-color-scheme]. */
+/* v2-style design tokens.
+   Light default (#fafafa deep); dark via [data-color-scheme]. */
 :root {
   --v2-bg-deep: #fafafa;
   --v2-bg-base: #ffffff;

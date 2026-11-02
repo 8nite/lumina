@@ -213,7 +213,7 @@ mod tests {
         std::fs::write(ws.join(".lumina/plugins/foo/plugin.mjs"), "export default {}").unwrap();
         let found = discover(ws, false);
         // Scope to the temp workspace: the user's global plugins dir may hold
-        // real plugins (e.g. opencode-zen) and must not affect this test.
+        // real plugins and must not affect this test.
         let ours: Vec<_> = found.iter().filter(|p| p.starts_with(ws)).collect();
         assert_eq!(ours.len(), 2, "{found:?}");
         // Empty set short-circuits without spawning node.
@@ -249,7 +249,7 @@ mod live_tests {
         assert_eq!(seen.and_then(|s| s.as_str()), Some("read"), "{out}");
     }
 
-    /// The bundled opencode-zen plugin enriches an opencode provider's core
+    /// The bundled plugin enriches a provider's core
     /// list with the Zen catalog (zen schema -> context_window/efforts),
     /// matching Go ids to Zen twins via `canonical_id` and adding Zen-only
     /// ids; core-only entries are kept. Failures keep the core list.
@@ -342,7 +342,7 @@ mod live_tests {
         assert_eq!(models[2].get("context_window").and_then(|n| n.as_u64()), Some(2048));
     }
 
-    /// Non-opencode providers pass through untouched (empty patch).
+    /// Other providers pass through untouched (empty patch).
     #[test]
     fn opencode_zen_plugin_ignores_other_providers() {
         let plug = std::env::current_dir().unwrap().join("plugins/opencode-zen.mjs");
