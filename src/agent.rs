@@ -70,7 +70,7 @@ impl Runner {
             ToolSpec { name: "read".into(), description: "Read a workspace file (paged for large files).".into(), schema: obj(&["path", "offset", "limit"]) },
             ToolSpec { name: "edit".into(), description: "Replace exactly one needle occurrence in a file.".into(), schema: obj(&["path", "old_string", "new_string"]) },
             ToolSpec { name: "write".into(), description: "Create or overwrite a workspace file.".into(), schema: obj(&["path", "content"]) },
-            ToolSpec { name: "bash".into(), description: "Run a shell command in the workspace (workdir optional; background:true runs detached; poll with task_output).".into(), schema: obj(&["command", "timeout_ms"]) },
+            ToolSpec { name: "bash".into(), description: "Run a shell command in the workspace (git/cargo/pnpm/tests; workdir optional; background:true runs detached; poll with task_output). Prefer native read/grep/glob for file search/read/listing, not bash equivalents.".into(), schema: obj(&["command", "timeout_ms"]) },
             ToolSpec { name: "grep".into(), description: "Regex-search workspace files.".into(), schema: obj(&["pattern", "include"]) },
             ToolSpec { name: "lsp".into(), description: "Code intelligence: symbols/refs (grep-backed alias).".into(), schema: obj(&["pattern", "include"]) },
             ToolSpec { name: "glob".into(), description: "List workspace paths by glob.".into(), schema: obj(&["pattern"]) },
@@ -81,7 +81,7 @@ impl Runner {
             ToolSpec { name: "websearch".into(), description: "Search the web for current info (needs a provider key; pick with [websearch] provider).".into(), schema: obj(&["query", "provider"]) },
             ToolSpec { name: "webfetch".into(), description: "Fetch one HTTP(S) URL as markdown/text/HTML (cap 100KB).".into(), schema: obj(&["url", "format"]) },
             ToolSpec { name: "mcp".into(), description: "Call a local MCP tool (stdio/SSE; see .lumina/mcp.json).".into(), schema: obj(&["server", "tool", "args"]) },
-            ToolSpec { name: "subagent".into(), description: "Launch a scoped subagent (general|explore). Subagents cannot delegate further. background:true returns a task ID; poll with task_output.".into(), schema: obj(&["task", "agent"]) },
+            ToolSpec { name: "subagent".into(), description: format!("Launch a scoped subagent (general|explore). Subagents cannot delegate further. background:true returns a task ID; poll with task_output. Budget: max {SUBAGENT_BUDGET} per turn — read/grep/edit directly once blocked."), schema: obj(&["task", "agent"]) },
             ToolSpec { name: "task_output".into(), description: "Poll a background bash/subagent task by ID.".into(), schema: obj(&["task_id"]) },
             ToolSpec { name: "todowrite".into(), description: "Track task progress as a todo list.".into(), schema: serde_json::json!({"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string"}}, "required": ["content"]}}}}) },
             ToolSpec { name: "patch".into(), description: "Apply a *** Begin Patch *** multi-file diff (add/update/delete/move); unified diff also accepted.".into(), schema: obj(&["patchText", "patch_text", "patch", "diff"]) },
@@ -100,14 +100,38 @@ impl Runner {
         if agent == Agent::Plan {
             s.push_str("PLAN MODE: research and blueprint only. Never edit source files; scoped writes to plan.md or .lumina/plans/*.md only.\n");
         }
-        s.push_str("Tool guidance: prefer kb_query over grep for durable knowledge; batch independent reads; quote file:line references. After tool results arrive, keep going until done; call more tools if anything remains.\n");
+        s.push_str("Tool guidance: use native tools, not bash equivalents — read (not bash cat/head/tail), grep (not bash grep/rg), glob (not bash find/ls); prefer kb_query over grep for durable knowledge; batch independent reads; quote file:line references. After tool results arrive, keep going until done; call more tools if anything remains.\n");
         s.push_str(crate::vault::VAULT_GUIDANCE);
         s.push('\n');
         s.push_str(&bundle.skills_block());
         s
     }
 
-    /// Run one user turn to completion. `on_event` receives streaming deltas
+    /// Persist one user turn per queued prompt (call once per turn; the
+    /// retry path reuses the same turn instead of storing a duplicate and
+    /// replaying already-executed tools).
+    pub fn begin_turn(
+        &self,
+        store: &Store,
+        session_id: &str,
+        text: &str,
+    ) -> Result<crate::store::Turn, AgentError> {
+        // Lumina hook: chat.message may rewrite the incoming turn text.
+        let mut user_text = text.to_string();
+        if let Some(h) = &self.plugins {
+            let payload = serde_json::json!({"text": text, "sessionID": session_id});
+            if let Some(out) = h.dispatch("chat.message", &payload, std::time::Duration::from_secs(5)) {
+                if let Some(t) = out.get("patch").and_then(|p| p.get("text")).and_then(|t| t.as_str()) {
+                    user_text = t.to_string();
+                }
+            }
+        }
+        Ok(store.add_turn(session_id, "user", &user_text)?)
+    }
+
+    /// Run one user turn to completion. `user_turn` must come from
+    /// [`Runner::begin_turn`] (one per queued prompt, retries included).
+    /// `on_event` receives streaming deltas
     /// (SSE broker in server mode; headless `run` ignores it).
     pub async fn run_prompt(
         &self,
@@ -115,7 +139,7 @@ impl Runner {
         router: &Router,
         cfg: &crate::config::Config,
         session_id: &str,
-        text: &str,
+        user_turn: &crate::store::Turn,
         effort: &str,
         images: &[ImageAttachment],
         mut on_event: impl FnMut(&str, &str) + Send,
@@ -145,17 +169,7 @@ impl Runner {
         if Self::maybe_auto_compact(store, router, cfg, session_id).await.is_err() {
             // proceed with full history; the loop degrades gracefully
         }
-        // Lumina hook: chat.message may rewrite the incoming turn text.
-        let mut user_text = text.to_string();
-        if let Some(h) = &self.plugins {
-            let payload = serde_json::json!({"text": text, "sessionID": session_id});
-            if let Some(out) = h.dispatch("chat.message", &payload, std::time::Duration::from_secs(5)) {
-                if let Some(t) = out.get("patch").and_then(|p| p.get("text")).and_then(|t| t.as_str()) {
-                    user_text = t.to_string();
-                }
-            }
-        }
-        let user_turn = store.add_turn(session_id, "user", &user_text)?;
+        let user_text = user_turn.text.clone();
 
         let mut messages = vec![llm::Message {
             role: "system".into(),
@@ -199,12 +213,16 @@ impl Runner {
         let vaulted_user = store.vault.substitute(session_id, &user_text).map_err(AgentError::Msg)?;
         messages.push(llm::Message { role: "user".into(), content: vaulted_user, thinking: String::new() });
 
+        // Subagent cost attribution: run_subtask returns its own usage, which
+        // the executor closure accumulates here and run_prompt merges into the
+        // turn total below (background deliveries included).
+        let sub_usage = std::sync::Arc::new(std::sync::Mutex::new(crate::llm::Usage::default()));
+        let sub_usage_exec = sub_usage.clone();
         let reg = Registry {
             kb_query: Some(std::sync::Arc::new(|ws, q, b| {
                 crate::kb::query(ws, q, b).map_err(|e| e.to_string())
             })),
-            bundle: Some(bundle),
-            websearch_provider: cfg.websearch.provider.clone(),
+            bundle: Some(bundle),            websearch_provider: cfg.websearch.provider.clone(),
             websearch_disabled: cfg.websearch.disabled,
             plugins: self.plugins.clone(),
             disabled_tools: custom.as_ref().map(|d| {
@@ -214,12 +232,19 @@ impl Runner {
                 let router = router.clone();
                 let cfg = cfg.clone();
                 let vault = store.vault.clone();
+                let acc = sub_usage_exec.clone();
                 move |sc: &SecCtx, req: &crate::tools::SubagentReq| {
                     // Sync tool context inside the async turn: park this worker
                     // thread and drive the subagent future to completion.
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current()
                             .block_on(run_subtask(&router, &cfg, &vault, sc, req))
+                    })
+                    .map(|(text, du)| {
+                        let mut a = acc.lock().unwrap();
+                        a.input = a.input.saturating_add(du.input);
+                        a.output = a.output.saturating_add(du.output);
+                        text
                     })
                     .map_err(|e| e.to_string())
                 }
@@ -255,7 +280,7 @@ impl Runner {
         // follow-ups ("continue") keep the gate armed.
         let work_requested =
             agent != Agent::Plan && (looks_like_work(&user_text) || looks_like_work(&first_task));
-        let (final_text, usage) = self
+        let (final_text, mut usage) = self
             .loop_until_done(
                 router,
                 &reg,
@@ -275,8 +300,12 @@ impl Runner {
                 work_requested,
             )
             .await?;
+        // Merge subagent cost (side-channel: the executor closure above).
         // (All assistant turns are persisted inside the loop as they stream,
         // so transcripts and /resume replay show every tool round.)
+        let extra = sub_usage.lock().unwrap();
+        usage.input = usage.input.saturating_add(extra.input);
+        usage.output = usage.output.saturating_add(extra.output);
         Ok(TurnOutcome { text: final_text, usage })
     }
 
@@ -338,8 +367,18 @@ impl Runner {
         // offsets evades the identical-call key above (the stuck session
         // re-read SessionView.tsx 10x). Nudge once per file per turn.
         let mut read_counts: HashMap<String, usize> = HashMap::new();
+        // Per-turn subagent budget: one subagent fans out to its own
+        // trajectory, so unbounded delegation turns one stuck turn into
+        // dozens of billed trajectories (stuck session cc686408: 30
+        // subagents at 2-10 min each, some proxy-reading a read-capped
+        // file to dodge the cap below).
+        let mut subagent_calls = 0usize;
         let mut prev_round_key = String::new();
         let mut repeat_streak = 0usize;
+        // Native-tool redirect: bash cat/grep/find/ls burns rounds the
+        // dedicated tools do in one call (session 843e971d: 80 bash for
+        // 4 edits). Nudge once per turn, then stay quiet.
+        let mut bash_nudged = false;
         for round in 0..self.max_steps {
             let (tx, mut rx) = mpsc::unbounded_channel::<Chunk>();
             let req = Request {
@@ -388,8 +427,10 @@ impl Runner {
                 if mutated && !verified && verify_rounds < 2 {
                     verify_rounds += 1;
                     let demand = "Unverified changes: this turn ran edit/write/patch but no passing test/build/typecheck command yet. Run the relevant verification now (e.g. `cargo test`, `pnpm --dir web build`) and fix failures until green; do NOT end with a text summary until verification passes. If verification is genuinely impossible in this workspace, state exactly what blocks it.";
+                    // In-memory only: control-plane nudges must not persist
+                    // as fake user turns (they corrupt replay/compaction and
+                    // teach the model to discount real user input).
                     messages.push(llm::Message { role: "user".into(), content: demand.to_string(), thinking: String::new() });
-                    let _ = store.add_turn(session_id, "user", demand);
                     on_stage("verifying…");
                     continue;
                 }
@@ -400,8 +441,8 @@ impl Runner {
                 if !mutated && work_requested && progress_rounds < 2 {
                     progress_rounds += 1;
                     let demand = "No changes made yet: this request asks to fix/build/change something, but the turn ran no edit/write/patch. Act now (make the change, then verify it) or state precisely what is missing or blocked — do NOT end with another status summary and zero edits.";
+                    // In-memory only (see verify gate above).
                     messages.push(llm::Message { role: "user".into(), content: demand.to_string(), thinking: String::new() });
-                    let _ = store.add_turn(session_id, "user", demand);
                     on_stage("acting…");
                     continue;
                 }
@@ -437,6 +478,13 @@ impl Runner {
                 if mutated && !verified {
                     final_text.push_str("\n\n");
                     final_text.push_str(UNVERIFIED_POINTER);
+                }
+                // A work request ending with zero edits must not read as
+                // done — the gate already forced action rounds and the
+                // model still didn't act, so name the miss for `continue`.
+                if !mutated && work_requested {
+                    final_text.push_str("\n\n");
+                    final_text.push_str(NO_PROGRESS_POINTER);
                 }
                 store.add_turn(session_id, "assistant", &final_text)?;
                 return Ok((final_text, usage));
@@ -501,13 +549,14 @@ impl Runner {
                     .unwrap_or_default();
                 let target = crate::tools::tool_target(&tc.name, &args);
                 on_tool(ToolEvent::Start { name: tc.name.clone(), target: target.clone() });
-                // Hard cap: the 4th-read nudge below is advisory and the
-                // stuck session (56d41a74) re-read SessionView.tsx 10x
-                // anyway (224 reads, 0 nudge hits — the code postdates it).
-                // Block the 6th+ read of one path per turn so the loop must
-                // act instead of re-paging; edits reset the count below.
-                let blocked = read_repeat_blocked(&tc.name, &target, read_counts.get(&target).copied().unwrap_or(0));
+                // Identical calls hard-stop on the 4th attempt and re-reads
+                // cap at the 6th (task_output exempt; edits clear the ledger
+                // below since the state changed).
+                let call_key = tool_call_key(&tc.name, &args);
+                let blocked = loop_blocked(&tc.name, &args, &seen, &read_counts)
+                    .or_else(|| subagent_guard(&tc.name, &args, &read_counts, subagent_calls));
                 let was_blocked = blocked.is_some();
+                let subagent_ran = tc.name.eq_ignore_ascii_case("subagent") && blocked.is_none();
                 let t0 = std::time::Instant::now();
                 let result = match blocked {
                     Some(msg) => Err(crate::tools::ToolError::Msg(msg)),
@@ -520,7 +569,7 @@ impl Runner {
                 };
                 on_tool(ToolEvent::Done {
                     name: tc.name.clone(),
-                    target,
+                    target: target.clone(),
                     preview,
                     error: is_err,
                     duration_ms: elapsed_ms,
@@ -534,7 +583,7 @@ impl Runner {
                         let mut note = String::new();
                         if o.truncated || out.len() > 4000 {
                             let total = out.len();
-                            out.truncate(4000);
+                            crate::tools::truncate_to(&mut out, 4000);
                             note = format!("\n[truncated {total} chars to 4000]");
                         }
                         format!("tool {} →\n{out}{note}", tc.name)
@@ -545,7 +594,7 @@ impl Runner {
                 // model to stop. Fires once per call per turn so the nudge
                 // doesn't itself become transcript spam.
                 let mut rendered = rendered;
-                let key = tool_call_key(&tc.name, &args);
+                let key = call_key;
                 if !key.is_empty() {
                     let n = seen.entry(key).or_insert(0);
                     *n += 1;
@@ -570,6 +619,26 @@ impl Runner {
                         }
                     }
                 }
+                // Bash-native redirect: cat/grep/find/ls via bash have
+                // dedicated tools. Nudge once per turn, then stay quiet.
+                if !bash_nudged && tc.name.eq_ignore_ascii_case("bash") && !was_blocked {
+                    let cmd = crate::tools::tool_target(&tc.name, &args);
+                    if let Some(nudge) = bash_native_nudge(&cmd) {
+                        rendered.push_str(&nudge);
+                        bash_nudged = true;
+                    }
+                }
+                // Proxy-read ledger: a subagent task naming a file reads it
+                // inside the child trajectory, so share the re-read ledger
+                // (stuck session cc686408 dodged the read cap with 30
+                // subagent proxy reads). Executed subagents also spend the
+                // per-turn budget enforced above.
+                if subagent_ran {
+                    subagent_calls += 1;
+                    for p in mentioned_paths(&target) {
+                        *read_counts.entry(p).or_insert(0) += 1;
+                    }
+                }
                 // Verify-after-fix tracking: a code mutation invalidates
                 // prior verification; only a passing verify command
                 // (bash runs a test/build/lint command and its output has
@@ -583,6 +652,9 @@ impl Runner {
                 {
                     mutated = true;
                     verified = false;
+                    // New workspace state: identical-call ledger restarts
+                    // (re-running the same check after an edit is new info).
+                    seen.clear();
                     let target = crate::tools::tool_target(&tc.name, &args);
                     if !target.is_empty() {
                         read_counts.remove(&target);
@@ -632,6 +704,13 @@ impl Runner {
                     " Progress note: {idle_rounds} rounds with no edit/write/patch yet — if exploration is done, make the change now (then verify it); otherwise state what is still missing."
                 ));
                 on_stage("idling…");
+            }
+            // Mid-loop verify prod: edits stacked with no green run drift
+            // (stuck session cc686408 landed edits but never verified
+            // before the budget ran out). Advisory until the end-gate
+            // forces it.
+            if mutated && !verified && (round + 1).is_multiple_of(12) {
+                nudge.push_str(" Verify now: this turn already ran edit/write/patch with no passing test/build yet — run the relevant verification command and fix failures until green instead of stacking more edits.");
             }
             // Steered input joins the active turn (Go takeSteered parity):
             // stored raw, sent vaulted, answered before anything else.
@@ -752,10 +831,26 @@ fn is_mutating(name: &str) -> bool {
 
 /// Canonicalizes one invocation for loop detection: lowercase name plus
 /// sorted args. task_output returns "" (exempt — polling a background task
-/// to completion is progress, not a loop).
+/// to completion is progress, not a loop). subagent canonicalizes to
+/// agent + mentioned paths: full task text is unique per call, which let
+/// stuck session cc686408 fire 30 subagents with no repeat ever tripping.
 fn tool_call_key(name: &str, args: &HashMap<String, serde_json::Value>) -> String {
     if name.eq_ignore_ascii_case("task_output") {
         return String::new();
+    }
+    if name.eq_ignore_ascii_case("subagent") {
+        let agent = args
+            .get("agent")
+            .or_else(|| args.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let task = args
+            .get("task")
+            .or_else(|| args.get("prompt"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return format!("subagent:{}:{}", agent, mentioned_paths(task).join(","));
     }
     let mut kv: Vec<(&String, &serde_json::Value)> = args.iter().collect();
     kv.sort_by(|a, b| a.0.cmp(b.0));
@@ -785,6 +880,88 @@ fn tool_label(name: &str, args: &HashMap<String, serde_json::Value>) -> String {
     }
 }
 
+/// Per-turn subagent budget: one subagent fans out to its own multi-round
+/// trajectory, so unbounded delegation turns one stuck turn into dozens of
+/// billed trajectories (stuck session cc686408: 30 subagents, 2-10 min each).
+const SUBAGENT_BUDGET: usize = 8;
+
+/// Path-like tokens in free text (`src/server/sessions.js`, backtick- or
+/// `file:line`-wrapped). Used to canonicalize subagent loop keys and to
+/// catch proxy re-reads of a read-capped file.
+fn mentioned_paths(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = text
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | ')' | ',' | ';'))
+        .filter_map(|tok| {
+            let t = tok.trim_matches(|c| matches!(c, '.' | ',' | ':' | ';' | '!' | '?' | ')'));
+            if t.len() >= 3 && t.len() < 200 && t.contains('/') && t.contains('.') && !t.contains("://") {
+                Some(t.split(':').next().unwrap_or(t).to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|p| p.contains('/') && p.contains('.'))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Pre-execution loop guard: the 4th identical call blocks and the 6th
+/// re-read of one path blocks. task_output is exempt (empty key); callers
+/// clear `seen` after a mutation since the state changed.
+fn loop_blocked(
+    name: &str,
+    args: &HashMap<String, serde_json::Value>,
+    seen: &HashMap<String, usize>,
+    read_counts: &HashMap<String, usize>,
+) -> Option<String> {
+    let key = tool_call_key(name, args);
+    if !key.is_empty() && seen.get(&key).copied().unwrap_or(0) >= 3 {
+        return Some(format!(
+            "loop blocked: identical `{}` call already ran 3 times this turn with no new result — change approach (different args or tool) or give the final text answer now.",
+            tool_label(name, args)
+        ));
+    }
+    let target = crate::tools::tool_target(name, args);
+    read_repeat_blocked(name, &target, read_counts.get(&target).copied().unwrap_or(0))
+}
+
+/// Subagent pre-execution guard: per-turn budget plus proxy-read of a
+/// read-capped file (suffix-matched: tasks cite abs paths while reads are
+/// keyed by the given arg). Returns the denial message when blocked.
+fn subagent_guard(
+    name: &str,
+    args: &HashMap<String, serde_json::Value>,
+    read_counts: &HashMap<String, usize>,
+    subagent_calls: usize,
+) -> Option<String> {
+    if !name.eq_ignore_ascii_case("subagent") {
+        return None;
+    }
+    let task = args
+        .get("task")
+        .or_else(|| args.get("prompt"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    for p in mentioned_paths(task) {
+        if let Some((k, n)) = read_counts
+            .iter()
+            .find(|(k, _)| *k == &p || p.ends_with(k.as_str()) || k.as_str().ends_with(p.as_str()))
+        {
+            if *n >= 5 {
+                return Some(format!(
+                    "subagent blocked: `{k}` already read {n} times this turn (proxy reads share the ledger) — act on what you have (grep/glob for the next fact, then edit) instead of delegating another read of it."
+                ));
+            }
+        }
+    }
+    if subagent_calls >= SUBAGENT_BUDGET {
+        return Some(format!(
+            "subagent budget exhausted: {subagent_calls} subagents already ran this turn — act directly with read/grep/edit instead of delegating further."
+        ));
+    }
+    None
+}
 /// Same-file re-read nudge: paging one file with different offsets evades
 /// the identical-call key. Fires once, on the 4th read of a path per turn.
 fn read_repeat_nudge(target: &str, n: usize) -> Option<String> {
@@ -793,6 +970,23 @@ fn read_repeat_nudge(target: &str, n: usize) -> Option<String> {
     }
     Some(format!(
         "\n\nLoop guard: `{target}` already read {n} times this turn. Do NOT re-page it — use grep/glob for the next fact, or batch the remaining reads in one round, then act."
+    ))
+}
+
+/// Bash-native redirect: `grep`/`cat`/`find`/`ls` via bash burn rounds
+/// the dedicated tools do in one call. Matches only when the command
+/// starts with the native binary (piped `git diff | grep` still needs
+/// shell, so it never nudges). Caller fires once per turn.
+fn bash_native_nudge(cmd: &str) -> Option<String> {
+    let first = cmd.trim_start().split_whitespace().next().unwrap_or("").to_lowercase();
+    let native = match first.as_str() {
+        "grep" | "rg" | "ag" => "grep",
+        "cat" | "head" | "tail" | "wc" | "less" | "more" => "read",
+        "find" | "ls" | "fd" => "glob",
+        _ => return None,
+    };
+    Some(format!(
+        "\n\nTool guidance: `bash: {first}` has a native `{native}` tool — use it instead of bash for file search/read/listing; reserve bash for git/cargo/pnpm/tests."
     ))
 }
 
@@ -868,6 +1062,12 @@ fn looks_like_work(text: &str) -> bool {
 /// verification run — the next `continue` must verify until green.
 const UNVERIFIED_POINTER: &str = "Note: this turn's edits were never verified (no passing test/build run) — say `continue` to verify: run the relevant tests/build and fix failures until green.";
 
+/// Resume pointer for turns released by the no-progress gate: the request
+/// asked for a change but the turn ends with zero edits, so say so
+/// explicitly instead of reading as done (stuck session 9fd55938 ran 24
+/// explore rounds then a filler final with the task untouched).
+const NO_PROGRESS_POINTER: &str = "Note: no edit/write/patch ran this turn, so the requested change is NOT done — say `continue` to proceed: make the change, then verify it (run the relevant tests/build and fix failures until green).";
+
 
 
 
@@ -879,7 +1079,7 @@ async fn run_subtask(
     vault: &crate::vault::Vault,
     parent: &SecCtx,
     req: &crate::tools::SubagentReq,
-) -> Result<String, AgentError> {
+) -> Result<(String, crate::llm::Usage), AgentError> {
     let bundle = Bundle::load(&parent.workspace, cfg.compat.import_global_rules, cfg.compat.import_global_skills);
     // Custom agents (mode subagent|all) plus builtins; primary-only rejects.
     let def = bundle
@@ -923,12 +1123,12 @@ async fn run_subtask(
     // balloon. Truncate with a note instead of blowing the token budget.
     let mut prompt = req.task.clone();
     if prompt.len() > 6000 {
-        prompt.truncate(6000);
+        crate::tools::truncate_to(&mut prompt, 6000);
         prompt.push_str("\n…[delegation prompt truncated at 6000 chars]");
     }
     let mut description = req.description.clone();
     if description.len() > 2000 {
-        description.truncate(2000);
+        crate::tools::truncate_to(&mut description, 2000);
         description.push_str("…[truncated]");
     }
     let mut prompt_text = format!("You are the {} subagent. {}\n\nScope: use only the provided tools; you cannot launch subagents. When done, summarize findings with file references.", def.name, def.body);
@@ -938,7 +1138,7 @@ async fn run_subtask(
     }
     prompt_text.push_str(crate::vault::VAULT_GUIDANCE);
     prompt_text.push('\n');
-    // Explore is read-only plus task polling; general gets everything but subagent.
+    // Explore is read-only; general gets everything but subagent.
     let specs: Vec<ToolSpec> = Runner::tool_specs_filtered(cfg.websearch.disabled)
         .into_iter()
         .filter(|t| {
@@ -946,7 +1146,7 @@ async fn run_subtask(
                 matches!(
                     t.name.as_str(),
                     "read" | "glob" | "grep" | "lsp" | "skill"
-                        | "kb_query" | "webfetch" | "websearch" | "bash" | "task_output"
+                        | "kb_query" | "webfetch" | "websearch" | "task_output"
                 )
             } else {
                 t.name != "subagent"
@@ -980,6 +1180,12 @@ async fn run_subtask(
         llm::Message { role: "user".into(), content: vault.substitute(&parent.session, &prompt).map_err(AgentError::Msg)?, thinking: String::new() },
     ];
     let mut last = String::new();
+    let mut sub_usage = crate::llm::Usage::default();
+    // Same guards as the parent loop, locally scoped: identical calls
+    // hard-stop after 3 executions and re-reads share a ledger, so a
+    // subagent cannot spin where the parent would be stopped.
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut read_counts: HashMap<String, usize> = HashMap::new();
     for _ in 0..32 {
         let (txs, mut rxs) = mpsc::unbounded_channel::<Chunk>();
         let req_msg = Request {
@@ -1009,9 +1215,11 @@ async fn run_subtask(
                 break;
             }
         }
-        let _usage = handle.await.map_err(|e| AgentError::Msg(format!("subagent task: {e}")))??;
+        let u = handle.await.map_err(|e| AgentError::Msg(format!("subagent task: {e}")))??;
+        sub_usage.input = sub_usage.input.saturating_add(u.input);
+        sub_usage.output = sub_usage.output.saturating_add(u.output);
         if calls.is_empty() {
-            return vault.resolve(&parent.session, &last).map_err(AgentError::Msg);
+            return vault.resolve(&parent.session, &last).map(|t| (t, sub_usage)).map_err(AgentError::Msg);
         }
         for tc in &calls {
             let args_val = serde_json::Value::Object(
@@ -1022,11 +1230,37 @@ async fn run_subtask(
                 .as_object()
                 .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default();
-            let result = reg.call(&sc, &tc.name, &args);
+            let result = match loop_blocked(&tc.name, &args, &seen, &read_counts) {
+                Some(msg) => Err(crate::tools::ToolError::Msg(msg)),
+                None => reg.call(&sc, &tc.name, &args),
+            };
+            let ok = result.is_ok();
             let rendered = match result {
-                Ok(o) => format!("tool {} →\n{}", tc.name, o.output),
+                Ok(o) => {
+                    let mut out = o.output;
+                    let mut note = String::new();
+                    if o.truncated || out.len() > 4000 {
+                        let total = out.len();
+                        crate::tools::truncate_to(&mut out, 4000);
+                        note = format!("\n[truncated {total} chars to 4000]");
+                    }
+                    format!("tool {} →\n{out}{note}", tc.name)
+                }
                 Err(e) => format!("tool {} failed: {e}", tc.name),
             };
+            let key = tool_call_key(&tc.name, &args);
+            if !key.is_empty() {
+                *seen.entry(key).or_insert(0) += 1;
+            }
+            if tc.name.eq_ignore_ascii_case("read") {
+                let target = crate::tools::tool_target(&tc.name, &args);
+                if !target.is_empty() {
+                    *read_counts.entry(target).or_insert(0) += 1;
+                }
+            }
+            if ok && (tc.name.eq_ignore_ascii_case("edit") || tc.name.eq_ignore_ascii_case("write") || tc.name.eq_ignore_ascii_case("patch")) {
+                seen.clear();
+            }
             let sub = vault.substitute(&parent.session, &format!("[tool result {}]\n{rendered}", tc.name)).map_err(AgentError::Msg)?;
             messages.push(llm::Message { role: "user".into(), content: sub, thinking: String::new() });
         }
@@ -1034,7 +1268,7 @@ async fn run_subtask(
         messages.push(llm::Message { role: "assistant".into(), content: sub, thinking: String::new() });
         last.clear();
     }
-    vault.resolve(&parent.session, &last).map_err(AgentError::Msg)
+    vault.resolve(&parent.session, &last).map(|t| (t, sub_usage)).map_err(AgentError::Msg)
 }
 
 impl Runner {
@@ -1061,9 +1295,10 @@ impl Runner {
         }
         let model = if sess.model.is_empty() { router.model_for("executor", "build") } else { sess.model.clone() };
         let window = router.context_window(&model).await as usize;
-        if window == 0 {
-            return Ok(()); // unknown window: never auto-compact blind
-        }
+        // Unknown window: fall back to a conservative default instead of
+        // never compacting (unbounded growth ends in a provider hard-reject
+        // mid-turn).
+        let window = if window == 0 { 64_000 } else { window };
         let msgs: Vec<llm::Message> = turns
             .iter()
             .map(|t| llm::Message { role: t.role.clone(), content: t.text.clone(), thinking: String::new() })
@@ -1140,12 +1375,12 @@ impl Runner {
             }
             match handle.await {
                 Ok(Ok(_)) if !text.trim().is_empty() => store.vault.resolve(session_id, &text).map_err(AgentError::Msg)?,
-                _ => format!("(omitted {} middle turns; LLM unavailable)\n{}", middle.len(), digest.chars().take(2000).collect::<String>()),
+                _ => format!("(offline fallback: LLM summarizer unreachable — below is the verbatim head of the {} omitted turns, not a model summary)\n{}", middle.len(), digest.chars().take(2000).collect::<String>()),
             }
         };
         let ids: Vec<String> = middle.iter().map(|t| t.id.clone()).collect();
-        let n = store.delete_turns(session_id, &ids)?;
-        store.add_turn(session_id, "assistant", &format!("Prior context summary ({n} turns compacted):\n{summary}"))?;
+        let summary = format!("Prior context summary ({} turns compacted):\n{summary}", ids.len());
+        let n = store.compact_replace(session_id, &ids, &summary)?;
         let _ = cfg; // compat flags are read at prompt time, not compaction time
         Ok(format!("compacted {n} turns"))
     }
@@ -1192,6 +1427,42 @@ mod loop_key_tests {
     }
 
     #[test]
+    fn subagent_key_canonicalizes_to_agent_and_paths() {
+        let k1 = tool_call_key("subagent", &a(&[("agent", "general"), ("task", "Read src/server/sessions.js activityFor and report verbatim")]));
+        let k2 = tool_call_key("subagent", &a(&[("agent", "general"), ("task", "Something totally different about src/server/sessions.js tail")]));
+        assert_eq!(k1, k2, "same agent + same file must share a key or repeat detection never fires");
+        let k3 = tool_call_key("subagent", &a(&[("agent", "general"), ("task", "Read src/public/app.js and report")]));
+        assert_ne!(k1, k3, "different files differ");
+    }
+
+    #[test]
+    fn mentioned_paths_extracts_file_tokens() {
+        let ps = mentioned_paths("Read `src/server/sessions.js:1275` and src/public/app.js verbatim");
+        assert_eq!(ps, vec!["src/public/app.js".to_string(), "src/server/sessions.js".to_string()]);
+        assert!(mentioned_paths("just think about the fix, no files").is_empty());
+        assert!(mentioned_paths("see https://example.com/docs for details").is_empty(), "URLs are not paths");
+    }
+
+    #[test]
+    fn subagent_guard_blocks_proxy_read_and_budget() {
+        let mut counts = HashMap::new();
+        counts.insert("src/server/sessions.js".to_string(), 5usize);
+        let blocked = subagent_guard(
+            "subagent",
+            &a(&[("task", "Read /home/herbert/ai-manager/src/server/sessions.js tail via subagent since direct reads are blocked")]),
+            &counts,
+            0,
+        )
+        .expect("proxy read of a capped file blocks");
+        assert!(blocked.contains("already read 5 times"), "{blocked}");
+        assert!(subagent_guard("subagent", &a(&[("task", "read src/other.js")]), &counts, 0).is_none());
+        let over = subagent_guard("subagent", &a(&[("task", "explore the repo")]), &HashMap::new(), SUBAGENT_BUDGET)
+            .expect("exhausted budget blocks");
+        assert!(over.contains("budget exhausted"), "{over}");
+        assert!(subagent_guard("read", &a(&[("path", "x")]), &counts, 99).is_none(), "only subagents are guarded");
+    }
+
+    #[test]
     fn task_output_is_exempt_and_labeled() {
         assert_eq!(tool_call_key("task_output", &a(&[("task_id", "task-1")])), "", "polls are progress, not loops");
         assert_eq!(tool_label("bash", &a(&[("command", "ls")])), "bash: ls");
@@ -1205,6 +1476,16 @@ mod loop_key_tests {
         assert!(nudge.contains("web/src/App.tsx"), "{nudge}");
         assert!(read_repeat_nudge("web/src/App.tsx", 5).is_none(), "fires once, not spam");
         assert!(read_repeat_nudge("", 4).is_none());
+    }
+
+    #[test]
+    fn bash_native_nudge_redirects_file_ops() {
+        assert!(bash_native_nudge("grep -r foo src").unwrap().contains("native `grep`"));
+        assert!(bash_native_nudge("cat src/main.rs").unwrap().contains("native `read`"));
+        assert!(bash_native_nudge("ls src").unwrap().contains("native `glob`"));
+        assert!(bash_native_nudge("git diff --stat HEAD").is_none(), "git still needs bash");
+        assert!(bash_native_nudge("cargo test").is_none());
+        assert!(bash_native_nudge("git diff | grep foo").is_none(), "piped grep still needs shell");
     }
 
     #[test]
@@ -1339,7 +1620,7 @@ mod guard_tests {
         let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
         let runner = Runner::new();
         let out = runner
-            .run_prompt(&store, &router, &cfg, &sess.id, "read a.txt", "", &[], |_, _| {}, |_| {}, |_| {})
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "read a.txt").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
             .await
             .unwrap();
         assert_eq!(out.text, "stuck: audit done, nothing left", "silent turn must end with a stuck summary, got {out:?}");
@@ -1422,7 +1703,7 @@ mod guard_tests {
         let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
         let runner = Runner::new();
         let out = runner
-            .run_prompt(&store, &router, &cfg, &sess.id, "say nothing", "", &[], |_, _| {}, |_| {}, |_| {})
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "say nothing").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
             .await
             .unwrap();
         assert!(out.text.trim().is_empty(), "no-work silence must pass through, got {out:?}");
@@ -1522,14 +1803,14 @@ mod guard_tests {
         let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
         let runner = Runner::new();
         let out = runner
-            .run_prompt(&store, &router, &cfg, &sess.id, "patch a.txt", "", &[], |_, _| {}, |_| {}, |_| {})
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "patch a.txt").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
             .await
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 5, "edit + 2 refused finishes + failing verify + release");
         assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "beta", "edit must apply");
         assert!(out.text.contains("never verified"), "released turn must carry the pointer, got {out:?}");
         let turns = store.turns(&sess.id).unwrap();
-        assert!(turns.iter().any(|t| t.text.contains("Unverified changes")), "gate demand must hit the transcript");
+        assert!(!turns.iter().any(|t| t.text.contains("Unverified changes")), "gate demand stays in-memory; transcript holds real turns only");
     }
 
     /// Scripted gateway serving fixed payloads in order (one POST per round).
@@ -1599,8 +1880,8 @@ mod guard_tests {
     }
 
     /// No-progress gate: a fix request ending with zero edits forces action
-    /// rounds (cap 2), then releases as-is — no breakage risk, so unlike
-    /// the verify gate there is no pointer.
+    /// rounds (cap 2), then releases with a resume pointer — the turn must
+    /// not read as done when nothing changed (stuck session 9fd55938).
     #[tokio::test]
     async fn no_progress_gate_forces_action_rounds_then_releases() {
         let read_call = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n";
@@ -1618,7 +1899,7 @@ mod guard_tests {
         let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
         let runner = Runner::new();
         let out = runner
-            .run_prompt(&store, &router, &cfg, &sess.id, "fix the orange glow", "", &[], |_, _| {}, |_| {}, |_| {})
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "fix the orange glow").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
             .await
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 4, "explore + 2 refused finishes + release");
@@ -1626,9 +1907,37 @@ mod guard_tests {
         let turns = store.turns(&sess.id).unwrap();
         assert_eq!(
             turns.iter().filter(|t| t.text.contains("No changes made yet")).count(),
-            2,
-            "both action demands must hit the transcript"
+            0,
+            "control-plane demands stay in-memory; transcript holds real turns only"
         );
+    }
+
+    /// No-progress release names the miss: the released text carries a
+    /// resume pointer instead of reading as done (stuck session 9fd55938:
+    /// 24 explore rounds, filler final, task untouched).
+    #[tokio::test]
+    async fn no_progress_release_carries_pointer() {
+        let read_call = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n";
+        let (router, cfg, hits) = scripted_e2e(vec![
+            read_call,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"looks broken, checking\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"still checking\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"blocked: need the css file\"}}]}\n\n",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "fix the orange glow").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 4, "explore + 2 refused finishes + release");
+        assert!(out.text.contains("need the css file"), "final text preserved, got {out:?}");
+        assert!(out.text.contains("NOT done"), "released text must name the miss, got {out:?}");
     }
 
     /// Non-work requests (no keywords) end with text untouched — the gate
@@ -1645,7 +1954,7 @@ mod guard_tests {
         let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
         let runner = Runner::new();
         let out = runner
-            .run_prompt(&store, &router, &cfg, &sess.id, "check the weather", "", &[], |_, _| {}, |_| {}, |_| {})
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "check the weather").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
             .await
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1, "no guard round trip for plain answers");
@@ -1671,7 +1980,7 @@ mod guard_tests {
         store.add_turn(&sess.id, "user", "fix the orange glow").unwrap();
         let runner = Runner::new();
         let out = runner
-            .run_prompt(&store, &router, &cfg, &sess.id, "continue", "", &[], |_, _| {}, |_| {}, |_| {})
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "continue").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
             .await
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 3, "bare follow-up must still force action rounds");
@@ -1679,8 +1988,8 @@ mod guard_tests {
         let turns = store.turns(&sess.id).unwrap();
         assert_eq!(
             turns.iter().filter(|t| t.text.contains("No changes made yet")).count(),
-            2,
-            "both action demands must hit the transcript"
+            0,
+            "control-plane demands stay in-memory; transcript holds real turns only"
         );
     }
 
@@ -1734,8 +2043,7 @@ mod guard_tests {
                 &store,
                 &router,
                 &cfg,
-                &sess.id,
-                "fix the thing",
+                &sess.id, &runner.begin_turn(&store, &sess.id, "fix the thing").unwrap(),
                 "",
                 &[],
                 |_, _| {},

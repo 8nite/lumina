@@ -39,10 +39,9 @@ pub struct AppState {
     pub plugins: PluginCache,
     pub sweeper: KbSweeper,
     pub cfg_path: Option<PathBuf>,
-    /// Retry idempotency keys: `{session}\n{request_id}` → first-seen time.
-    /// A client resubmit after a lost response must not steer/queue the
-    /// same text twice (stuck session 7614829e).
-    pub seen_prompts: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    /// Monotonic SSE sequence number: clients detect dropped (lagged)
+    /// broadcast events by gaps and refetch /api/state to reconcile.
+    pub seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AppState {
@@ -55,12 +54,18 @@ impl AppState {
         // Background task completions surface as turn.progress stages
         // (Go OnBackgroundDone parity).
         let tx = events.clone();
+        let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tx_seq = seq.clone();
         crate::tools::set_background_hook(std::sync::Arc::new(move |session: &str, id: &str, kind: &str, _label: &str| {
-            let _ = tx.send(serde_json::json!({
+            let mut v = serde_json::json!({
                 "type": "turn.progress",
                 "session": session,
                 "stage": format!("background done: {id} ({kind})"),
-            }));
+            });
+            if let Some(o) = v.as_object_mut() {
+                o.insert("seq".into(), tx_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst).into());
+            }
+            let _ = tx.send(v);
         }));
         Self {
             gate: ApprovalGate::new(events.clone()),
@@ -74,11 +79,14 @@ impl AppState {
             plugins: PluginCache::new(),
             sweeper: KbSweeper::new(),
             cfg_path,
-            seen_prompts: Arc::new(Mutex::new(HashMap::new())),
+            seq,
         }
     }
 
-    fn emit(&self, v: serde_json::Value) {
+    fn emit(&self, mut v: serde_json::Value) {
+        if let Some(o) = v.as_object_mut() {
+            o.insert("seq".into(), self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst).into());
+        }
         let _ = self.events.send(v);
     }
 }
@@ -324,28 +332,6 @@ pub(crate) struct QueuedPrompt {
 /// Retry idempotency window: same span as the cross-daemon turn claim.
 const IDEM_TTL_SECS: u64 = 600;
 
-/// Returns true when this (session, request_id) was already submitted
-/// within the window — the caller must NOT steer/queue again. Prunes
-/// expired entries on each call so the map stays bounded.
-fn already_seen(
-    map: &mut HashMap<String, std::time::Instant>,
-    session_id: &str,
-    request_id: &str,
-    now: std::time::Instant,
-) -> bool {
-    map.retain(|_, &mut t| {
-        now.checked_duration_since(t)
-            .map(|d| d.as_secs() < IDEM_TTL_SECS)
-            .unwrap_or(true)
-    });
-    let key = format!("{session_id}\n{request_id}");
-    if map.contains_key(&key) {
-        return true;
-    }
-    map.insert(key, now);
-    false
-}
-
 #[derive(Deserialize)]
 struct PromptBody {
     #[serde(default)]
@@ -427,12 +413,8 @@ async fn prompt(
     // never refreshes it either.
     let request_id = b.request_id.trim().to_string();
     if !request_id.is_empty() {
-        let dup = already_seen(
-            &mut st.seen_prompts.lock().unwrap(),
-            &id,
-            &request_id,
-            std::time::Instant::now(),
-        );
+        // Fail-open: a DB error must not block the prompt.
+        let dup = st.store.seen_request(&id, &request_id, IDEM_TTL_SECS as i64).unwrap_or(false);
         if dup {
             let running = st.running.lock().unwrap().contains(&id);
             let status = if running { "steered" } else { "accepted" };
@@ -518,7 +500,7 @@ async fn prompt(
         // frees the claim and the running entry instead of wedging the
         // session with a dead drain.
         let _release = TurnRelease { store: st2.store.clone(), running: st2.running.clone(), id: id2.clone(), owner };
-        let first = drive_one(&st2, &runner, &id2, first_q).await;
+        let first = drive_one(&st2, &runner, &id2, &_release.owner, first_q).await;
         // The request may be gone (disconnect); the drain continues anyway.
         let _ = first_tx.send(first);
         let mut runner2 = Runner::new();
@@ -534,7 +516,7 @@ async fn prompt(
             // as a queued turn (Go leftover-steer parity).
             let rest = st2.store.take_steered(&id2);
             if !rest.trim().is_empty() {
-                let _ = drive_one(&st2, &runner2, &id2, QueuedPrompt {
+                let _ = drive_one(&st2, &runner2, &id2, &_release.owner, QueuedPrompt {
                     text: rest,
                     effort: String::new(),
                     images: Vec::new(),
@@ -545,7 +527,7 @@ async fn prompt(
                 st2.queued.lock().unwrap().get_mut(&id2).and_then(|q| q.pop_front())
             };
             let Some(q) = next else { break };
-            let _ = drive_one(&st2, &runner2, &id2, q).await;
+            let _ = drive_one(&st2, &runner2, &id2, &_release.owner, q).await;
         }
         // TurnRelease drops here: claim + running entry freed on every path.
     });
@@ -569,7 +551,7 @@ async fn prompt(
 }
 
 /// Run one queued turn: events, context gauge, standing-ops. Returns text or error string.
-async fn drive_one(st: &AppState, runner: &Runner, id: &str, q: QueuedPrompt) -> Result<String, String> {
+async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: QueuedPrompt) -> Result<String, String> {
     st.emit(ev("turn.started", id, serde_json::json!({"text": q.text})));
     let tx = st.events.clone();
     let sid = id.to_string();
@@ -592,20 +574,40 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, q: QueuedPrompt) ->
             let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "done", "tool": name, "target": target, "preview": preview, "error": error, "duration_ms": duration_ms})));
         }
     };
+    // Claim heartbeat: refresh our ownership while the turn runs so a
+    // second daemon can't steal the slot mid-turn (600s steal window vs
+    // turns that run far longer). Stops refreshing once the claim is lost.
+    let hb_store = st.store.clone();
+    let hb_id = id.to_string();
+    let hb_owner = owner.to_string();
+    let hb = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if !hb_store.claim_turn(&hb_id, &hb_owner, 600) {
+                break;
+            }
+        }
+    });
     // Backend owns the work: a transient LLM/gateway failure must not
     // silently kill the turn (stuck session d3539f35 ended mid-work with
     // no transcript trace after the no-progress gate pushed it onward).
     // One retry after a short cool-down, then a persisted failure note so
     // `continue` resumes with context instead of a dead transcript.
+    // One persisted user turn per queued prompt: the retry below reuses it
+    // instead of storing a duplicate and replaying executed tools.
+    let user_turn = runner
+        .begin_turn(&st.store, id, &q.text)
+        .map_err(|e| e.to_string())?;
     let mut out = runner
-        .run_prompt(&st.store, &st.router, &st.cfg, id, &q.text, &q.effort, &q.images, &mut on_event, &mut on_stage, &mut on_tool)
+        .run_prompt(&st.store, &st.router, &st.cfg, id, &user_turn, &q.effort, &q.images, &mut on_event, &mut on_stage, &mut on_tool)
         .await;
     if out.is_err() {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         out = runner
-            .run_prompt(&st.store, &st.router, &st.cfg, id, &q.text, &q.effort, &q.images, &mut on_event, &mut on_stage, &mut on_tool)
+            .run_prompt(&st.store, &st.router, &st.cfg, id, &user_turn, &q.effort, &q.images, &mut on_event, &mut on_stage, &mut on_tool)
             .await;
     }
+    hb.abort();
     match out {
         Ok(outcome) => {
             let ms = started.elapsed().as_millis() as u64;
@@ -1352,6 +1354,20 @@ async fn unrevert(State(st): State<AppState>, Path(id): Path<String>) -> impl In
 }
 
 async fn compact(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    // Never slice history out from under a live turn (its messages snapshot
+    // and per-round appends assume stable history).
+    let claimed_live = st
+        .store
+        .turn_owner(&id)
+        .map(|(_, since)| chrono::Utc::now().timestamp() - since < 600)
+        .unwrap_or(false);
+    if st.running.lock().unwrap().contains(&id) || claimed_live {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "turn in flight; compact after it completes"})),
+        )
+            .into_response();
+    }
     match Runner::compact_session(&st.store, &st.router, &st.cfg, &id).await {
         Ok(msg) => {
             st.emit(ev("session.compacted", &id, serde_json::json!({"result": msg})));
@@ -1466,15 +1482,13 @@ mod models_hook_tests {
 
     #[test]
     fn prompt_idempotency_dedups_within_ttl() {
-        let t0 = std::time::Instant::now();
-        let mut map = HashMap::new();
-        assert!(!already_seen(&mut map, "s1", "k1", t0), "first submit passes");
-        assert!(already_seen(&mut map, "s1", "k1", t0), "immediate resubmit dedups");
-        assert!(!already_seen(&mut map, "s1", "k2", t0), "different key passes");
-        assert!(!already_seen(&mut map, "s2", "k1", t0), "different session passes");
-        let later = t0 + std::time::Duration::from_secs(IDEM_TTL_SECS + 1);
-        assert!(!already_seen(&mut map, "s1", "k1", later), "expired key passes again");
-        assert_eq!(map.len(), 1, "expired entries pruned, got {map:?}");
+        let s = crate::store::Store::open(Some(":memory:")).unwrap();
+        assert!(!s.seen_request("s1", "k1", IDEM_TTL_SECS as i64).unwrap(), "first submit passes");
+        assert!(s.seen_request("s1", "k1", IDEM_TTL_SECS as i64).unwrap(), "immediate resubmit dedups");
+        assert!(!s.seen_request("s1", "k2", IDEM_TTL_SECS as i64).unwrap(), "different key passes");
+        assert!(!s.seen_request("s2", "k1", IDEM_TTL_SECS as i64).unwrap(), "different session passes");
+        // Negative TTL ages everything out: exercises the prune path.
+        assert!(!s.seen_request("s1", "k1", -1).unwrap(), "expired key passes again");
     }
 
     fn meta(id: &str, window: u32) -> crate::llm::ModelMeta {
@@ -1639,9 +1653,11 @@ mod drive_tests {
         let (st, runner, id, hits) =
             drive_state(vec![("500 Internal Server Error", ""), ("200 OK", FINISH)]);
         let q = QueuedPrompt { text: "hi there".into(), effort: String::new(), images: Vec::new() };
-        let out = drive_one(&st, &runner, &id, q).await;
+        let out = drive_one(&st, &runner, &id, "test-owner", q).await;
         assert_eq!(out.unwrap(), "recovered", "retry must recover the turn");
         assert_eq!(hits.load(Ordering::SeqCst), 2, "one failed attempt plus one retry");
+        let user_turns = st.store.turns(&id).unwrap().into_iter().filter(|t| t.role == "user" && t.text == "hi there").count();
+        assert_eq!(user_turns, 1, "retry must reuse the user turn, not duplicate it");
     }
 
     /// Persistent gateway failure: two attempts, then a failure note lands
@@ -1651,7 +1667,7 @@ mod drive_tests {
         let (st, runner, id, hits) =
             drive_state(vec![("500 Internal Server Error", ""), ("500 Internal Server Error", "")]);
         let q = QueuedPrompt { text: "hi there".into(), effort: String::new(), images: Vec::new() };
-        let out = drive_one(&st, &runner, &id, q).await;
+        let out = drive_one(&st, &runner, &id, "test-owner", q).await;
         assert!(out.is_err(), "persistent failure must still surface, got {out:?}");
         assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one retry, no loop");
         let turns = st.store.turns(&id).unwrap();

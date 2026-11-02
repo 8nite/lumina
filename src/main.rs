@@ -338,8 +338,11 @@ async fn main() -> MainResult {
             ));
             // Headless progress log (Go parity): stages on stderr, only the
             // final answer on stdout.
+            let user_turn = runner
+                .begin_turn(&store, &sess.id, &text)
+                .map_err(|e| format!("store: {e}"))?;
             let outcome = runner
-                .run_prompt(&store, &router, &cfg, &sess.id, &text, llm::normalize_effort(&effort), &images,
+                .run_prompt(&store, &router, &cfg, &sess.id, &user_turn, llm::normalize_effort(&effort), &images,
                     |d, t| {
                         let preview = if d.is_empty() { t } else { d };
                         let one: String = preview.chars().take(120).collect();

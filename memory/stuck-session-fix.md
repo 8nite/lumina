@@ -136,33 +136,38 @@ single-flights concurrent submits. Test:
 `prompt_idempotency_dedups_within_ttl`.
 7614829e duplicate-prompt fix landed (6ad0f21): request_id idempotency in daemon prompt (seen-key map 600s, deduped status), client and SDK reuse one key across retries, App send single-flights. Live-verified deduped:true on resubmit. Cargo 122 pass, clippy at baseline, web tsc+build green.
 
-## Fifth case (7614829e, 2026-11-01): bare "continue" spun 124 tools, zero edits, no gate
+## Fifth case (7614829e "continue" turn, 2026-11-01): gates blind on follow-ups + todo/bash spin
 
-Same orange-glow session: a follow-up `continue` prompt carries no intent
-by itself, so `looks_like_work("continue")` is false and the no-progress
-gate stayed disarmed while the model ran ~40 rounds (43 todowrite
-re-plans, 66 explore bashes, SessionView re-reads) with zero edits and no
-finish attempt for the end-gates to catch. Fix in `src/agent.rs`
-(uncommitted): inherit the session's original task — first non-tool `user`
-turn — for gate decisions (`work_requested` = current prompt OR first
-task); plus an idle-round nudge — consecutive mutation-free rounds counter
-(`edit`/`write`/`patch` resets; `task_output`-only polling rounds neither
-reset nor advance), advisory prod every 12th idle round on work requests
-(`idling…` stage). Tests:
+"continue" turn ran 15:20:10→15:31:50 (~124 tools: 43 todowrite re-plans
+stuck at 0/3, 66 explore bashes, 9 reads, 6 greps, SessionView re-reads),
+zero edits, ended with duplicated filler and no gate fired — the prompt
+text "continue" matches no work keyword, so `work_requested` was false and
+the no-progress gate stayed disarmed; the mid-loop spin never attempts a
+finish for the end-gates to catch. Fixes in `src/agent.rs` (32a5da3):
+(1) inherit the session's original task (first non-tool `user` turn) for
+gate decisions (`work_requested` = current prompt OR first task), so bare
+follow-ups keep both end-gates armed; (2) idle-round nudge — consecutive
+mutation-free rounds counter (`edit`/`write`/`patch` resets;
+`task_output`-only polling rounds neither reset nor advance), advisory
+prod every 12th idle round on work requests (`idling…` stage). Tests:
 `followup_inherits_work_from_original_task` (bare follow-up forces action
 rounds, both demands hit transcript), `idle_rounds_nudge_then_gate_releases`
 (12 reads surface `idling` stage, turn still ends via no-progress gate).
 
-## Fifth case (7614829e "continue" turn, 2026-11-01): gates blind on follow-ups + todo/bash spin
+## Sixth case (cc686408 session, 2026-11-01): subagent fan-out dodges loop guards
 
-"continue" turn ran 15:20:10→15:31:50 (~124 tools: 43 todowrite re-plans
-stuck at 0/3, 66 explore bashes, 9 reads, 6 greps), zero edits, ended
-with duplicated filler and no gate fired — the prompt text "continue"
-matches no work keyword, so `work_requested` was false. Fixes in
-`src/agent.rs`: (1) inherit the session's original task (first non-tool
-user turn) for gate decisions, so bare follow-ups keep both end-gates
-armed; (2) idle-round nudge — consecutive mutation-free rounds on a work
-request append an advisory prod every 12th round (`idling…` stage;
-task_output-only polls don't count). Tests:
-`followup_inherits_work_from_original_task`,
-`idle_rounds_nudge_then_gate_releases`.
+One stuck turn fanned out to 30 subagents (2–10 min each, uncommitted
+`src/agent.rs` work): full task text is unique per call so the
+identical-call key never tripped, and proxy reads inside child
+trajectories dodged the per-file read cap. Fixes: (1) `tool_call_key`
+canonicalizes subagent to `agent + mentioned_paths(task)`
+(`mentioned_paths` extracts `dir/file.ext` tokens, skips URLs);
+(2) `SUBAGENT_BUDGET=8` per turn + `subagent_guard` pre-execution deny
+(budget exhausted, or task names a file already read 5+ times —
+suffix-matched since tasks cite abs paths); executed subagents share
+the re-read ledger. Tool description advertises the budget. (3) mid-loop
+verify prod: mutated-but-unverified at every 12th round appends
+`Verify now…` advisory until the end-gate forces it. Tests:
+`subagent_key_canonicalizes_to_agent_and_paths`,
+`mentioned_paths_extracts_file_tokens`,
+`subagent_guard_blocks_proxy_read_and_budget`.

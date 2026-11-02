@@ -227,6 +227,34 @@
       "output_tokens": 0,
       "files": 2,
       "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 1 node + 2 edges for prompt request-id idempotency (stuck-session-fix.md fourth case, 6ad0f21); deduped stale repeat lines; MEMORY.md index updated"
+    },
+    {
+      "date": "2026-11-01T15:42:19.653080+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 2 nodes + 3 edges for follow-up task inheritance + 12-round idle nudge (stuck-session-fix.md fifth case, 7614829e continue spin, landed 32a5da3); duplicate Fifth-case headings merged; MEMORY.md index updated"
+    },
+    {
+      "date": "2026-11-01T16:05:00+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 2 nodes + 4 edges for subagent budget/proxy-read guard + mid-loop verify prod (stuck-session-fix.md sixth case, cc686408, uncommitted); MEMORY.md index updated"
+    },
+    {
+      "date": "2026-11-02T00:17:47.438080+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "inline host-agent delta: loop-harness-audit.md + MEMORY.md index desc (no transcript source provided; no headless extract)"
+    },
+    {
+      "date": "2026-11-02T01:19:04.754748+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 2 nodes + 3 links for truncate_to char-boundary fix + NOT-done pointer (harness-silent-turn-death.md); MEMORY.md index desc filled (no transcript source provided; no headless extract)"
     }
   ],
   "total_input_tokens": 0,

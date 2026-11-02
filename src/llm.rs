@@ -807,8 +807,9 @@ async fn chat_openai(
                 Err(_) => continue,
             };
             if let Some(u) = v.get("usage") {
-                usage.input = u.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
-                usage.output = u.get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+                // Frames repeat per chunk: sum, don't overwrite.
+                usage.input = usage.input.saturating_add(u.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+                usage.output = usage.output.saturating_add(u.get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
             }
             let Some(choice) = v.get("choices").and_then(|c| c.get(0)) else {
                 continue;

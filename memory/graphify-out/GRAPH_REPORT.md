@@ -1,11 +1,11 @@
-# Graph Report - memory  (2026-11-01, refreshed inline incl. stuck-session fix + drive_one retry + prompt idempotency)
+# Graph Report - memory  (2026-11-02, refreshed inline incl. stuck-session fix + drive_one retry + prompt idempotency + follow-up inheritance/idle nudge + subagent budget/verify prod + harness-silent-turn-death)
 
 ## Corpus Check
-- 28 files · ~7300 words
+- 30 files · ~8400 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 135 nodes · 181 links · 4 communities
+- 145 nodes · 196 links · 4 communities
 - Extraction: 89% EXTRACTED · 8% INFERRED · 0% AMBIGUOUS · INFERRED: 11 edges (avg confidence: 0.83)
 - Token cost: 0 input · 0 output
 
@@ -57,7 +57,7 @@ Nodes (26): lumina Live Wiring, Lumina Memory Index, Steer Queue Inbox While Wor
 
 ### Community 2 - "Subagent Background Web Tools"
 Cohesion: 0.40
-Nodes (11): BTC E2E Web Subagent Background Verification, SSE Fragment Accumulation Fix, Reference system-prompt Parity via toolGuidance, Plan-Fence Deny plus Permission Gating, Depth-1 Subagent Runner with Explore Envelope, Subagent Background Web Tool Surface, Question Round-Trip UI Wiring, Patch Tool Envelope, Identical-Round Loop Guard, Empty-Final Turn Guard, Auto-Continue Ceiling Pointer
+Nodes (11): BTC E2E Web Subagent Background Verification, SSE Fragment Accumulation Fix, Reference system-prompt Parity via toolGuidance, Plan-Fence Deny plus Permission Gating, Depth-1 Subagent Runner with Explore Envelope, Subagent Background Web Tool Surface, Question Round-Trip UI Wiring, Patch Tool Envelope, Identical-Round Loop Guard, Empty-Final Turn Guard, Auto-Continue Ceiling Pointer, Atomic Compaction Replace Transaction, Retry Reuses One User Turn, Subagent Loop Guards, SSE Seq Ids plus Idempotency and Steer Inbox
 
 ### Community 3 - "Plan/Build and Permission Modes"
 Nodes (9): Lumina Pure-Go Daemon, 4-Mode Permission & Bypass Broker (Shift+Tab), Plan & Build Primary Agent Modes (Tab), AGENTS.md & Markdown Extensions Loader, Config Defaults Seed Flags, agent-browser Skill Port, Skill Advertisement Gap, Skill Advertisement Fix (skillsBlock), Global Skill Promotion plus Keyless Fallback

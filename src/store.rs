@@ -4,7 +4,6 @@
 use regex::Regex;
 use rusqlite::{params, Connection};
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -48,9 +47,6 @@ pub struct Store {
     /// Memory-only secret vault (dies with the process; transcripts keep values).
     /// Arc-shared: subagent closures outlive the turn borrow.
     pub vault: Arc<crate::vault::Vault>,
-    /// Steer inbox: text steered into a running turn (Go Runner inbox
-    /// parity). Memory-only; drained at round boundaries.
-    steered: Mutex<HashMap<String, Vec<String>>>,
 }
 
 fn now() -> String {
@@ -143,7 +139,13 @@ impl Store {
                req_id TEXT PRIMARY KEY, session_id TEXT, tool TEXT, target TEXT,
                decision TEXT, created_at TEXT);
              CREATE TABLE IF NOT EXISTS traces(
-               id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, payload TEXT, created_at TEXT);",
+               id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, payload TEXT, created_at TEXT);
+             CREATE TABLE IF NOT EXISTS idempotency(
+               session_id TEXT NOT NULL, request_id TEXT NOT NULL, created_at INTEGER,
+               PRIMARY KEY(session_id, request_id));
+             CREATE TABLE IF NOT EXISTS steered(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, text TEXT, created_at TEXT);
+             CREATE INDEX IF NOT EXISTS idx_steered_session ON steered(session_id);",
         )?;
         for ddl in [
             "ALTER TABLE sessions ADD COLUMN inflight_owner TEXT DEFAULT ''",
@@ -155,7 +157,6 @@ impl Store {
         Ok(Self {
             db: Mutex::new(db),
             vault: Arc::new(crate::vault::Vault::new()),
-            steered: Mutex::new(HashMap::new()),
         })
     }
 
@@ -385,7 +386,7 @@ impl Store {
     pub fn turns(&self, session: &str) -> Result<Vec<Turn>, StoreError> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(
-            "SELECT id,session_id,parent_id,role,text,created_at FROM turns WHERE session_id=? ORDER BY created_at",
+            "SELECT id,session_id,parent_id,role,text,created_at FROM turns WHERE session_id=? ORDER BY created_at, rowid",
         )?;
         let rows = st.query_map([session], |r| {
             Ok(Turn {
@@ -469,13 +470,30 @@ pub fn sanitize_export(text: &str) -> String {
 
 
 impl Store {
-    /// Delete turns by id (compaction).
-    pub fn delete_turns(&self, session: &str, ids: &[String]) -> Result<usize, StoreError> {
-        let db = self.db.lock().unwrap();
+    /// Atomically swap compacted turns for their summary (compaction).
+    /// Delete-then-insert in one transaction: a crash can never leave
+    /// the middle turns deleted with no summary.
+    pub fn compact_replace(&self, session: &str, ids: &[String], summary: &str) -> Result<usize, StoreError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
         let mut n = 0;
         for id in ids {
-            n += db.execute("DELETE FROM turns WHERE session_id=? AND id=?", params![session, id])?;
+            n += tx.execute("DELETE FROM turns WHERE session_id=? AND id=?", params![session, id])?;
         }
+        let t = Turn {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session.into(),
+            parent_id: String::new(),
+            role: "assistant".into(),
+            text: summary.into(),
+            created_at: now(),
+        };
+        tx.execute(
+            "INSERT INTO turns(id,session_id,parent_id,role,text,created_at) VALUES(?,?,?,?,?,?)",
+            params![t.id, t.session_id, t.parent_id, t.role, t.text, t.created_at],
+        )?;
+        tx.execute("UPDATE sessions SET updated_at=? WHERE id=?", params![now(), session])?;
+        tx.commit()?;
         Ok(n)
     }
 
@@ -540,22 +558,7 @@ mod tests {
     use super::*;
 
     fn mem() -> Store {
-        let db = Connection::open_in_memory().unwrap();
-        db.pragma_update(None, "journal_mode", "WAL").unwrap();
-        db.execute_batch(
-            "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_id TEXT DEFAULT '',
-             workspace_dir TEXT NOT NULL, agent TEXT DEFAULT 'build',
-             permission_mode TEXT DEFAULT 'bypass', model TEXT DEFAULT '', title TEXT DEFAULT '',
-             created_at TEXT, updated_at TEXT);
-             CREATE TABLE turns(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, parent_id TEXT DEFAULT '',
-             role TEXT, text TEXT, created_at TEXT);
-             CREATE INDEX idx_turns_session ON turns(session_id);
-             CREATE TABLE approvals(req_id TEXT PRIMARY KEY, session_id TEXT, tool TEXT, target TEXT,
-             decision TEXT, created_at TEXT);
-             CREATE TABLE traces(id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, payload TEXT, created_at TEXT);",
-        )
-        .unwrap();
-        Store { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()), steered: Mutex::new(HashMap::new()) }
+        Store::open(Some(":memory:")).unwrap()
     }
 
     #[test]
@@ -679,19 +682,50 @@ impl Store {
 
     /// Release the turn slot (only our own claims).
     /// Buffer text into the running turn (steer delivery). Empty trims to noop.
+    /// DB-backed: survives daemon restarts (the old memory inbox lost steers).
     pub fn steer(&self, session: &str, text: &str) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
-        self.steered.lock().unwrap().entry(session.to_string()).or_default().push(text.to_string());
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT INTO steered(session_id,text,created_at) VALUES(?,?,?)",
+            params![session, text, now()],
+        );
     }
 
     /// Drain buffered steer text for one turn (joined, trimmed).
     pub fn take_steered(&self, session: &str) -> String {
-        let mut inbox = self.steered.lock().unwrap();
-        let parts = inbox.remove(session).unwrap_or_default();
-        parts.join("\n\n").trim().to_string()
+        let db = self.db.lock().unwrap();
+        let rows: Vec<String> = db
+            .prepare("SELECT text FROM steered WHERE session_id=? ORDER BY id")
+            .and_then(|mut st| st.query_map([session], |r| r.get(0))?.collect::<Result<_, _>>())
+            .unwrap_or_default();
+        let _ = db.execute("DELETE FROM steered WHERE session_id=?", params![session]);
+        rows.join("\n\n").trim().to_string()
+    }
+
+    /// Retry idempotency: true when (session, request_id) was already
+    /// submitted within ttl_secs. DB-backed: survives daemon restarts.
+    /// Prunes expired keys on each call so the table stays bounded.
+    pub fn seen_request(&self, session: &str, request_id: &str, ttl_secs: i64) -> Result<bool, StoreError> {
+        let db = self.db.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.execute("DELETE FROM idempotency WHERE created_at < ?", params![now - ttl_secs])?;
+        let n: i64 = db.query_row(
+            "SELECT COUNT(*) FROM idempotency WHERE session_id=? AND request_id=?",
+            params![session, request_id],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            return Ok(true);
+        }
+        db.execute(
+            "INSERT INTO idempotency(session_id,request_id,created_at) VALUES(?,?,?)",
+            params![session, request_id, now],
+        )?;
+        Ok(false)
     }
 
     pub fn release_turn(&self, id: &str, owner: &str) {
@@ -709,22 +743,7 @@ mod claim_tests {
 
     #[test]
     fn claim_release_cycle() {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_id TEXT DEFAULT '',
-             workspace_dir TEXT NOT NULL, agent TEXT DEFAULT 'build',
-             permission_mode TEXT DEFAULT 'bypass', model TEXT DEFAULT '', title TEXT DEFAULT '',
-             created_at TEXT, updated_at TEXT);",
-        )
-        .unwrap();
-        // inflight columns missing on this scratch schema: migrate tolerantly.
-        for ddl in [
-            "ALTER TABLE sessions ADD COLUMN inflight_owner TEXT DEFAULT ''",
-            "ALTER TABLE sessions ADD COLUMN inflight_since INTEGER DEFAULT 0",
-        ] {
-            let _ = db.execute_batch(ddl);
-        }
-        let s = Store { db: Mutex::new(db), vault: Arc::new(crate::vault::Vault::new()), steered: Mutex::new(HashMap::new()) };
+        let s = Store::open(Some(":memory:")).unwrap();
         let sess = s.create_session("/w", "build", "bypass", "").unwrap();
         assert!(s.claim_turn(&sess.id, "daemon-a", 600));
         assert!(!s.claim_turn(&sess.id, "daemon-b", 600)); // held: 409 path

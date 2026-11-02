@@ -319,12 +319,28 @@ fn wash(sc: &SecCtx, p: &str) -> PathBuf {
     norm
 }
 
+/// Byte-cap a string without panicking: `String::truncate` panics when
+/// `max_bytes` splits a multi-byte char, and tool outputs routinely carry
+/// them (→, ─, …). A 256KB `cap` of CJK/log output killed the daemon's
+/// turn worker on exactly this (`is_char_boundary` assertion). Floor to
+/// the nearest char boundary instead.
+pub fn truncate_to(s: &mut String, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 const MAX_BYTES: u64 = 256 * 1024;
 
 fn cap(s: String) -> Outcome {
     if s.len() as u64 > MAX_BYTES {
         let mut t = s;
-        t.truncate(MAX_BYTES as usize);
+        truncate_to(&mut t, MAX_BYTES as usize);
         Outcome { output: t, truncated: true }
     } else {
         Outcome { output: s, truncated: false }
@@ -492,7 +508,7 @@ fn do_bash(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value
     if bg {
         let mut label = cmd_str.clone();
         if label.len() > 80 {
-            label.truncate(80);
+            truncate_to(&mut label, 80);
             label.push('…');
         }
         let id = new_task(&sc.session, "bash", &label);
@@ -1613,5 +1629,34 @@ mod extended_tests {
         // tool_target mirrors the alias.
         assert_eq!(tool_target("shell", &args(&[("command", "echo hi")])), "echo hi");
         assert_eq!(tool_target("lsp", &args(&[("pattern", "hello")])), "hello");
+    }
+
+    #[test]
+    fn truncate_to_floors_at_char_boundary() {
+        // ASCII fast path: untouched.
+        let mut s = "hello".to_string();
+        truncate_to(&mut s, 10);
+        assert_eq!(s, "hello");
+        // "é" is 2 bytes: capping "aé" (3 bytes) at 2 floors to "a"
+        // instead of panicking mid-char.
+        let mut s = "aé".to_string();
+        truncate_to(&mut s, 2);
+        assert_eq!(s, "a");
+        // Exact boundary keeps the char.
+        let mut s = "aé".to_string();
+        truncate_to(&mut s, 3);
+        assert_eq!(s, "aé");
+    }
+
+    #[test]
+    fn cap_multibyte_output_does_not_panic() {
+        // Regression: `cap` used `String::truncate`, which panics when the
+        // 256KB split lands inside a multi-byte char — killing the daemon
+        // turn worker (`is_char_boundary` assertion). 262143 1-byte chars
+        // + "…" (3 bytes) puts the split inside the ellipsis.
+        let big = "a".repeat(262143) + "…";
+        let out = cap(big);
+        assert!(out.truncated);
+        assert!(out.output.len() <= MAX_BYTES as usize);
     }
 }
