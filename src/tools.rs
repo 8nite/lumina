@@ -517,7 +517,7 @@ fn do_bash(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value
         let session = sc.session.clone();
         let id2 = id.clone();
         std::thread::spawn(move || {
-            let out = match exec_bash(&cmd_str, &dir, &session, &extra_env, timeout) {
+            let out = match exec_bash(&cmd_str, &dir, &session, &extra_env, timeout, false) {
                 Ok(s) => s,
                 Err(e) => format!("error: {e}"),
             };
@@ -525,7 +525,7 @@ fn do_bash(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value
         });
         return Ok(Outcome { output: format!("started background task {id} (poll with task_output)"), truncated: false });
     }
-    exec_bash(&cmd_str, &dir, &sc.session, &extra_env, timeout).map(cap)
+    exec_bash(&cmd_str, &dir, &sc.session, &extra_env, timeout, true).map(cap)
 }
 
 /// Synchronous shell run shared by foreground `bash` and background tasks.
@@ -536,6 +536,7 @@ fn exec_bash(
     session: &str,
     extra_env: &[(String, String)],
     timeout: Option<Duration>,
+    kill_on_stop: bool,
 ) -> Result<String, ToolError> {
     // Per-session TMPDIR hygiene (cleaned on session.deleted). Ensure the
     // dir exists so tools (and test suites run via bash) can use it.
@@ -578,6 +579,13 @@ fn exec_bash(
                 let _ = child.kill();
                 return Err(ToolError::Msg(format!("bash: timed out after {:?}", timeout.unwrap())));
             }
+            // Cooperative stop lands mid-tool: kill the child so the
+            // turn ends now instead of after the command finishes.
+            // Foreground only — background tasks outlive the turn.
+            None if kill_on_stop && stop_requested(session) => {
+                let _ = child.kill();
+                return Err(ToolError::Msg("bash: stopped by user".into()));
+            }
             None => std::thread::sleep(Duration::from_millis(25)),
         }
     }
@@ -619,6 +627,28 @@ fn notify_background_done(session: &str, id: &str, kind: &str, label: &str) {
     if let Some(h) = background_hook().lock().unwrap().clone() {
         h(session, id, kind, label);
     }
+}
+
+/// Cooperative-stop probe: foreground `bash` kills the child when the
+/// session's stop flag is set, so the web Stop button lands in ~ms
+/// instead of after the tool finishes (a `sleep 60` used to eat the
+/// stop). Daemon-only: the server installs it at startup from its
+/// `Arc<Store>`; unset in headless `run` and tests (prior behavior).
+pub type StopHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+fn stop_hook() -> &'static Mutex<Option<StopHook>> {
+    use std::sync::OnceLock;
+    static HOOK: OnceLock<Mutex<Option<StopHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Install the process-wide stop probe.
+pub fn set_stop_hook(hook: StopHook) {
+    *stop_hook().lock().unwrap() = Some(hook);
+}
+
+fn stop_requested(session: &str) -> bool {
+    stop_hook().lock().unwrap().as_ref().is_some_and(|h| h(session))
 }
 
 fn task_registry() -> &'static Mutex<HashMap<String, TaskEntry>> {

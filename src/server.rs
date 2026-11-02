@@ -122,6 +122,11 @@ async fn require_token(
 }
 
 pub fn router(state: AppState) -> Router {
+    // Cooperative stop must land mid-tool: foreground bash polls this and
+    // kills the child instead of running the command out (daemon-only;
+    // headless `run` leaves it unset and keeps prior behavior).
+    let stop_store = state.store.clone();
+    crate::tools::set_stop_hook(std::sync::Arc::new(move |sess: &str| stop_store.stop_requested(sess)));
     Router::new()
         .route("/openapi.json", get(openapi))
         .route("/api/v1/events", get(events))
