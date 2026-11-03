@@ -346,6 +346,20 @@
    "output_tokens": 0,
    "files": 1,
    "note": "standing-ops kb refresh (ses_e60e1cc3cffeRgFoPmNgF6c5tH ended): no transcript source provided; no new findings to distill; verified frontmatter+index coverage clean, graph healthy (173 nodes/233 links, 0 dups); re-stamped over-exploration-fix.md mtime-only touch (content hash identical, 4 semantic nodes already present); no headless extract (no-key flow)"
+  },
+  {
+   "date": "2026-11-03T14:14:17.521660+00:00",
+   "input_tokens": 0,
+   "output_tokens": 0,
+   "files": 4,
+   "note": "standing-ops kb refresh (ses_e61dbb351ffelFHVoiGANa53Yz ended): no transcript source provided; distilled from git (c652b72 copilot probe filter, 1ec51c4 tui enterprise/avail, d719a02 flush+clock markers) + indexed session file webui-background-visibility.md (deduped own toast bullet); 3 topics updated, 1 indexed, 6 inline semantic nodes + 7 links (185 nodes/247 links); no headless extract (no-key flow)"
+  },
+  {
+   "date": "2026-11-03T14:58:29.435392+00:00",
+   "input_tokens": 0,
+   "output_tokens": 0,
+   "files": 2,
+   "note": "standing-ops kb refresh follow-up: indexed cache-hits.md (frontmatter+wikilinks, MEMORY.md blurb), 3 inline semantic nodes + 3 links (188 nodes/250 links); no headless extract (no-key flow)"
   }
  ],
  "total_input_tokens": 0,

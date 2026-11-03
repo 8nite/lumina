@@ -1,5 +1,5 @@
 ---
-date_modified: 2026-10-30
+date_modified: 2026-11-03
 tags: [system-prompt, subagent, background-tasks, websearch, e2e, interop]
 ---
 
@@ -12,3 +12,5 @@ tags: [system-prompt, subagent, background-tasks, websearch, e2e, interop]
   - Subagent delegation prompts truncated (6000/2000 chars) so a pasted dump can't blow the child context window (child system is intentionally lean: no global bundle).
   - Step-cap: when the 8-round cap is hit with pending calls, one final no-tools round asks the model to summarize, so the turn ends with a substantive gathered reply instead of `""`.
 - **Caveats observed:** `copilot/gpt-4o` + `gpt-4.1` work on this account; newer `claude-sonnet-5`/`gpt-5.6-*` IDs return `model_not_supported`; Copilot 429s under burst load; `api.coindesk.com` does not resolve from this network (use coinbase/kraken/coingecko); `investing.com` returns 403 to bots (subagent reported it honestly). Google cross-check skipped per repo zero-Google hard-deny posture.
+
+See also: [[subagents-websearch]], [[lumina-live]].

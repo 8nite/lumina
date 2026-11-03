@@ -53,11 +53,13 @@ pub enum Event {
         target: String,
         preview: String,
         error: bool,
+    #[allow(dead_code)]
         duration_ms: u64,
     },
     TurnCompleted { session: String, ms: u64, chars: usize, text: String, model: String },
     TurnFailed { session: String, error: String },
     PermissionAsked { req_id: String, session: String, tool: String, target: String },
+    #[allow(dead_code)]
     PermissionResolved { req_id: String, decision: String },
     QuestionAsked { req_id: String, session: String, questions: Vec<QuestionView> },
     QuestionResolved { req_id: String },
@@ -127,6 +129,7 @@ pub struct AgentView {
     #[serde(default)]
     pub mode: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub description: String,
 }
 
@@ -333,6 +336,7 @@ impl Sdk {
         Ok(Self::check(self.req(reqwest::Method::PATCH, &format!("/api/v1/sessions/{id}")).json(body).send()?)?.json()?)
     }
 
+    #[allow(dead_code)]
     pub fn submit(&self, id: &str, text: &str, effort: &str) -> Result<SubmitOut, SdkError> {
         self.submit_delivery(id, text, effort, "steer")
     }
@@ -404,6 +408,7 @@ impl Sdk {
         })
     }
 
+    #[allow(dead_code)]
     pub fn submit_text(&self, id: &str, text: &str, effort: &str) -> Result<String, SdkError> {
         Ok(self.submit(id, text, effort)?.text)
     }

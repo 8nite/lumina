@@ -47,9 +47,11 @@ pub struct ToolSpec {
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolCall {
+    #[allow(dead_code)]
     pub id: String,
     pub name: String,
     pub args: HashMap<String, serde_json::Value>,
+    #[allow(dead_code)]
     pub raw_args: String,
 }
 
@@ -80,6 +82,13 @@ impl Usage {
         self.output = self.output.saturating_add(o.output);
         self.cache_read = self.cache_read.saturating_add(o.cache_read);
         self.cache_write = self.cache_write.saturating_add(o.cache_write);
+    }
+    /// Whole-percent prefix-cache hit rate for this usage slice (0 when empty).
+    pub fn cache_hit_pct(&self) -> u32 {
+        if self.input == 0 {
+            return 0;
+        }
+        (self.cache_read.min(self.input) as u64 * 100 / self.input as u64) as u32
     }
 }
 
@@ -158,6 +167,8 @@ pub fn valid_effort(s: &str) -> bool {
 }
 
 /// Render "" as "auto" for pills and pickers (Go EffortLabel parity).
+/// Used by TUI pickers + tests.
+#[allow(dead_code)]
 pub fn effort_label(s: &str) -> &str {
     match normalize_effort(s) {
         "" => "auto",
@@ -174,6 +185,8 @@ pub fn effort_label(s: &str) -> &str {
 /// Anthropic thinking budget ladder (must be >= 1024 when set).
 /// Position on the reasoning ladder (auto/"" = -1, provider default).
 /// `none` budgets 0 (thinking omitted); `minimal` takes the API floor.
+/// Live in TUI pickers + tests (`#[cfg(test)]` only in this binary).
+#[allow(dead_code)]
 pub fn effort_index(effort: &str) -> i32 {
     match normalize_effort(effort) {
         "" => -1,
@@ -192,6 +205,7 @@ pub fn effort_index(effort: &str) -> i32 {
 /// provider advertises nothing (empty = unknown). Advertised tokens pass
 /// through verbatim (deduped) — never filtered to a hardcoded subset — so
 /// provider vocabularies like `minimal`/`none` survive to pickers and wire.
+#[allow(dead_code)]
 pub fn efforts_or_default(supported: &[String]) -> Vec<String> {
     const LADDER: [&str; 8] = ["auto", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
     if supported.is_empty() {
@@ -213,6 +227,7 @@ pub fn efforts_or_default(supported: &[String]) -> Vec<String> {
 
 /// Clamp an effort into the advertised ladder: above the top clamps down,
 /// below the bottom (or unknown) clamps up to the lowest supported.
+#[allow(dead_code)]
 pub fn clamp_effort(effort: &str, supported: &[String]) -> String {
     let ladder = efforts_or_default(supported);
     let want = normalize_effort(effort);
@@ -1768,6 +1783,14 @@ mod tests {
         assert_eq!((a.input, a.output), (11, 7));
         assert_eq!(a.cache_read, u32::MAX, "saturating, never wraps");
         assert_eq!(a.cache_write, 4);
+    }
+
+    #[test]
+    fn cache_hit_pct_clamps_and_handles_empty() {
+        assert_eq!(Usage::default().cache_hit_pct(), 0);
+        assert_eq!(Usage { input: 1000, cache_read: 710, ..Default::default() }.cache_hit_pct(), 71);
+        // Over-reporting provider data never exceeds 100.
+        assert_eq!(Usage { input: 100, cache_read: 500, ..Default::default() }.cache_hit_pct(), 100);
     }
 
     #[test]

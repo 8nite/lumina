@@ -198,10 +198,10 @@ async fn main() -> MainResult {
         }
         Some(Cmd::Web {}) => {
             let base = std::env::var("LUMINA_URL").unwrap_or_else(|_| "http://127.0.0.1:4089".into());
-            ensure_daemon(&base, &cfg).await?;
+            ensure_daemon_detached(&base).await?;
             println!("{base}");
             // Best-effort browser open; the URL above is the contract.
-            let _ = std::process::Command::new("xdg-open").arg(&base).output();
+            open_browser(&base);
             Ok(())
         }
         Some(Cmd::Pair { lan: _ }) => {
@@ -512,7 +512,8 @@ fn cmd_kb(args: &[String]) -> MainResult {
             if !shown {
                 println!("(no knowledge base configured — no memory/knowledge dir in AGENTS.md/rules)");
             }
-            for rel in ["graphify-out/graph.json"] {
+            {
+                let rel = "graphify-out/graph.json";
                 let p = wpath.join(rel);
                 if p.exists() {
                     let g = kb::Graph::load(&p).map_err(|e| format!("{e}"))?;
@@ -620,6 +621,63 @@ fn split_base(base: &str) -> (String, u16) {
 }
 
 /// Ensure a daemon answers at `base`; if the loopback port is closed, boot
+/// a detached `lumina serve` child that outlives this process, then wait for
+/// readiness. Used by `lumina web`, which exits right after printing the URL
+/// (an in-process `tokio::spawn` server would die with it).
+async fn ensure_daemon_detached(base: &str) -> MainResult {
+    let (host, port) = split_base(base);
+    if tokio::net::TcpStream::connect((host.as_str(), port)).await.is_ok() {
+        return Ok(());
+    }
+    if !server::is_loopback(&host) {
+        return Err(format!("no daemon at {base} (set LUMINA_TOKEN for remote attach)").into());
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("web: current exe: {e}"))?;
+    std::process::Command::new(exe)
+        .arg("serve")
+        .arg("--host")
+        .arg(&host)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("web: failed to start daemon: {e}"))?;
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect((host.as_str(), port)).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err("daemon failed to start".into())
+}
+
+/// Best-effort browser open with a loud failure (silent `let _ =` left users
+/// thinking `lumina web` was broken on headless boxes with no opener).
+/// Returns the failure note (also printed); `None` when the opener ran clean.
+fn open_browser_with(base: &str, opener: &str) -> Option<String> {
+    match std::process::Command::new(opener).arg(base).output() {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => {
+            let detail = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Some(if detail.is_empty() {
+                format!("open a browser at {base} (automatic open failed)")
+            } else {
+                format!("open a browser at {base} (automatic open failed: {detail})")
+            })
+        }
+        Err(e) => Some(format!("open a browser at {base} (automatic open unavailable: {e})")),
+    }
+}
+
+fn open_browser(base: &str) {
+    if let Some(note) = open_browser_with(base, "xdg-open") {
+        eprintln!("{note}");
+    }
+}
+
+/// Ensure a daemon answers at `base`; if the loopback port is closed, boot
 /// an in-process server (mirrors `lumina` auto-start) and wait for readiness.
 async fn ensure_daemon(base: &str, cfg: &config::Config) -> MainResult {
     let (host, port) = split_base(base);
@@ -658,4 +716,40 @@ fn config_path() -> Option<PathBuf> {
         return Some(PathBuf::from(p));
     }
     config::default_path().filter(|p| p.exists())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn split_base_defaults_to_4089() {
+        assert_eq!(split_base("http://127.0.0.1:4089"), ("127.0.0.1".into(), 4089));
+        assert_eq!(split_base("http://127.0.0.1:4489/"), ("127.0.0.1".into(), 4489));
+        assert_eq!(split_base("http://localhost"), ("localhost".into(), 4089));
+        assert_eq!(split_base("http://127.0.0.1:notaport"), ("127.0.0.1".into(), 4089));
+        assert_eq!(split_base("https://127.0.0.1:5000"), ("127.0.0.1".into(), 5000));
+    }
+
+    #[test]
+    fn open_browser_reports_missing_opener() {
+        let note = open_browser_with("http://127.0.0.1:4089", "definitely-not-a-real-opener-xyz");
+        let note = note.expect("missing opener must return a note, not silence");
+        assert!(note.contains("http://127.0.0.1:4089"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn detached_reuses_live_port_without_spawning() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Port is open, so this must return Ok without spawning anything.
+        ensure_daemon_detached(&format!("http://127.0.0.1:{port}")).await.unwrap();
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn detached_refuses_non_loopback() {
+        let err = ensure_daemon_detached("http://10.255.255.1:4089").await.unwrap_err();
+        assert!(err.to_string().contains("no daemon"), "{err}");
+    }
 }

@@ -2862,6 +2862,214 @@
    "rationale": "'Analyse and copy ...' matched no work hint (161 turns, zero edits, gate disarmed); added copy/sync/clone/move (not port: matches report/support/import). Daemon restarted 22:20 UTC with fresh binary after confirming no inflight turn; health-checked via openapi.json (200) + headless run.",
    "source_url": "",
    "captured_at": "2026-11-03T03:26:29+00:00"
+  },
+  {
+   "id": "stuck_ceiling_tail_pointer",
+   "label": "Ceiling Tail Resume Pointer (120-round ceiling, 7920b8fc)",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T13:15:49.066300+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "ceiling tail resume pointer",
+   "rationale": "Hit 120-round ceiling and tail echoed bare filler with no resume pointer (read as done). Fixed: ceiling_tail() always leads with budget notice + UNVERIFIED/NO_PROGRESS pointers.",
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:174",
+   "source_url": ""
+  },
+  {
+   "id": "stuck_bash_mutation_detection",
+   "label": "Bash Mutation Detection (bash_looks_mutating arms verify gate)",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T13:15:49.066300+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "bash mutation detection",
+   "rationale": "Bash-applied sed/python patches never set mutated so verify gate stayed blind with stale verified=true. Fixed: bash_looks_mutating() arms verify gate on sed/python/patch/tee/redirect.",
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:174",
+   "source_url": ""
+  },
+  {
+   "id": "stuck_make_install_daemon_guard",
+   "label": "Make Install Daemon Guard (refuse pkill lumina mid-turn)",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T13:15:49.066300+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "make install daemon guard",
+   "rationale": "make install would pkill daemon mid-turn. Fixed: bash tool refuses make install/make stop/pkill lumina mid-turn; removed duplicate allow, fixed needless_borrow test. Verified 194 tests green, daemon restarted on 4089.",
+   "source_file": "stuck-session-fix.md",
+   "source_location": "stuck-session-fix.md:174",
+   "source_url": ""
+  },
+  {
+   "id": "copilot_probe_usable_filter",
+   "label": "Copilot Probe Usable Filter (structural + live probe, fail-open)",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T14:14:13.964900+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "copilot probe usable filter",
+   "rationale": "list_models hides unusable models in three layers: structural filter drops responses-only endpoints, live probe classifies chat usability with fail-open verdict, cached probe hides dead models.",
+   "source_file": "zen-twin-suppression.md",
+   "source_location": "zen-twin-suppression.md:10",
+   "source_url": ""
+  },
+  {
+   "id": "tui_model_hides_unavailable",
+   "label": "TUI Model Picker Hides Unavailable Providers",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T14:14:13.964900+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "tui model hides unavailable",
+   "rationale": "/model lists only providers with at least one live model and never shows an empty model list; unavailable providers hidden, not errored.",
+   "source_file": "model-picker-filter.md",
+   "source_location": "model-picker-filter.md:11",
+   "source_url": ""
+  },
+  {
+   "id": "tui_connect_enterprise_url",
+   "label": "TUI Enterprise Connect URL Prompt",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T14:14:13.964900+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "tui connect enterprise url",
+   "rationale": "/connect prompts for the enterprise base URL; empty input means the default host, submit continues the device flow against the given URL.",
+   "source_file": "model-picker-filter.md",
+   "source_location": "model-picker-filter.md:12",
+   "source_url": ""
+  },
+  {
+   "id": "llm_flush_pending_calls",
+   "label": "LLM Flush Pending Tool Calls on DONE/EOF",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T14:14:13.964900+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "llm flush pending calls",
+   "rationale": "Pending streamed tool calls flush on [DONE]/EOF/same-frame finish_reason so a call arriving with completion is never dropped; three regression tests.",
+   "source_file": "lumina-live.md",
+   "source_location": "lumina-live.md:13",
+   "source_url": ""
+  },
+  {
+   "id": "webui_bg_sidebar_dot",
+   "label": "Sidebar Running Dot (live turn set overlay)",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T14:14:41.878687+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "sidebar running dot",
+   "rationale": "Daemon overlays its live turn set onto session views as running bool; sidebar renders a pulsing dot from s.running. Verified live mid-turn True, idle False.",
+   "source_file": "webui-background-visibility.md",
+   "source_location": "webui-background-visibility.md:11",
+   "source_url": ""
+  },
+  {
+   "id": "webui_bg_completion_toast",
+   "label": "Background Completion Toast and Title Flash",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T14:14:41.878687+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "background completion toast",
+   "rationale": "turn.completed/failed on an unviewed session raises a clickable 15s toast plus tab title flash; opening the session consumes its toast. Ephemeral bash background jobs still have no persistent panel.",
+   "source_file": "webui-background-visibility.md",
+   "source_location": "webui-background-visibility.md:16",
+   "source_url": ""
+  },
+  {
+   "id": "cache_hits_steady_state",
+   "label": "Prefix-Cache Steady-State Hit Rate (60-71%)",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T14:58:22.886549+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "prefix-cache steady-state hit rate",
+   "rationale": "Long steady sessions converge 60-71% prefix-cache hits from sessions.tokens_cache_read/input; new sessions pay cold prefix (54 turns -> 32%).",
+   "source_file": "cache-hits.md",
+   "source_location": "cache-hits.md:8",
+   "source_url": ""
+  },
+  {
+   "id": "cache_hits_compact_cost",
+   "label": "Compaction Costs One Full-Price Turn",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T14:58:22.886549+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "compaction costs one full-price turn",
+   "rationale": "Each compact rewrites history at full price (4 compacts + 5 subagents -> 40% over 161 turns); mid-session router model swap resets cache namespace.",
+   "source_file": "cache-hits.md",
+   "source_location": "cache-hits.md:8",
+   "source_url": ""
+  },
+  {
+   "id": "cache_hits_subagent_cold",
+   "label": "Subagents Start Ice-Cold (fewer/larger calls)",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T14:58:22.886549+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "subagents start ice-cold",
+   "rationale": "Subagents start ice-cold on cache; prefer fewer/larger calls and main-turn iteration over fan-out.",
+   "source_file": "cache-hits.md",
+   "source_location": "cache-hits.md:8",
+   "source_url": ""
+  },
+  {
+   "id": "cache_hits_telemetry",
+   "label": "Cache-Hit Telemetry (Usage::cache_hit_pct + per-turn log)",
+   "_origin": "semantic",
+   "author": "host-agent-inline",
+   "captured_at": "2026-11-03T15:16:39.342262+00:00",
+   "community": 1,
+   "community_name": "Memory Index and Live Wiring",
+   "contributor": "standing-ops kb refresh",
+   "file_type": "document",
+   "norm_label": "cache-hit telemetry",
+   "rationale": "Telemetry landed: Usage::cache_hit_pct (src/llm.rs, clamped, tested) + tracing::info per turn.completed (src/server.rs, silent unless RUST_LOG=info) with session/model/input/output/cache_read/hit_pct. No behavior change.",
+   "source_file": "cache-hits.md",
+   "source_location": "cache-hits.md:12",
+   "source_url": ""
   }
  ],
  "links": [
@@ -5423,6 +5631,149 @@
    "confidence_score": 0.9,
    "source_file": "over-exploration-fix.md",
    "source_location": "over-exploration-fix.md:73",
+   "weight": 1.0
+  },
+  {
+   "source": "stuck_verify_gate",
+   "target": "stuck_ceiling_tail_pointer"
+  },
+  {
+   "source": "stuck_verify_gate",
+   "target": "stuck_bash_mutation_detection"
+  },
+  {
+   "source": "stuck_verify_gate",
+   "target": "stuck_make_install_daemon_guard"
+  },
+  {
+   "source": "stuck_ceiling_tail_pointer",
+   "target": "stuck_no_progress_gate"
+  },
+  {
+   "source": "zen_twin_suppression_rule",
+   "target": "copilot_probe_usable_filter"
+  },
+  {
+   "source": "picker_composer_filter",
+   "target": "tui_model_hides_unavailable"
+  },
+  {
+   "source": "tui_model_hides_unavailable",
+   "target": "tui_connect_enterprise_url"
+  },
+  {
+   "source": "lumina_live_transport",
+   "target": "llm_flush_pending_calls"
+  },
+  {
+   "source": "verbose_streaming_server_clock",
+   "target": "webui_bg_sidebar_dot"
+  },
+  {
+   "source": "webui_bg_sidebar_dot",
+   "target": "webui_bg_completion_toast"
+  },
+  {
+   "source": "verbose_streaming_turn_events",
+   "target": "webui_bg_completion_toast"
+  },
+  {
+   "source": "cache_hits_steady_state",
+   "target": "conversation_efficiency_prompt_caching",
+   "relation": "extends",
+   "_origin": "semantic",
+   "confidence": "EXTRACTED",
+   "confidence_score": 0.85,
+   "source_file": "cache-hits.md",
+   "source_location": "cache-hits.md:8",
+   "weight": 1.0
+  },
+  {
+   "source": "cache_hits_compact_cost",
+   "target": "conversation_efficiency_nudge_compaction",
+   "relation": "conceptually_related_to",
+   "_origin": "semantic",
+   "confidence": "EXTRACTED",
+   "confidence_score": 0.8,
+   "source_file": "cache-hits.md",
+   "source_location": "cache-hits.md:8",
+   "weight": 1.0
+  },
+  {
+   "source": "cache_hits_steady_state",
+   "target": "context_providers_router_cache",
+   "relation": "conceptually_related_to",
+   "_origin": "semantic",
+   "confidence": "EXTRACTED",
+   "confidence_score": 0.8,
+   "source_file": "cache-hits.md",
+   "source_location": "cache-hits.md:8",
+   "weight": 1.0
+  },
+  {
+   "source": "cache_hits_telemetry",
+   "target": "cache_hits_steady_state",
+   "relation": "extends",
+   "_origin": "semantic",
+   "confidence": "EXTRACTED",
+   "confidence_score": 0.9,
+   "source_file": "cache-hits.md",
+   "source_location": "cache-hits.md:12",
+   "weight": 1.0
+  },
+  {
+   "source": "cache_hits_telemetry",
+   "target": "conversation_efficiency_prompt_caching",
+   "relation": "conceptually_related_to",
+   "_origin": "semantic",
+   "confidence": "EXTRACTED",
+   "confidence_score": 0.9,
+   "source_file": "cache-hits.md",
+   "source_location": "cache-hits.md:12",
+   "weight": 1.0
+  },
+  {
+   "source": "loopharness_sse_idempotency_inbox",
+   "target": "stuck_sse_channel_1024",
+   "relation": "conceptually_related_to",
+   "_origin": "semantic",
+   "confidence": "EXTRACTED",
+   "confidence_score": 0.9,
+   "source_file": "loop-harness-audit.md",
+   "source_location": "loop-harness-audit.md:8",
+   "weight": 1.0
+  },
+  {
+   "source": "loopharness_subagent_loop_guards",
+   "target": "overexplore_identical_output_ledger",
+   "relation": "conceptually_related_to",
+   "_origin": "semantic",
+   "confidence": "EXTRACTED",
+   "confidence_score": 0.9,
+   "source_file": "loop-harness-audit.md",
+   "source_location": "loop-harness-audit.md:8",
+   "weight": 1.0
+  },
+  {
+   "source": "prompt_e2e_guidance",
+   "target": "subagents_websearch_tool_surface",
+   "relation": "conceptually_related_to",
+   "_origin": "semantic",
+   "confidence": "EXTRACTED",
+   "confidence_score": 0.9,
+   "source_file": "prompt-e2e.md",
+   "source_location": "prompt-e2e.md:16",
+   "weight": 1.0
+  },
+  {
+   "source": "prompt_e2e_btc_run",
+   "target": "subagents_websearch_runner_depth",
+   "relation": "conceptually_related_to",
+   "_origin": "semantic",
+   "confidence": "EXTRACTED",
+   "confidence_score": 0.9,
+   "source_file": "prompt-e2e.md",
+   "source_location": "prompt-e2e.md:16",
    "weight": 1.0
   }
  ],

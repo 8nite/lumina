@@ -282,7 +282,7 @@ impl App {
                         Err(e) => self.set_status(&format!("model: {e}")),
                     }
                 }
-                Some(p) => self.open_models_at(&p.to_string()),
+                Some(p) => self.open_models_at(p),
                 None => self.open_models(),
             },
             "resume" => self.open_sessions(),
@@ -488,7 +488,7 @@ impl App {
     }
 
     fn open_models(&mut self) {
-        self.open_models_at(&String::new());
+        self.open_models_at("");
     }
 
     /// Live model ids for one provider; unavailable providers (4xx/5xx,

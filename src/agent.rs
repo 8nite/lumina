@@ -189,6 +189,8 @@ impl Runner {
     /// [`Runner::begin_turn`] (one per queued prompt, retries included).
     /// `on_event` receives streaming deltas
     /// (SSE broker in server mode; headless `run` ignores it).
+    // ponytail: allow 11-arg hot path (single call site; struct would churn diff).
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_prompt(
         &self,
         store: &Store,
@@ -382,6 +384,8 @@ impl Runner {
         Ok(TurnOutcome { text: final_text, usage })
     }
 
+    // ponytail: allow 18-arg turn loop (single call site; struct would churn diff).
+    #[allow(clippy::too_many_arguments)]
     async fn loop_until_done(
         &self,
         router: &Router,
@@ -960,6 +964,24 @@ impl Runner {
                         read_counts.remove(&target);
                     }
                 }
+                // Bash-applied edits (session 7920b8fc: sed/python patches
+                // via bash never set `mutated`, so the verify gate stayed
+                // blind and the turn released as verified with untested
+                // changes). A successful mutating-looking bash invalidates
+                // prior verification like an edit does.
+                // ponytail: keyword heuristic; a miss only costs the verify
+                // nudge, never correctness.
+                if result_ok
+                    && tc.name.eq_ignore_ascii_case("bash")
+                    && bash_looks_mutating(&crate::tools::tool_target(&tc.name, &args))
+                {
+                    mutated = true;
+                    verified = false;
+                    seen.clear();
+                    out_counts.clear();
+                    todowrite_streak = 0;
+                    text_streak = 0;
+                }
                 if tc.name.eq_ignore_ascii_case("bash") && result_ok && !rendered.contains("[exit ") {
                     let cmd = crate::tools::tool_target(&tc.name, &args);
                     if is_verify_command(&cmd) {
@@ -1076,20 +1098,13 @@ impl Runner {
             last_text.clear();
             thinking_buf.clear();
         }
-        // Exhausted ceiling with tools still pending: return the last real
-        // model text plus an explicit resume pointer instead of an empty
-        // turn (empty turns read as silent stops and force `continue`).
-        let tail = if last_nonempty.trim().is_empty() {
-            "Tool budget exhausted after 120 tool rounds with work still pending. Say `continue` to resume: the next turn should list exactly what remains and the precise next tool calls (names + arguments).".to_string()
-        } else {
-            last_nonempty
-        };
+        // Exhausted ceiling with tools still pending: always lead with an
+        // explicit budget notice (session 7920b8fc ended with a bare echo
+        // of the last filler text, which read as done with work remaining).
+        // The last model text follows for context, then resume pointers.
+        let tail = ceiling_tail(&last_nonempty, self.max_steps, mutated, verified, work_requested);
         // User transparency: resolve any refs the model echoed before storing.
-        let mut tail = store.vault.resolve(session_id, &tail).map_err(AgentError::Msg)?;
-        if mutated && !verified {
-            tail.push_str("\n\n");
-            tail.push_str(UNVERIFIED_POINTER);
-        }
+        let tail = store.vault.resolve(session_id, &tail).map_err(AgentError::Msg)?;
         store.add_turn(session_id, "assistant", &tail)?;
         Ok((tail, usage))
     }
@@ -1097,6 +1112,7 @@ impl Runner {
     /// One tools-stripped round asking the model to state done-vs-remaining
     /// after a silent turn end. Never fails the turn: a still-silent model
     /// yields the canned resume pointer.
+    #[allow(clippy::too_many_arguments)]
     async fn empty_final_text(
         &self,
         router: &Router,
@@ -1457,6 +1473,62 @@ fn is_verify_command(cmd: &str) -> bool {
     // (the session's own `pnpm --dir web build`); match the runner plus
     // a build/test subcommand anywhere in the line.
     lower.contains("pnpm") && (lower.contains("build") || lower.contains("test"))
+}
+
+/// Verify-after-fix tracking: does this bash command plausibly mutate the
+/// workspace (so a green verify run from before it no longer proves the
+/// tree)? Substring match on the lowered command. Interpreters only count
+/// with a write signal (`open(`, `write`) so `python3 -c "print(1)"`
+/// stays a read. A miss only costs the verify nudge, never correctness.
+fn bash_looks_mutating(cmd: &str) -> bool {
+    const SIGNALS: &[&str] = &[
+        "sed -i",
+        "sed --in-place",
+        "perl -",
+        "patch ",
+        "git apply",
+        "tee ",
+        "cargo fix",
+        "mv ",
+        "cp ",
+        "rm ",
+        "mkdir ",
+        "touch ",
+        ">",
+    ];
+    let lower = cmd.to_lowercase();
+    if SIGNALS.iter().any(|s| lower.contains(s)) {
+        return true;
+    }
+    let interpreter = ["python", "node", "ruby", "php", "perl"].iter().any(|s| lower.contains(s));
+    interpreter && (lower.contains("open(") || lower.contains("write"))
+}
+
+/// Ceiling tail: the turn hit the tool-round budget with work still
+/// pending. Always leads with an explicit exhaustion notice (never a bare
+/// echo of the last filler text) plus the resume pointers that apply, so
+/// the transcript reads as interrupted, not done.
+fn ceiling_tail(
+    last_nonempty: &str,
+    max_steps: usize,
+    mutated: bool,
+    verified: bool,
+    work_requested: bool,
+) -> String {
+    let mut tail = if last_nonempty.trim().is_empty() {
+        format!("Tool budget exhausted after {max_steps} tool rounds with work still pending. Say `continue` to resume: the next turn should list exactly what remains and the precise next tool calls (names + arguments).")
+    } else {
+        format!("Tool budget exhausted after {max_steps} tool rounds with work still pending. Last model text: {last_nonempty}\n\nSay `continue` to resume: the next turn should list exactly what remains and the precise next tool calls (names + arguments).")
+    };
+    if mutated && !verified {
+        tail.push_str("\n\n");
+        tail.push_str(UNVERIFIED_POINTER);
+    }
+    if !mutated && work_requested {
+        tail.push_str("\n\n");
+        tail.push_str(NO_PROGRESS_POINTER);
+    }
+    tail
 }
 
 /// No-progress gate input: does this request ask for a change? Substring
@@ -2026,6 +2098,38 @@ mod loop_key_tests {
         assert!(!is_verify_command("pnpm install"), "install is not verification");
         assert!(!is_verify_command("git diff --stat HEAD"), "diff is not verification");
         assert!(!is_verify_command("echo done"), "echo is not verification");
+    }
+
+    #[test]
+    fn bash_mutation_detection() {
+        // Session 7920b8fc: sed/python patches via bash must arm the gate.
+        assert!(bash_looks_mutating("sed -i 's/a/b/' src/main.rs"));
+        assert!(bash_looks_mutating("python3 - <<'EOF'\nopen('src/x.rs','w').write('hi')\nEOF"));
+        assert!(bash_looks_mutating("patch -p1 < fix.diff"));
+        assert!(bash_looks_mutating("echo hi > newfile.txt"), "redirection creates files");
+        assert!(bash_looks_mutating("cargo fix --allow-dirty"));
+        assert!(!bash_looks_mutating("ls -la"), "listing is not a mutation");
+        assert!(!bash_looks_mutating("grep -r foo src"), "search is not a mutation");
+        assert!(!bash_looks_mutating("cargo build"), "build output is not a source edit");
+        assert!(!bash_looks_mutating("cargo clippy --tests"), "lint is not a mutation");
+        assert!(!bash_looks_mutating("python3 -c \"print(1)\""), "pure compute is not a mutation");
+        assert!(!bash_looks_mutating("cat src/main.rs"), "read is not a mutation");
+    }
+
+    #[test]
+    fn ceiling_tail_never_reads_as_done() {
+        // Session 7920b8fc: the ceiling echoed bare filler with no pointer.
+        let t = ceiling_tail("Remaining lints mapped, applying the fixes.", 120, false, false, true);
+        assert!(t.contains("Tool budget exhausted after 120"), "{t}");
+        assert!(t.contains("Remaining lints mapped"), "last text kept for context, got {t}");
+        assert!(t.contains("continue"), "{t}");
+        assert!(t.contains("NOT done"), "zero-edit ceiling keeps the no-progress pointer, got {t}");
+        let t = ceiling_tail("", 120, true, false, true);
+        assert!(t.contains("Tool budget exhausted"), "{t}");
+        assert!(t.contains("never verified"), "{t}");
+        let t = ceiling_tail("filler", 120, true, true, true);
+        assert!(t.contains("Tool budget exhausted"), "{t}");
+        assert!(!t.contains("never verified"), "verified edits need no pointer, got {t}");
     }
 
     #[test]

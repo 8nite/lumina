@@ -16,6 +16,7 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[allow(dead_code)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
@@ -126,6 +127,7 @@ pub struct KbConfig {
     pub standing_ops: bool,
     /// Rebuild workspace AST graph on git commit (Go parity; honored by hooks).
     #[serde(default)]
+    #[allow(dead_code)]
     pub auto_commit_ast_hook: bool,
     /// Explicit KB dir override (workspace-relative or absolute,
     /// colon-separated for several). Wins over rule-md mentions and

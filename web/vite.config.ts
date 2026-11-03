@@ -10,5 +10,17 @@ export default defineConfig({
       '/openapi.json': 'http://127.0.0.1:4089',
     },
   },
-  build: { outDir: 'dist', sourcemap: false },
+  build: {
+    outDir: 'dist',
+    sourcemap: false,
+    chunkSizeWarningLimit: 600,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom'],
+          xterm: ['@xterm/xterm'],
+        },
+      },
+    },
+  },
 });

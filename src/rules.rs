@@ -37,6 +37,7 @@ pub struct AgentDef {
     pub description: String,
     pub mode: String,
     pub model: String,
+    #[allow(dead_code)]
     pub path: String,
     pub body: String,
     /// Per-tool overrides from a `tools:` frontmatter block (`bash: false`).
@@ -46,6 +47,7 @@ pub struct AgentDef {
 #[derive(Debug, Clone)]
 pub struct CommandDef {
     pub name: String,
+    #[allow(dead_code)]
     pub path: PathBuf,
     pub body: String,
 }

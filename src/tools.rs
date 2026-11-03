@@ -476,10 +476,32 @@ fn do_edit(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Out
     Ok(Outcome { output: format!("edited {}", abs.display()), truncated: false })
 }
 
+/// Daemon self-preservation: does this shell command kill the serving
+/// daemon (`make install`/`make stop` pkill it; pkill/killall lumina does
+/// it directly)? A mid-turn kill orphans the transcript with no failure
+/// note, so the bash tool refuses these while the turn owns the daemon.
+fn daemon_kill_command(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    if lower.contains("make install") || lower.contains("make stop") {
+        return true;
+    }
+    lower.contains("lumina") && (lower.contains("pkill") || lower.contains("killall") || lower.contains("kill "))
+}
+
 fn do_bash(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
     let cmd_str = str_arg(args, &["command", "cmd"]);
     if cmd_str.trim().is_empty() {
         return Err(ToolError::Msg("bash: empty command".into()));
+    }
+    // Daemon self-preservation (session 7920b8fc task asked for
+    // `make install`, whose `stop` target pkill's this daemon mid-turn and
+    // orphans the transcript with no failure note). Block only the
+    // daemon-killing forms; `make build`, `cargo ...`, and a direct
+    // `install -m` binary copy are all fine mid-turn.
+    if daemon_kill_command(&cmd_str) {
+        return Err(ToolError::Denied(
+            "bash: refusing to kill the lumina daemon mid-turn (`make install`/`make stop`/pkill lumina would orphan this turn with no transcript note). Run the build now; copy the binary with `install -m` if needed and restart the daemon after the turn completes.".to_string(),
+        ));
     }
     // workdir runs in the workspace or a whitelisted external dir.
     let mut dir = sc.workspace.clone();
@@ -554,6 +576,7 @@ fn do_bash(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value
 
 /// Synchronous shell run shared by foreground `bash` and background tasks.
 /// ponytail: std Command + scoped kill via wait_timeout emulation (poll loop).
+#[allow(clippy::too_many_arguments)]
 fn exec_bash(
     cmd_str: &str,
     workspace: &Path,
@@ -1523,6 +1546,19 @@ mod tests {
         let sc = ctx(d.path(), Agent::Plan, PermissionMode::Bypass);
         let err = reg.call(&sc, "edit", &args(&[("path", "x.rs"), ("old_string", "old"), ("new_string", "new")])).unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
+    }
+
+    #[test]
+    fn daemon_kill_commands_refused() {
+        // Session 7920b8fc: `make install` pkill's the serving daemon
+        // mid-turn and orphans the transcript with no failure note.
+        assert!(daemon_kill_command("make install"));
+        assert!(daemon_kill_command("make stop"));
+        assert!(daemon_kill_command("pkill -f 'lumina serve'"));
+        assert!(!daemon_kill_command("make build"), "build is safe mid-turn");
+        assert!(!daemon_kill_command("cargo build"), "cargo is safe mid-turn");
+        assert!(!daemon_kill_command("install -m 0755 bin/lumina ~/.local/bin/lumina"), "direct binary copy is safe; restart after the turn");
+        assert!(!daemon_kill_command("ls -la"), "listing is safe");
     }
 
     #[test]

@@ -26,10 +26,10 @@ rust-lint:
 	cargo clippy --tests
 
 stop:
-	@-pkill -f "lumina serve" 2>/dev/null && echo "stopped running 'lumina serve'" || echo "no running 'lumina serve' found"
+	@-pkill -f "[l]umina serve" 2>/dev/null && echo "stopped running 'lumina serve'" || echo "no running 'lumina serve' found"
 
 install: build
-	@$(MAKE) stop
+	@$(MAKE) --no-print-directory stop
 	install -d $(PREFIX)/bin
 	install -m 0755 bin/$(BINARY) $(PREFIX)/bin/$(BINARY)
 	@echo "installed to $(PREFIX)/bin/$(BINARY) (ensure it is on PATH)"

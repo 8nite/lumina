@@ -40,3 +40,5 @@ tags: [index, memory, lumina]
 - [[harness-gap-analysis]] — Harness gap analysis (Nov 2026): at-parity/ahead map (Harness², graphify RAG, static Rust binary), 8 ranked gaps (OS sandbox critical → benchmark proof minor).
 - [[over-exploration-fix]] — Over-exploration loop guards (de530754 audit: 105 turns for ~8 reads): identical-output ledger, todowrite 4th-advisory/6th-block budget, identical-text streak forced answer, reset on edit/write/patch.
 - [[webui-tables]] — WebUI pipe tables rendered as literal text: `LinkifiedText.tsx` GFM table grammar (`splitRow` code-span-aware split, `delimAlign`, strict header/delimiter match, ragged-row pad/truncate); `tsc` + `vite build` green.
+- [[webui-background-visibility]] — Background-turn visibility (3bbace61 gap): daemon live-turn set overlays `running` on session views, sidebar pulsing dot, `App.tsx` completion toasts + tab title flash for unviewed sessions.
+- [[cache-hits]] — Prefix-cache hit rates per session (60-71% steady-state, compact costs one full-price turn, subagents start ice-cold, model swap resets namespace).

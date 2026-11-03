@@ -169,6 +169,35 @@ export default function App() {
   // text it never appended via send().
   const turnsRef = useRef<Turn[]>([]);
   turnsRef.current = turns;
+  // Mirror of the session list so background completions can label their
+  // toast without resubscribing the long-lived SSE handler.
+  const sessionsRef = useRef<Session[]>([]);
+  sessionsRef.current = sessions;
+  // Background-completion toasts: a turn landing on a session the user
+  // isn't viewing (session 3bbace61 finished while the user looked
+  // elsewhere and nothing ever said so). Click jumps to the session.
+  const [toasts, setToasts] = useState<{ key: number; sessionId: string; label: string; text: string; failed?: boolean }[]>([]);
+  const toastKey = useRef(0);
+  const baseTitle = useRef<string | null>(null);
+  const markSessionRunning = (sid: string, running: boolean) => {
+    setSessions((prev) =>
+      prev.some((s) => s.id === sid) ? prev.map((s) => (s.id === sid ? { ...s, running } : s)) : prev,
+    );
+  };
+  const pushToast = (sessionId: string, text: string, failed?: boolean) => {
+    const label = sessionsRef.current.find((s) => s.id === sessionId)?.title || sessionId.slice(0, 8);
+    const key = ++toastKey.current;
+    setToasts((prev) => [...prev.slice(-2), { key, sessionId, label, text: text.slice(0, 140), failed }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.key !== key));
+    }, 15000);
+  };
+  // Title flash while an unseen completion waits: the tab itself says so.
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    if (baseTitle.current === null) baseTitle.current = document.title;
+    document.title = toasts.length === 0 ? baseTitle.current : `✓ turn done — ${baseTitle.current}`;
+  }, [toasts]);
 
   // Resync one session from the daemon: transcript (history always renders,
   // even when turn.completed was missed offline) + running flag (spinner
@@ -360,6 +389,7 @@ export default function App() {
       const activeId = sessionRef.current?.id;
       const forSession = !e.session_id || !activeId || e.session_id === activeId;
       if (e.type === 'turn.started' && forSession) {
+        if (e.session_id) markSessionRunning(e.session_id, true);
         setWorking(true);
         setTurnStart(Date.now());
         setNow(Date.now());
@@ -498,6 +528,24 @@ export default function App() {
             }
             return next.slice(-30);
           });
+        }
+      }
+      // Cross-session visibility: the sidebar dot follows every turn, and
+      // a terminal event on a session the user isn't viewing raises a
+      // toast (the active-session handlers below stay exactly as they
+      // were — this block only tracks + announces).
+      if (e.type === 'turn.completed' && e.session_id) {
+        markSessionRunning(e.session_id, false);
+        if (e.session_id !== activeId) {
+          const d = (e.data || {}) as { text?: string };
+          pushToast(e.session_id, (d.text || 'turn done').trim() || 'turn done');
+        }
+      }
+      if (e.type === 'turn.failed' && e.session_id) {
+        markSessionRunning(e.session_id, false);
+        if (e.session_id !== activeId) {
+          const d = (e.data || {}) as { error?: string };
+          pushToast(e.session_id, (d.error || 'turn failed').trim() || 'turn failed', true);
         }
       }
       if (e.type === 'turn.completed' && e.session_id && e.session_id === activeId) {
@@ -687,6 +735,9 @@ export default function App() {
 
   const pickSession = async (s: Session | null) => {
     setSession(s);
+    // Opening the session consumes its completion toast (the title
+    // effect restores the tab once none remain).
+    if (s) setToasts((prev) => prev.filter((t) => t.sessionId !== s.id));
     setTurns([]);
     setInput('');
     setCtx(null);
@@ -1220,6 +1271,29 @@ export default function App() {
       )}
       {serversOpen && (
         <ServersModal active={base} onPick={switchServer} onClose={() => setServersOpen(false)} />
+      )}
+      {toasts.length > 0 && (
+        <div className="fixed bottom-4 right-4 z-50 flex w-80 flex-col gap-2">
+          {toasts.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => {
+                setToasts((prev) => prev.filter((x) => x.key !== t.key));
+                const s = sessionsRef.current.find((x) => x.id === t.sessionId);
+                if (s) void pickSession(s);
+              }}
+              className="v2-panel rounded-lg p-3 text-left shadow-lg"
+              title="Open session"
+            >
+              <div className="v2-title mb-1 text-[13px]">
+                {t.failed ? '✕ turn failed' : '✓ turn done'} — {t.label}
+              </div>
+              <div className="overflow-hidden text-ellipsis whitespace-nowrap text-[12px] text-[var(--v2-text-muted)]">
+                {t.text}
+              </div>
+            </button>
+          ))}
+        </div>
       )}
     </div>
   );

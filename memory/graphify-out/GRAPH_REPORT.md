@@ -1,12 +1,12 @@
-# Graph Report - memory  (2026-11-03, refreshed inline incl. stuck-session fix + drive_one retry + prompt idempotency + follow-up inheritance/idle nudge + subagent budget/verify prod + harness-silent-turn-death EOF flush + kb-lazy-resolution + todo-pill-3of3 + harness-gap-analysis + smoke3/verify-gate/redirect-escalation + acp/mcp-serve serve plans + dedup rebuild + webui-tables GFM grammar + over-exploration addendum-2)
+# Graph Report - memory  (2026-11-03, refreshed inline incl. stuck-session fix + drive_one retry + prompt idempotency + follow-up inheritance/idle nudge + subagent budget/verify prod + harness-silent-turn-death EOF flush + kb-lazy-resolution + todo-pill-3of3 + harness-gap-analysis + smoke3/verify-gate/redirect-escalation + acp/mcp-serve serve plans + dedup rebuild + webui-tables GFM grammar + over-exploration addendum-2 + cache-hits telemetry + loop-harness/prompt-e2e cross-links)
 
 ## Corpus Check
-- 36 files · ~10,922 words
+- 38 files · ~11,735 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 176 nodes · 236 edges · 5 communities
-- Extraction: 87% EXTRACTED · 12% INFERRED · 0% AMBIGUOUS · INFERRED: 28 edges (avg confidence: 0.8)
+- 189 nodes · 256 links · 5 communities
+- Extraction: 83% EXTRACTED · 11% INFERRED · 6% other/unlabeled · INFERRED: 29 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)

@@ -142,6 +142,7 @@ impl Graph {
         out
     }
 
+    #[allow(dead_code)]
     pub fn dfs(&self, seed: &str, budget: usize) -> Vec<String> {
         let budget = if budget == 0 { 50 } else { budget };
         let mut out = Vec::new();
@@ -159,6 +160,8 @@ impl Graph {
         out
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn shortest_path(&self, from: &str, to: &str) -> Option<Vec<String>> {
         if from == to {
             return Some(vec![from.into()]);
@@ -190,6 +193,8 @@ impl Graph {
         None
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn explain(&self, from: &str, to: &str) -> String {
         let Some(path) = self.shortest_path(from, to) else {
             return format!("no path between {from:?} and {to:?}");
@@ -213,10 +218,12 @@ impl Graph {
         s
     }
 
+    #[allow(dead_code)]
     pub fn affected(&self, id: &str) -> Vec<String> {
         self.neighbors(id)
     }
 
+    #[allow(dead_code)]
     pub fn god_nodes(&self, k: usize) -> Vec<String> {
         let mut ds: Vec<(&String, usize)> = self.adj.iter().map(|(id, es)| (id, es.len())).collect();
         ds.sort_by_key(|&(_, n)| std::cmp::Reverse(n));

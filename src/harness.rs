@@ -97,6 +97,7 @@ fn check_additive(old: &str, new: &str) -> Result<(), HarnessError> {
 pub struct Candidate {
     pub id: String,
     pub files: HashMap<String, String>,
+    #[allow(dead_code)]
     pub rationale: String,
 }
 
@@ -105,6 +106,7 @@ pub struct ProbeResult {
     pub candidate_id: String,
     pub pass: bool,
     pub score: f64,
+    #[allow(dead_code)]
     pub detail: String,
 }
 

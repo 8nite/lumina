@@ -107,6 +107,12 @@ export function Sidebar(props: {
                         {(s.workspace_dir.split('/').filter(Boolean).pop() || '·').slice(0, 1).toUpperCase()}
                       </span>
                       <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                        {s.running && (
+                          <span
+                            className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-emerald-400"
+                            title="working…"
+                          />
+                        )}
                         <span className="v2-title min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-[13px]">
                           {s.title || s.id.slice(0, 8)}
                         </span>

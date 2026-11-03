@@ -315,6 +315,31 @@ else
 fi
 kill $SRVPID $DOZEPID 2>/dev/null; wait 2>/dev/null
 
+section "S18 lumina web cold-start (daemon outlives web)"
+# Test the repo build (S17 precedent): the installed lumina-rs may be stale,
+# and reinstalling would kill the running daemon.
+WEBBIN="$REPOROOT/target/debug/lumina"
+[ -x "$WEBBIN" ] || fail "repo binary missing" "$WEBBIN"
+WPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+WBASE="http://127.0.0.1:$WPORT"
+WOUT=$(LUMINA_URL="$WBASE" LUMINA_DB="$ROOT/web.db" timeout 30 "$WEBBIN" web 2>"$ROOT/web.err")
+[ "$?" = "0" ] && echo "$WOUT" | grep -q "$WBASE" && pass "web prints URL + exit 0" || fail "web exit/URL" "$(echo "$WOUT" | head -c 150)"
+sleep 1
+if ss -tln 2>/dev/null | grep -q ":$WPORT "; then pass "daemon survives web exit (listening)"; else fail "daemon died with web"; fi
+code=$(curl -s -o /tmp/e2e-web-cold.html -w "%{http_code}" --max-time 10 "$WBASE/")
+[ "$code" = "200" ] && grep -q 'id="root"' /tmp/e2e-web-cold.html && pass "cold SPA served" || fail "cold SPA" "$code"
+code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$WBASE/api/v1/sessions")
+[ "$code" = "200" ] && pass "cold sessions API" || fail "cold sessions" "$code"
+# Headless box has no opener: web must say so loudly instead of silent ok.
+grep -q "automatic open" "$ROOT/web.err" && pass "loud open-failure note" || fail "open note silent" "$(head -c 150 "$ROOT/web.err")"
+# Warm path: web against the already-running suite daemon reuses it.
+WOUT2=$(LUMINA_URL="$BASE" timeout 30 "$WEBBIN" web 2>/dev/null)
+[ "$?" = "0" ] && [ "$WOUT2" = "$BASE" ] && pass "warm web reuses daemon" || fail "warm web" "$(echo "$WOUT2" | head -c 150)"
+WPID=$(ss -tlnp 2>/dev/null | grep ":$WPORT " | python3 -c 'import sys,re;m=re.search(r"pid=(\d+)",sys.stdin.read());print(m.group(1) if m else "")')
+[ -n "$WPID" ] && kill "$WPID" 2>/dev/null; wait 2>/dev/null
+sleep 1
+ss -tln 2>/dev/null | grep -q ":$WPORT " && fail "cold daemon stopped" "still listening" || pass "cold daemon stopped"
+
 echo
 echo "=== e2e-live: $PASS passed, $FAIL failed (${#SECTIONS[@]} sections)"
 [ "$FAIL" = "0" ]

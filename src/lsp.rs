@@ -135,6 +135,8 @@ fn col_to_utf16(line_text: &str, col_1based: usize) -> usize {
 }
 
 /// UTF-16 code units → 1-based Unicode-scalar column for display.
+/// Used by hover/diagnostic rendering + tests.
+#[allow(dead_code)]
 fn col_from_utf16(line_text: &str, units: usize) -> usize {
     let mut used = 0;
     let mut col = 1;

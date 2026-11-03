@@ -1,5 +1,5 @@
 ---
-date_modified: 2026-11-01
+date_modified: 2026-11-03
 tags: [reliability, sessions, sse, loop-guards]
 ---
 
@@ -171,3 +171,4 @@ verify prod: mutated-but-unverified at every 12th round appends
 `subagent_key_canonicalizes_to_agent_and_paths`,
 `mentioned_paths_extracts_file_tokens`,
 `subagent_guard_blocks_proxy_read_and_budget`.
+Session 7920b8fc root cause: hit 120-round ceiling and tail echoed bare filler with no resume pointer (read as done); bash-applied sed/python patches never set mutated so verify gate stayed blind with stale verified=true; make install would pkill daemon mid-turn. Fixed: ceiling_tail() always leads with budget notice + UNVERIFIED/NO_PROGRESS pointers; bash_looks_mutating() arms verify gate on sed/python/patch/tee/redirect; bash tool refuses make install/make stop/pkill lumina mid-turn; removed duplicate allow, fixed needless_borrow test. Verified: 194 tests green, zero clippy/build warnings, daemon restarted on 4089.

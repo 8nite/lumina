@@ -192,6 +192,10 @@ struct SessionView {
     tokens_output: i64,
     tokens_cache_read: i64,
     tokens_cache_write: i64,
+    /// Live turn state (same-daemon memory, not stored): drives the
+    /// sidebar working dot so background turns are visible from any view.
+    #[serde(default)]
+    running: bool,
 }
 
 fn view(s: &crate::store::Session) -> SessionView {
@@ -207,6 +211,7 @@ fn view(s: &crate::store::Session) -> SessionView {
         tokens_output: s.tokens_output,
         tokens_cache_read: s.tokens_cache_read,
         tokens_cache_write: s.tokens_cache_write,
+        running: false,
     }
 }
 
@@ -224,7 +229,21 @@ async fn list_sessions(
         };
     }
     match store.list_for_dir(q.directory.as_deref()) {
-        Ok(v) => Json(v.iter().map(view).collect::<Vec<_>>()).into_response(),
+        Ok(v) => {
+            // Overlay the live turn set so the sidebar can show which
+            // sessions are working without polling per-session state.
+            let running = st.running.lock().unwrap();
+            Json(
+                v.iter()
+                    .map(|s| {
+                        let mut sv = view(s);
+                        sv.running = running.contains(&s.id);
+                        sv
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -266,7 +285,11 @@ async fn create_session(State(st): State<AppState>, Json(b): Json<CreateBody>) -
 async fn get_session(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let store = &st.store;
     match store.get_session(&id) {
-        Ok(Some(s)) => Json(serde_json::json!(view(&s))).into_response(),
+        Ok(Some(s)) => {
+            let mut sv = view(&s);
+            sv.running = st.running.lock().unwrap().contains(&s.id);
+            Json(serde_json::json!(sv)).into_response()
+        }
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
@@ -764,6 +787,12 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: Que
         Ok(outcome) => {
             let ms = started.elapsed().as_millis() as u64;
             let (model, used, max) = context_snapshot(st, id).await;
+            // Per-turn cache telemetry: the log is the only place that shows
+            // hit-rate drift (compacts/subagent bursts/model swaps reset the
+            // prefix). Zero behavior change; silent unless RUST_LOG=info.
+            tracing::info!(session = %id, model = %model, input = outcome.usage.input,
+                output = outcome.usage.output, cache_read = outcome.usage.cache_read,
+                hit_pct = outcome.usage.cache_hit_pct(), "turn completed");
             st.emit(ev("turn.completed", id, serde_json::json!({
                 "text": outcome.text, "model": model, "duration_ms": ms,
                 "input_tokens": outcome.usage.input, "output_tokens": outcome.usage.output,
@@ -1687,7 +1716,7 @@ mod models_hook_tests {
         let mut core = vec![meta("b-model", 0), meta("a-model", 100)];
         merge_models(
             &mut core,
-            &serde_json::json!([
+            serde_json::json!([
                 {"id": "b-model", "name": "B", "context_window": 1048576,
                  "supported_efforts": ["low", "high"]},
                 {"id": "c-model"},

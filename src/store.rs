@@ -879,6 +879,7 @@ impl Store {
     /// no live turns, so any leftover claim is a crash artifact).
     pub fn clear_all_claims(&self) -> Result<usize, StoreError> {
         let db = self.db.lock().unwrap();
-        Ok(db.execute("UPDATE sessions SET inflight_owner='', inflight_since=0 WHERE inflight_owner != ''", [])? as usize)
+        let n = db.execute("UPDATE sessions SET inflight_owner='', inflight_since=0 WHERE inflight_owner != ''", [])?;
+        Ok(n)
     }
 }
