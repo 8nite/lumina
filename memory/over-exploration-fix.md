@@ -45,6 +45,21 @@ re-planning all slipped through.
   real regression this way: idle-rounds test used 12 identical 1-line
   files (now distinct — identical outputs ARE the output-ledger's case).
 
-Note: the ` Answer round` demand is in-memory only (like other control-plane
+Note: the `Answer round` demand is in-memory only (like other control-plane
 nudges); request bodies omit `"tools"` when empty (OpenAI adapter skips
 empty vec) so tests assert absence of tool definitions + demand text.
+
+Addendum (session 265e3298): the first todowrite-guard version counted
+absolute calls per turn (nudge 4th, block 6th). That session's 29
+todowrite calls included real 0/4 -> 2/4 progress, which an absolute
+block would have broken. Refined to consecutive-identical streaks
+(nudge 4th, block 8th): identical output carries no new information by
+definition, while status flips reset the streak and are never blocked.
+Same session also showed the guards never fired (0 hits) because the
+serving daemon runs bin/lumina built 21:08, before the guards landed in
+target/debug (21:39). Lesson: fixes go live only after `make build`
+AND daemon restart — never restart mid-turn (strands the inflight
+claim). Cache check on 265e3298: tokens_cache_read 274,764 / input
+682,753 = ~40% served from cache (vs 61% in de530754 — variance is
+normal). cache_write 0 is expected: the zen gateway (OpenAI-Responses)
+uses implicit prefix caching with no creation counter.
