@@ -63,3 +63,15 @@ claim). Cache check on 265e3298: tokens_cache_read 274,764 / input
 682,753 = ~40% served from cache (vs 61% in de530754 — variance is
 normal). cache_write 0 is expected: the zen gateway (OpenAI-Responses)
 uses implicit prefix caching with no creation counter.
+
+Addendum 2 (session 265e3298 re-check): the turn was still live and the
+same waste continued (29 todowrite, 11x identical at the end, filler
+repeats) — because the serving daemon ran bin/lumina from 21:08, before
+the guards landed (21:39). Lesson learned the hard way: fixes only go
+live after `make build` AND daemon restart; verified the daemon binary
+lags the repo by checking guard strings in the binary. Also fixed a
+no-progress-gate blind spot the session exposed: "analyse and copy ..."
+matched no work hint (161 turns, zero edits, gate disarmed) — added
+copy/sync/clone/move (not port: matches report/support/import).
+Daemon restarted 22:20 UTC with the fresh binary after confirming no
+inflight turn; health-checked via openapi.json (200) + headless run.
