@@ -127,6 +127,10 @@ struct App {
     custom_cmds: Vec<(String, String)>,
     primaries: Vec<String>,
     pending_connect: Option<PendingConnect>,
+    /// /connect wizard: after choosing copilot, the next Enter supplies
+    /// the GitHub/enterprise URL (empty = github.com default).
+    awaiting_url: bool,
+    connect_provider: String,
     ctx: String,
     popup: Option<Popup>,
     perm: Option<PermModal>,
@@ -180,6 +184,31 @@ impl App {
 
     fn submit(&mut self) {
         let text: String = self.input_text();
+        // /connect wizard consumes the next line as the enterprise URL,
+        // even when empty (empty = github.com default). A slash command
+        // while awaiting cancels the wizard and runs normally.
+        if self.awaiting_url {
+            if text.starts_with('/') {
+                self.awaiting_url = false;
+                self.connect_provider.clear();
+                if text.trim().is_empty() {
+                    return;
+                }
+                self.input.clear();
+                self.cursor = 0;
+                self.popup = None;
+                self.dispatch_command(&text);
+                return;
+            }
+            let provider = std::mem::take(&mut self.connect_provider);
+            self.awaiting_url = false;
+            self.input.clear();
+            self.cursor = 0;
+            self.popup = None;
+            let provider = if provider.is_empty() { "copilot".to_string() } else { provider };
+            self.start_device_flow(&provider, text.trim());
+            return;
+        }
         if text.trim().is_empty() {
             return;
         }
@@ -329,16 +358,46 @@ impl App {
         }
     }
 
-    /// /connect wizard: provider → device code → tick-driven poll to connected.
-    /// Mirrors Go's provider picker + GitHub URL prompt + device polling.
+    /// /connect wizard: provider → enterprise URL prompt → device code →
+    /// tick-driven poll to connected. Mirrors Go's provider picker +
+    /// GitHub URL prompt + device polling: choosing copilot without a URL
+    /// prompts for the enterprise URL first instead of jumping straight
+    /// to the device flow.
     fn connect(&mut self, rest: Vec<&str>) {
         let provider = rest.first().copied().unwrap_or("copilot").to_string();
         if provider != "copilot" {
             self.set_status(&format!("/connect only supports copilot (got {provider:?})"));
             return;
         }
-        let github_url = rest.get(1).copied().unwrap_or("https://api.github.com").to_string();
-        let dc = match self.sdk.auth_start(&provider, &github_url) {
+        // Provider chosen but no URL yet: prompt for the enterprise URL.
+        // The next Enter continues the wizard (empty = github.com default).
+        if rest.len() < 2 {
+            self.awaiting_url = true;
+            self.connect_provider = provider.clone();
+            self.push_msg(
+                "system",
+                format!(
+                    "GitHub URL for {provider}? (Enter = github.com, or type your GHES/enterprise host, empty = default)"
+                ),
+            );
+            self.set_status("enter enterprise URL, empty = github.com (Esc cancels)");
+            return;
+        }
+        let github_url = rest.get(1).copied().unwrap_or("").to_string();
+        self.start_device_flow(&provider, github_url.trim());
+    }
+
+    /// Continue the wizard once the enterprise URL is known (empty = default).
+    fn start_device_flow(&mut self, provider: &str, github_raw: &str) {
+        let raw = github_raw.trim();
+        // ponytail: empty/shorthand accepted here; daemon device_host()
+        // normalizes to https://github.com or https://<ghes-host>.
+        let github_url = if raw.is_empty() || raw == "github.com" || raw == "https://github.com" {
+            "https://api.github.com".to_string()
+        } else {
+            raw.to_string()
+        };
+        let dc = match self.sdk.auth_start(provider, &github_url) {
             Ok(v) => v,
             Err(e) => {
                 self.set_status(&format!("connect: {e}"));
@@ -357,7 +416,7 @@ impl App {
         }
         self.push_msg("system", format!("To connect {provider}: open {uri} and enter {user_code}"));
         self.pending_connect = Some(PendingConnect {
-            provider,
+            provider: provider.to_string(),
             github_url,
             device_code: code,
             next_poll: Instant::now() + Duration::from_secs(interval),
@@ -432,28 +491,67 @@ impl App {
         self.open_models_at(&String::new());
     }
 
-    /// /model [provider]: jump straight to a provider's live models when named.
-    fn open_models_at(&mut self, want: &str) {
-        match self.sdk.providers() {
-            Ok(p) => {
-                let providers: Vec<String> = p.iter().filter_map(|v| v.get("name")?.as_str().map(|s| s.to_string())).collect();
-                let pi = providers.iter().position(|x| x == want).unwrap_or(0);
-                let picking = !want.is_empty() && providers.iter().any(|x| x == want);
-                let models = if picking { self.load_models(&providers[pi]) } else { vec![] };
-                self.popup = Some(Popup::Models { providers, pi, models, mi: 0, picking_model: picking });
-            }
-            Err(e) => self.set_status(&format!("models: {e}")),
+    /// Live model ids for one provider; unavailable providers (4xx/5xx,
+    /// unauthenticated, empty) yield an empty list so callers can hide them.
+    fn live_models(&self, provider: &str) -> Vec<String> {
+        match self.sdk.models(provider) {
+            Ok(m) => m.iter().filter_map(|v| v.get("id")?.as_str().map(|s| s.to_string())).collect(),
+            Err(_) => vec![],
         }
     }
 
-    fn load_models(&self, provider: &str) -> Vec<String> {
-        match self.sdk.models(provider) {
-            Ok(m) => m.iter().filter_map(|v| v.get("id")?.as_str().map(|s| s.to_string())).collect(),
-            Err(e) => {
-                // Status needs &mut; stash the error for the caller to surface.
-                let _ = e;
-                vec![]
+    /// /model [provider]: jump straight to a provider's live models when named.
+    /// Bare /model lists only providers that currently serve live models —
+    /// unavailable providers are probed and hidden (web parity + Go parity:
+    /// unauthenticated/unsupported providers are skipped, never shown empty).
+    fn open_models_at(&mut self, want: &str) {
+        match self.sdk.providers() {
+            Ok(p) => {
+                let all: Vec<String> = p.iter().filter_map(|v| v.get("name")?.as_str().map(|s| s.to_string())).collect();
+                if all.is_empty() {
+                    self.set_status("no live models (connect the provider first)");
+                    return;
+                }
+                // Direct provider jump: only when it actually serves models.
+                if !want.is_empty() && all.iter().any(|x| x == want) {
+                    let models = self.live_models(want);
+                    if models.is_empty() {
+                        self.set_status(&format!("no live models for {want} (connect the provider first)"));
+                        return;
+                    }
+                    self.popup = Some(Popup::Models {
+                        providers: vec![want.to_string()],
+                        pi: 0,
+                        models,
+                        mi: 0,
+                        picking_model: true,
+                    });
+                    return;
+                }
+                // Bare /model (or substring filter): probe each provider and
+                // keep only the usable ones so unavailable models stay hidden.
+                let live = filter_live_providers(&all, want, |name| self.live_models(name));
+                if live.is_empty() {
+                    if want.is_empty() {
+                        self.set_status("no live models (connect the provider first)");
+                    } else {
+                        self.set_status(&format!("no live models for {want} (connect the provider first)"));
+                    }
+                    return;
+                }
+                // One usable provider: skip the provider step, show its models.
+                if live.len() == 1 {
+                    let models = self.live_models(&live[0]);
+                    if models.is_empty() {
+                        self.set_status(&format!("no live models for {} (connect the provider first)", live[0]));
+                        return;
+                    }
+                    self.popup = Some(Popup::Models { providers: live, pi: 0, models, mi: 0, picking_model: true });
+                } else {
+                    self.popup = Some(Popup::Models { providers: live, pi: 0, models: vec![], mi: 0, picking_model: false });
+                }
             }
+            Err(e) => self.set_status(&format!("models: {e}")),
         }
     }
 
@@ -834,6 +932,18 @@ impl App {
     }
 }
 
+/// Keep only providers that serve live models, optionally filtered by a
+/// substring. Unavailable providers (error/empty) are hidden, never shown
+/// as empty entries. Pure helper so the filtering rule is unit-testable
+/// without a daemon.
+fn filter_live_providers(all: &[String], want: &str, fetch: impl Fn(&str) -> Vec<String>) -> Vec<String> {
+    all.iter()
+        .filter(|name| want.is_empty() || *name == want || name.contains(want))
+        .filter(|name| !fetch(name).is_empty())
+        .cloned()
+        .collect()
+}
+
 fn complete_files(workspace: &str, prefix: &str) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>, prefix: &str) {
@@ -908,7 +1018,7 @@ fn complete_memory(workspace: &str, prefix: &str) -> Vec<String> {
     out
 }
 
-const HELP: &str = "keys: Tab plan/build/* · Shift+Tab approval · Enter send · Ctrl+X queue · Esc cancel/close\n/plan /build /mode /model /variant /resume /continue /fork /graphify <q> /compact /thinking /undo /redo /evolve /init /clear · @file paths · [[memory]] notes";
+const HELP: &str = "keys: Tab plan/build/* · Shift+Tab approval · Enter send · Ctrl+X queue · Esc cancel/close\n/plan /build /mode /model /connect /variant /resume /continue /fork /graphify <q> /compact /thinking /undo /redo /evolve /init /clear · @file paths · [[memory]] notes";
 
 pub fn run(opts: LaunchOpts) -> Result<(), String> {
     let sdk = Sdk::new(&opts.base_url, &opts.token);
@@ -958,6 +1068,8 @@ pub fn run(opts: LaunchOpts) -> Result<(), String> {
         custom_cmds: vec![],
         primaries: vec![],
         pending_connect: None,
+        awaiting_url: false,
+        connect_provider: String::new(),
         ctx: String::from("ctx —"),
         popup: None,
         perm: None,
@@ -1115,6 +1227,10 @@ fn event_loop(
             (KeyCode::Esc, _) => {
                 if app.popup.is_some() {
                     app.popup = None;
+                } else if app.awaiting_url {
+                    app.awaiting_url = false;
+                    app.connect_provider.clear();
+                    app.set_status("connect cancelled");
                 } else if app.queue_armed {
                     app.queue_armed = false;
                     app.set_status("queue disarmed");
@@ -1244,11 +1360,13 @@ fn popup_enter(app: &mut App) {
                         Ok(m) => {
                             let names: Vec<String> = m.iter().filter_map(|v| v.get("id")?.as_str().map(|s| s.to_string())).collect();
                             if names.is_empty() {
-                                app.set_status(&format!("no live models for {p}"));
+                                // Hide unavailable: no empty model picker.
+                                app.set_status(&format!("no live models for {p} (connect the provider first)"));
+                            } else {
+                                app.popup = Some(Popup::Models { providers, pi, models: names, mi: 0, picking_model: true });
                             }
-                            app.popup = Some(Popup::Models { providers, pi, models: names, mi: 0, picking_model: true });
                         }
-                        Err(e) => app.set_status(&format!("models: {e}")),
+                        Err(e) => app.set_status(&format!("no live models for {p} (connect the provider first): {e}")),
                     }
                 }
             } else if let (Some(p), Some(m)) = (providers.get(pi), models.get(mi)) {
@@ -1529,6 +1647,8 @@ mod tests {
             custom_cmds: vec![("deploy".into(), "deploy $ARGUMENTS".into())],
             primaries: vec![],
             pending_connect: None,
+            awaiting_url: false,
+            connect_provider: String::new(),
             ctx: "ctx —".into(),
             status: "ok".into(),
             status_at: Instant::now(),
@@ -1555,6 +1675,82 @@ mod tests {
         app.input = "plain text".chars().collect();
         app.update_complete();
         assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn connect_prompts_for_enterprise_url() {
+        let mut app = dummy();
+        // Choosing copilot without a URL must prompt for the enterprise
+        // URL instead of jumping straight to the device flow.
+        app.connect(vec!["copilot"]);
+        assert!(app.awaiting_url);
+        assert_eq!(app.connect_provider, "copilot");
+        assert!(app.pending_connect.is_none());
+        assert!(app.messages.iter().any(|(_, m)| m.contains("GitHub URL")));
+    }
+
+    #[test]
+    fn connect_url_submit_continues() {
+        let mut app = dummy();
+        app.connect(vec!["copilot"]);
+        assert!(app.awaiting_url);
+        // Typing a URL and hitting Enter continues the wizard: the flag
+        // clears and a device-flow attempt is made (offline daemon here,
+        // so it fails closed with no pending poll).
+        app.input = "https://ghe.example.com".chars().collect();
+        app.cursor = app.input.len();
+        app.submit();
+        assert!(!app.awaiting_url);
+        assert!(app.pending_connect.is_none());
+        assert!(app.status.contains("connect:") || app.status.contains("device"));
+    }
+
+    #[test]
+    fn connect_empty_url_means_default() {
+        let mut app = dummy();
+        app.connect(vec![]);
+        assert!(app.awaiting_url);
+        // Empty Enter accepts the github.com default and continues.
+        app.input = vec![];
+        app.cursor = 0;
+        app.submit();
+        assert!(!app.awaiting_url);
+    }
+
+    #[test]
+    fn model_hides_unavailable_providers() {
+        use super::filter_live_providers;
+        let all = vec!["copilot".to_string(), "openai".to_string(), "dead".to_string()];
+        // Only copilot serves live models; others are hidden.
+        let live = filter_live_providers(&all, "", |name| match name {
+            "copilot" => vec!["gpt-5".to_string()],
+            _ => vec![],
+        });
+        assert_eq!(live, vec!["copilot".to_string()]);
+        // Substring filter still hides unavailable.
+        let live = filter_live_providers(&all, "open", |_| vec![]);
+        assert!(live.is_empty());
+        // Empty fetch for all → nothing shown, caller reports no live models.
+        let live = filter_live_providers(&all, "", |_| vec![]);
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn model_picker_never_shows_empty_models() {
+        let mut app = dummy();
+        // Simulate picking a provider whose daemon returns no models:
+        // popup_enter must hide it (no empty picker) and report status.
+        app.popup = Some(Popup::Models {
+            providers: vec!["copilot".to_string()],
+            pi: 0,
+            models: vec![],
+            mi: 0,
+            picking_model: false,
+        });
+        super::popup_enter(&mut app);
+        // Offline daemon → error path also hides the picker.
+        assert!(app.popup.is_none());
+        assert!(app.status.contains("no live models"));
     }
 }
 
