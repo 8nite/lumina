@@ -1469,6 +1469,12 @@ fn looks_like_work(text: &str) -> bool {
         "fix", "bug", "broken", "doesn", "not work", "fail", "error",
         "implement", "repair", "refactor", "migrat", "push",
         "wire", "missing", "wrong", "add",
+        // Mutation verbs the gate must not miss (session 265e3298:
+        // "analyse and copy to lumina global config" ran 161 turns with
+        // zero edits while the gate stayed disarmed — no hint matched).
+        // Deliberately no "port" (matches report/support/import).
+        // False positives cost at most 2 forced rounds, then release.
+        "copy", "sync", "clone", "move",
     ];
     let lower = text.to_lowercase();
     HINTS.iter().any(|h| lower.contains(h))
@@ -2028,6 +2034,9 @@ mod loop_key_tests {
         assert!(looks_like_work("session doesnt turn orange, u can try"));
         assert!(looks_like_work("add a collapse toggle"));
         assert!(looks_like_work("push the branch"));
+        assert!(looks_like_work("analyse and copy to lumina global config"), "copy requests are work");
+        assert!(looks_like_work("sync the fork"));
+        assert!(!looks_like_work("send me the weekly report"), "report must not match (no port hint)");
         assert!(!looks_like_work("chk the logs and see whats the issue"));
         assert!(!looks_like_work("what changed in the last commit"));
         assert!(!looks_like_work("check the weather"));
