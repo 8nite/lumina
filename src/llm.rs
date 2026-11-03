@@ -4,13 +4,20 @@
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 /// Per-request LLM ceiling: a silent gateway stream fails the turn instead
 /// of hanging it forever (the drain loop only ends on a terminal chunk).
 pub const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Probe-verified usable Copilot model ids + when they were verified.
+type CopilotUsable = HashMap<String, (HashSet<String>, std::time::Instant)>;
+
+/// Probe-verified Copilot usability cache TTL: entitlements change rarely,
+/// and each refresh costs one tiny chat probe per catalog entry.
+const COPILOT_USABLE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 #[derive(Debug, Error)]
 pub enum LlmError {
@@ -295,6 +302,15 @@ pub struct Router {
     overrides: std::sync::RwLock<HashMap<String, String>>,
     /// Exchanged Copilot session tokens by provider name (short-lived, ~25min).
     copilot_sessions: std::sync::RwLock<HashMap<String, CopilotSession>>,
+    /// Probe-verified usable Copilot models by provider (the catalog lists
+    /// entitlement-dead entries that 400 at chat time; verified 12/47 usable
+    /// 2026-11-03). Stale-while-revalidate: pickers serve the cache when
+    /// fresh, otherwise refresh in the background (see list_models).
+    /// Arc-shared: Router::clone must share these (the refresh task writes
+    /// through a clone; a deep copy would sink the write).
+    copilot_usable: std::sync::Arc<std::sync::RwLock<CopilotUsable>>,
+    /// In-flight usability refreshes (one per provider; no probe storms).
+    copilot_refreshing: std::sync::Arc<std::sync::RwLock<HashSet<String>>>,
     /// Advertised context windows by (protocol, base_url, model).
     ctx_cache: std::sync::RwLock<HashMap<String, u32>>,
 }
@@ -316,6 +332,8 @@ impl Clone for Router {
             providers: self.providers.clone(),
             overrides: std::sync::RwLock::new(self.overrides.read().unwrap().clone()),
             copilot_sessions: std::sync::RwLock::new(self.copilot_sessions.read().unwrap().clone()),
+            copilot_usable: self.copilot_usable.clone(),
+            copilot_refreshing: self.copilot_refreshing.clone(),
             ctx_cache: std::sync::RwLock::new(self.ctx_cache.read().unwrap().clone()),
         }
     }
@@ -394,6 +412,8 @@ impl Router {
             providers,
             overrides: std::sync::RwLock::new(HashMap::new()),
             copilot_sessions: std::sync::RwLock::new(HashMap::new()),
+            copilot_usable: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            copilot_refreshing: std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
             ctx_cache: std::sync::RwLock::new(HashMap::new()),
         })
     }
@@ -620,14 +640,80 @@ impl Router {
             },
             "copilot" => {
                 let sess = self.copilot_session(provider, &def).await?;
-                let mut tmp = def.clone();
-                tmp.base_url = sess.base_url.clone();
-                tmp.api_key = sess.token.clone();
-                openai_models(&tmp, &copilot_headers()).await
+                let url = format!("{}/models", sess.base_url.trim_end_matches('/'));
+                let mut req = client().get(&url).bearer_auth(&sess.token);
+                for (k, v) in copilot_headers() {
+                    req = req.header(k, v.clone());
+                }
+                let res = req.send().await?;
+                if !res.status().is_success() {
+                    return Err(LlmError::Msg(format!("models {url}: {}", res.status())));
+                }
+                let v: serde_json::Value = res.json().await?;
+                // Structural filter first: entries advertising endpoints
+                // without /chat/completions (Responses-only) can never ride
+                // our chat path. Legacy entries omit the field; the probe
+                // cache decides those (fail-open until verified).
+                let compat: Vec<ModelMeta> = openai_models_from_value(&v)
+                    .into_iter()
+                    .filter(|m| {
+                        copilot_chat_compatible(
+                            catalog_endpoints(&v, &m.id).as_ref(),
+                        )
+                    })
+                    .collect();
+                // Probe-verified usability, stale-while-revalidate: a fresh
+                // cache hides entitlement-dead entries (400
+                // model_not_supported at chat time); otherwise refresh in the
+                // background and serve the structural list meanwhile.
+                if let Some(set) = self.copilot_usable_fresh(provider) {
+                    Ok(compat.into_iter().filter(|m| set.contains(&m.id)).collect())
+                } else {
+                    let ids: Vec<String> = compat.iter().map(|m| m.id.clone()).collect();
+                    self.spawn_copilot_refresh(
+                        provider.to_string(),
+                        sess.base_url.clone(),
+                        sess.token.clone(),
+                        ids,
+                    );
+                    Ok(compat)
+                }
             }
             "ollama" => ollama_models(&def).await,
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Fresh probe-verified usable set, if any (fail-open: stale/missing
+    /// means the caller serves the structural list + refreshes).
+    fn copilot_usable_fresh(&self, provider: &str) -> Option<HashSet<String>> {
+        self.copilot_usable.read().unwrap().get(provider).and_then(|(set, at)| {
+            if at.elapsed() < COPILOT_USABLE_TTL {
+                Some(set.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Refresh usability in the background (one in flight per provider).
+    /// Never blocks pickers; a total outage skips the write so the next
+    /// listing retries instead of poisoning the cache.
+    fn spawn_copilot_refresh(&self, provider: String, base: String, token: String, ids: Vec<String>) {
+        if !self.copilot_refreshing.write().unwrap().insert(provider.clone()) {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let out = probe_copilot_usable(&base, &token, &ids).await;
+            this.copilot_refreshing.write().unwrap().remove(&provider);
+            if out.signalled {
+                this.copilot_usable
+                    .write()
+                    .unwrap()
+                    .insert(provider, (out.ids, std::time::Instant::now()));
+            }
+        });
     }
 }
 
@@ -1267,6 +1353,13 @@ async fn openai_models(def: &ProviderDef, extra: &[(&str, String)]) -> Result<Ve
         return Err(LlmError::Msg(format!("models {url}: {}", res.status())));
     }
     let v: serde_json::Value = res.json().await?;
+    Ok(openai_models_from_value(&v))
+}
+
+/// Pure parse of an OpenAI-style `/models` payload (shared by the GET
+/// wrapper and the Copilot branch, which needs the raw payload too for
+/// its structural endpoint filter).
+fn openai_models_from_value(v: &serde_json::Value) -> Vec<ModelMeta> {
     let mut out = Vec::new();
     if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
         for m in arr {
@@ -1296,7 +1389,112 @@ async fn openai_models(def: &ProviderDef, extra: &[(&str, String)]) -> Result<Ve
         }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(out)
+    out
+}
+
+/// Advertised `supported_endpoints` for one catalog id (None when the
+/// legacy entry omits the field).
+fn catalog_endpoints(catalog: &serde_json::Value, id: &str) -> Option<Vec<String>> {
+    catalog
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|arr| {
+            arr.iter().find(|m| m.get("id").and_then(|i| i.as_str()) == Some(id))
+        })
+        .and_then(|m| m.get("supported_endpoints"))
+        .and_then(|e| e.as_array())
+        .map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect())
+}
+
+/// Structural chat compatibility: a present endpoint list without
+/// `/chat/completions` (Responses-only models) can never ride our chat
+/// path. Absent lists (legacy entries) stay; the probe cache decides those.
+fn copilot_chat_compatible(endpoints: Option<&Vec<String>>) -> bool {
+    match endpoints {
+        None => true,
+        Some(list) => list.iter().any(|e| e == "/chat/completions"),
+    }
+}
+
+/// Fail-open probe verdict: only a clear refusal hides a model.
+/// Throttles, outages and auth failures keep it — never poison the picker
+/// on a transient error. Returns (keep, definitive_signal).
+fn classify_copilot_probe(status: u16, body: &str) -> (bool, bool) {
+    if status == 200 {
+        return (true, true);
+    }
+    if status == 404 {
+        return (false, true);
+    }
+    if status == 400 {
+        let b = body.to_lowercase();
+        if b.contains("not_supported")
+            || b.contains("not supported")
+            || b.contains("not found")
+            || b.contains("no such model")
+        {
+            return (false, true);
+        }
+        return (true, false);
+    }
+    (true, false)
+}
+
+/// One tiny non-streaming chat probe: does this model actually accept
+/// chat completions on this account? (max_tokens 1; ~10 tokens each.)
+async fn probe_copilot_model(base: &str, token: &str, id: &str) -> (bool, bool) {
+    let body = serde_json::json!({
+        "model": id,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "stream": false,
+    });
+    let mut req = client()
+        .post(format!("{}/chat/completions", base.trim_end_matches('/')))
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(20))
+        .json(&body);
+    for (k, v) in copilot_headers() {
+        req = req.header(k, v.clone());
+    }
+    let res = match req.send().await {
+        Ok(r) => r,
+        Err(_) => return (true, false),
+    };
+    let status = res.status().as_u16();
+    let text = res.text().await.unwrap_or_default();
+    classify_copilot_probe(status, &text)
+}
+
+/// Usability probe outcome over a catalog: the verified-usable ids, plus
+/// whether the run produced any definitive signal at all.
+struct CopilotProbeOut {
+    ids: HashSet<String>,
+    signalled: bool,
+}
+
+/// Probe every id (6 at a time) for real chat usability.
+async fn probe_copilot_usable(base: &str, token: &str, ids: &[String]) -> CopilotProbeOut {
+    let mut out = CopilotProbeOut { ids: HashSet::new(), signalled: false };
+    let mut js = tokio::task::JoinSet::new();
+    for chunk in ids.chunks(6) {
+        for id in chunk {
+            let (b, t, id) = (base.to_string(), token.to_string(), id.clone());
+            js.spawn(async move {
+                let (keep, signal) = probe_copilot_model(&b, &t, &id).await;
+                (id, keep, signal)
+            });
+        }
+        while let Some(r) = js.join_next().await {
+            if let Ok((id, keep, signal)) = r {
+                if keep {
+                    out.ids.insert(id);
+                }
+                out.signalled |= signal;
+            }
+        }
+    }
+    out
 }
 
 async fn ollama_models(def: &ProviderDef) -> Result<Vec<ModelMeta>, LlmError> {
@@ -1699,6 +1897,8 @@ mod tests {
             .collect(),
             overrides: std::sync::RwLock::new(HashMap::new()),
             copilot_sessions: std::sync::RwLock::new(HashMap::new()),
+            copilot_usable: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            copilot_refreshing: std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
             ctx_cache: std::sync::RwLock::new(HashMap::new()),
         };
         assert_eq!(r.model_for("executor", "plan"), "o/m");
@@ -1751,6 +1951,203 @@ mod tests {
         assert_eq!(models[1].id, "muse-spark-1.3-contributor");
         assert_eq!(models[1].context_window, 1048576, "{models:?}");
         assert_eq!(models[1].supported_efforts, vec!["low", "high"]);
+    }
+
+    #[test]
+    fn copilot_structural_filter_drops_responses_only() {
+        // Legacy entries omit supported_endpoints (probe decides);
+        // a present list without /chat/completions is structural.
+        assert!(copilot_chat_compatible(None));
+        assert!(copilot_chat_compatible(Some(&vec!["/chat/completions".into()])));
+        assert!(copilot_chat_compatible(Some(&vec!["/chat/completions".into(), "/responses".into()])));
+        assert!(!copilot_chat_compatible(Some(&vec!["/responses".into(), "ws:/responses".into()])));
+        assert!(!copilot_chat_compatible(Some(&vec![])));
+    }
+
+    #[test]
+    fn copilot_probe_verdict_fails_open() {
+        // Ground truth only: 200 keeps, clear refusals drop.
+        assert_eq!(classify_copilot_probe(200, ""), (true, true));
+        assert_eq!(classify_copilot_probe(404, ""), (false, true));
+        assert_eq!(
+            classify_copilot_probe(400, r#"{"error":{"code":"model_not_supported"}}"#),
+            (false, true)
+        );
+        assert_eq!(
+            classify_copilot_probe(400, "The requested model is not supported"),
+            (false, true)
+        );
+        // Anything else keeps without a signal (throttle/outage/auth:
+        // never poison the picker on a transient error).
+        assert_eq!(classify_copilot_probe(400, r#"{"error":"bad request"}"#), (true, false));
+        assert_eq!(classify_copilot_probe(429, "slow down"), (true, false));
+        assert_eq!(classify_copilot_probe(500, ""), (true, false));
+        assert_eq!(classify_copilot_probe(401, ""), (true, false));
+    }
+
+    /// Deadline-bounded mock Copilot gateway: serves GET /models with the
+    /// given catalog and answers POST /chat/completions 200 only for the
+    /// model id containing "good" (400 model_not_supported otherwise).
+    fn serve_copilot_mock(
+        listener: std::net::TcpListener,
+        catalog: &'static str,
+        max_conns: usize,
+    ) {
+        use std::io::{Read, Write};
+        listener.set_nonblocking(true).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut served = 0;
+        while served < max_conns && std::time::Instant::now() < end {
+            let (s, _) = match listener.accept() {
+                Ok(x) => x,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+            };
+            let mut s = s;
+            s.set_nonblocking(false).ok();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            let mut head = Vec::new();
+            loop {
+                let mut b = [0u8; 1];
+                if s.read_exact(&mut b).is_err() {
+                    break;
+                }
+                head.push(b[0]);
+                if head.ends_with(b"\r\n\r\n") || head.len() > 65536 {
+                    break;
+                }
+            }
+            let head_s = String::from_utf8_lossy(&head).into_owned();
+            let mut body = Vec::new();
+            if head_s.starts_with("POST") {
+                let len = head_s
+                    .lines()
+                    .find_map(|l| {
+                        l.trim().to_lowercase().strip_prefix("content-length:").and_then(|n| {
+                            n.trim().parse::<usize>().ok()
+                        })
+                    })
+                    .unwrap_or(0);
+                let mut buf = vec![0u8; len.min(65536)];
+                let mut read = 0;
+                while read < buf.len() {
+                    match s.read(&mut buf[read..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => read += n,
+                    }
+                }
+                body = buf[..read].to_vec();
+            }
+            let (status, resp_body) = if head_s.starts_with("GET /models") {
+                ("200 OK", catalog.to_string())
+            } else if head_s.starts_with("POST") {
+                if String::from_utf8_lossy(&body).contains("\"good\"") {
+                    ("200 OK", r#"{"id":"good","choices":[],"usage":{}}"#.to_string())
+                } else {
+                    (
+                        "400 Bad Request",
+                        r#"{"error":{"code":"model_not_supported","message":"The requested model is not supported"}}"#
+                            .to_string(),
+                    )
+                }
+            } else {
+                ("404 Not Found", "{}".to_string())
+            };
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                    resp_body.len()
+                )
+                .as_bytes(),
+            );
+            served += 1;
+        }
+    }
+
+    const MOCK_CATALOG: &str = r#"{"data":[
+        {"id":"dead-chat","supported_endpoints":["/chat/completions"]},
+        {"id":"good"},
+        {"id":"legacy-dead"},
+        {"id":"responses-only","supported_endpoints":["/responses","ws:/responses"]}
+    ]}"#;
+
+    fn copilot_test_router(addr: &str) -> Router {
+        Router {
+            fast: String::new(),
+            executor: "cop/good".into(),
+            planner: String::new(),
+            improver: String::new(),
+            providers: [("cop".into(), ProviderDef {
+                protocol: "copilot".into(),
+                base_url: format!("http://{addr}"),
+                api_key: String::new(),
+                github_token: "g".into(),
+                token_url: String::new(),
+            })]
+            .into_iter()
+            .collect(),
+            overrides: std::sync::RwLock::new(HashMap::new()),
+            copilot_sessions: std::sync::RwLock::new(
+                [("cop".into(), CopilotSession {
+                    token: "sess".into(),
+                    expires_unix: chrono::Utc::now().timestamp() + 99999,
+                    base_url: format!("http://{addr}"),
+                })]
+                .into_iter()
+                .collect(),
+            ),
+            copilot_usable: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            copilot_refreshing: std::sync::Arc::new(std::sync::RwLock::new(HashSet::new())),
+            ctx_cache: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// First listing (no cache): Responses-only is hidden structurally;
+    /// the rest serve meanwhile while the background probe refreshes.
+    #[tokio::test]
+    async fn copilot_list_models_structural_first() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || serve_copilot_mock(listener, MOCK_CATALOG, 12));
+        let r = copilot_test_router(&addr);
+        let models = r.list_models("cop").await.expect("models");
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["dead-chat", "good", "legacy-dead"], "{ids:?}");
+    }
+
+    /// The probe itself: only the actually-usable id survives.
+    #[tokio::test]
+    async fn copilot_probe_finds_usable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || serve_copilot_mock(listener, MOCK_CATALOG, 8));
+        let out = probe_copilot_usable(
+            &format!("http://{addr}"),
+            "sess",
+            &["good".into(), "dead-chat".into(), "legacy-dead".into()],
+        )
+        .await;
+        assert!(out.signalled);
+        assert_eq!(out.ids, HashSet::from(["good".to_string()]));
+    }
+
+    /// Fresh cache: the listing hides entitlement-dead entries outright.
+    #[tokio::test]
+    async fn copilot_list_models_cached_hides_dead() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        // Fresh cache: no background refresh fires, exactly one connection.
+        std::thread::spawn(move || serve_copilot_mock(listener, MOCK_CATALOG, 2));
+        let r = copilot_test_router(&addr);
+        r.copilot_usable.write().unwrap().insert(
+            "cop".into(),
+            (HashSet::from(["good".to_string()]), std::time::Instant::now()),
+        );
+        let models = r.list_models("cop").await.expect("models");
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["good"], "{ids:?}");
     }
 }
 
