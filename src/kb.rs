@@ -735,7 +735,7 @@ pub fn query_in(
     if dirs.is_empty() {
         let mut out = String::from("## reflect\n");
         out.push_str(&reflect_dirs(workspace, &[]));
-        out.push_str("\nkb: no knowledge base configured for this workspace (no memory/knowledge dir mentioned in AGENTS.md/rules and no memory/*.md found) — skipping KB; proceed with code/tools, ask the user if durable memory is needed.\n");
+        out.push_str("\nkb: no knowledge base configured for this workspace (no memory/knowledge dir mentioned in AGENTS.md/rules and no memory/*.md found) — skipping KB; proceed with code/tools, and do NOT call kb_query again this turn (re-querying returns this same skip note).\n");
         return Ok(out);
     }
     let lq_words: Vec<String> = q.to_lowercase().split_whitespace().map(|w| w.to_string()).collect();
@@ -1060,6 +1060,7 @@ mod fallback_tests {
         // No AGENTS.md mention and no memory/*.md: KB-less workspace.
         let out = query(d.path(), "how does auth work", 4000).unwrap();
         assert!(out.contains("no knowledge base configured"), "{out}");
+        assert!(out.contains("do NOT call kb_query again"), "{out}");
         assert!(!has_kb(d.path()));
     }
 

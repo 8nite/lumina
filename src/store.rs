@@ -30,6 +30,12 @@ pub struct Session {
     pub title: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Cumulative LLM usage for the session (opencode `session.tokens_*`
+    /// parity). Updated per turn; survives restarts for cost dashboards.
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub tokens_cache_read: i64,
+    pub tokens_cache_write: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +157,10 @@ impl Store {
         for ddl in [
             "ALTER TABLE sessions ADD COLUMN inflight_owner TEXT DEFAULT ''",
             "ALTER TABLE sessions ADD COLUMN inflight_since INTEGER DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN tokens_input INTEGER DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN tokens_output INTEGER DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN tokens_cache_read INTEGER DEFAULT 0",
+            "ALTER TABLE sessions ADD COLUMN tokens_cache_write INTEGER DEFAULT 0",
         ] {
             // Duplicate-column is the happy path on a migrated DB.
             let _ = db.execute_batch(ddl);
@@ -181,6 +191,10 @@ impl Store {
             title: String::new(),
             created_at: now(),
             updated_at: now(),
+            tokens_input: 0,
+            tokens_output: 0,
+            tokens_cache_read: 0,
+            tokens_cache_write: 0,
         };
         let db = self.db.lock().unwrap();
         db.execute(
@@ -192,6 +206,8 @@ impl Store {
     }
 
     fn row_to_session(r: &rusqlite::Row) -> rusqlite::Result<Session> {
+        // New columns default to 0 on pre-migration rows / narrow SELECTs.
+        let get_i64 = |idx: usize| -> i64 { r.get::<_, Option<i64>>(idx).unwrap_or(Some(0)).unwrap_or(0) };
         Ok(Session {
             id: r.get(0)?,
             parent_id: r.get(1)?,
@@ -202,13 +218,17 @@ impl Store {
             title: r.get(6)?,
             created_at: r.get(7)?,
             updated_at: r.get(8)?,
+            tokens_input: get_i64(9),
+            tokens_output: get_i64(10),
+            tokens_cache_read: get_i64(11),
+            tokens_cache_write: get_i64(12),
         })
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>, StoreError> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(
-            "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at
+            "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write
              FROM sessions WHERE id=?",
         )?;
         let mut rows = st.query([id])?;
@@ -220,7 +240,7 @@ impl Store {
         let db = self.db.lock().unwrap();
         let hit = {
             let mut st = db.prepare(
-                "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at
+                "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write
                  FROM sessions WHERE workspace_dir=? ORDER BY updated_at DESC LIMIT 1",
             )?;
             let mut rows = st.query([&want])?;
@@ -231,7 +251,7 @@ impl Store {
         }
         // Legacy fallback: rows stored pre-normalization (e.g. literal ".").
         let mut st = db.prepare(
-            "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at
+            "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write
              FROM sessions ORDER BY updated_at DESC",
         )?;
         let all = st.query_map([], Self::row_to_session)?;
@@ -252,7 +272,7 @@ impl Store {
             let want = normalize_workspace(d);
             {
                 let mut st = db.prepare(
-                    "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at
+                    "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write
                      FROM sessions WHERE workspace_dir=? ORDER BY updated_at DESC",
                 )?;
                 for r in st.query_map([&want], Self::row_to_session)? {
@@ -263,7 +283,7 @@ impl Store {
             }
             // Legacy fallback: pre-normalization spellings (e.g. ".").
             let mut st = db.prepare(
-                "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at
+                "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write
                  FROM sessions ORDER BY updated_at DESC",
             )?;
             for r in st.query_map([], Self::row_to_session)? {
@@ -274,7 +294,7 @@ impl Store {
             }
         } else {
             let mut st = db.prepare(
-                "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at
+                "SELECT id,parent_id,workspace_dir,agent,permission_mode,model,title,created_at,updated_at,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write
                  FROM sessions ORDER BY updated_at DESC",
             )?;
             for r in st.query_map([], Self::row_to_session)? {
@@ -287,6 +307,21 @@ impl Store {
     pub fn touch(&self, id: &str) -> Result<(), StoreError> {
         let db = self.db.lock().unwrap();
         db.execute("UPDATE sessions SET updated_at=? WHERE id=?", params![now(), id])?;
+        Ok(())
+    }
+
+    /// Accumulate per-turn LLM usage onto the session (opencode
+    /// `session.tokens_*` parity) and stamp updated_at. Saturating: a
+    /// corrupt usage spike can never wrap the counters.
+    pub fn add_usage(&self, id: &str, u: &crate::llm::Usage) -> Result<(), StoreError> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "UPDATE sessions SET
+                tokens_input = tokens_input + ?, tokens_output = tokens_output + ?,
+                tokens_cache_read = tokens_cache_read + ?, tokens_cache_write = tokens_cache_write + ?,
+                updated_at=? WHERE id=?",
+            params![u.input as i64, u.output as i64, u.cache_read as i64, u.cache_write as i64, now(), id],
+        )?;
         Ok(())
     }
 
@@ -606,6 +641,18 @@ mod tests {
         let child = s.fork(&a.id, None).unwrap();
         assert_eq!(child.parent_id, a.id);
         assert_eq!(s.turns(&child.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn usage_accumulates_per_session() {
+        let s = mem();
+        let a = s.create_session("/repo", "build", "bypass", "").unwrap();
+        let u = crate::llm::Usage { input: 100, output: 20, cache_read: 800, cache_write: 5 };
+        s.add_usage(&a.id, &u).unwrap();
+        s.add_usage(&a.id, &u).unwrap();
+        let got = s.get_session(&a.id).unwrap().unwrap();
+        assert_eq!((got.tokens_input, got.tokens_output), (200, 40));
+        assert_eq!((got.tokens_cache_read, got.tokens_cache_write), (1600, 10));
     }
 
     #[test]

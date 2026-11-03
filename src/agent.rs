@@ -14,6 +14,29 @@ use std::{collections::HashMap, path::PathBuf};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+/// Hash a rendered tool result for the identical-output ledger.
+/// Byte-exact: same information in any tool counts together; any
+/// guard-nudge suffix already applied counts as part of the text.
+fn output_key(s: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Hash assistant text case- and whitespace-insensitively: filler
+/// ("Comparing X — pulling Y." x5) matches verbatim; real answers
+/// with new content do not.
+fn text_key(s: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let norm: String = s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    let mut h = DefaultHasher::new();
+    norm.hash(&mut h);
+    h.finish()
+}
+
 /// Tool lifecycle for `turn.tool` SSE rows (Go OnToolStart/OnToolDone parity).
 #[derive(Debug, Clone)]
 pub enum ToolEvent {
@@ -50,10 +73,14 @@ pub const STOPPED_TEXT: &str = "Stopped by user.";
 /// Persist a cooperative stop: flush pending reasoning, then a plain
 /// assistant note so the transcript (and `continue`) reads sanely.
 fn persist_stopped(store: &Store, session_id: &str, thinking_buf: &str) {
+    // Reasoning lives in traces, not turns: turns are the replay prefix
+    // (every byte billed every round), traces are debug-only. A thinking
+    // turn would never be replayed (replay filters user/assistant only)
+    // yet would inflate compaction and token estimates.
     if !thinking_buf.trim().is_empty() {
         let capped: String = thinking_buf.chars().take(4000).collect();
         if let Ok(resolved) = store.vault.resolve(session_id, &capped) {
-            let _ = store.add_turn(session_id, "thinking", &resolved);
+            let _ = store.add_trace(session_id, "thinking", &resolved);
         }
     }
     let _ = store.add_turn(session_id, "assistant", STOPPED_TEXT);
@@ -65,20 +92,29 @@ pub struct Runner {
     pub approval: Option<ApprovalGate>,
     /// Lumina-compatible JS/TS plugin worker (None when unconfigured).
     pub plugins: Option<Arc<Host>>,
+    /// Shared language-server manager (servers persist across turns;
+    /// cloned, never rebuilt, so `run` and the daemon reuse processes).
+    pub lsp: Arc<crate::lsp::Manager>,
 }
 
 impl Runner {
     pub fn new() -> Self {
         // Auto-continue ceiling: must match Go hardCap (120). The old 16
         // ended long tasks with a silent stop that forced `continue`.
-        Self { max_steps: 120, approval: None, plugins: None }
+        Self { max_steps: 120, approval: None, plugins: None, lsp: Arc::new(crate::lsp::Manager::new(Default::default())) }
+    }
+
+    /// Attach the configured language servers (call once per process;
+    /// the manager spawns servers lazily on first tool use).
+    pub fn set_lsp(&mut self, cfg: crate::config::LspConfig) {
+        self.lsp = Arc::new(crate::lsp::Manager::new(cfg));
     }
 
     fn tool_specs() -> Vec<ToolSpec> {
-        Self::tool_specs_filtered(false)
+        Self::tool_specs_filtered(false, false)
     }
 
-    fn tool_specs_filtered(hide_websearch: bool) -> Vec<ToolSpec> {
+    fn tool_specs_filtered(hide_websearch: bool, hide_lsp: bool) -> Vec<ToolSpec> {
         let obj = |props: &[&str]| {
             serde_json::json!({
                 "type": "object",
@@ -91,7 +127,7 @@ impl Runner {
             ToolSpec { name: "write".into(), description: "Create or overwrite a workspace file.".into(), schema: obj(&["path", "content"]) },
             ToolSpec { name: "bash".into(), description: "Run a shell command in the workspace (git/cargo/pnpm/tests; workdir optional; background:true runs detached; poll with task_output). Prefer native read/grep/glob for file search/read/listing, not bash equivalents.".into(), schema: obj(&["command", "timeout_ms"]) },
             ToolSpec { name: "grep".into(), description: "Regex-search workspace files.".into(), schema: obj(&["pattern", "include"]) },
-            ToolSpec { name: "lsp".into(), description: "Code intelligence: symbols/refs (grep-backed alias).".into(), schema: obj(&["pattern", "include"]) },
+            ToolSpec { name: "lsp".into(), description: "Semantic code intelligence via the workspace language server (rust-analyzer/gopls/typescript-language-server/pylsp): op=symbols|definition|references|diagnostics on a workspace-relative path (1-based line/character, 0/0 = file start; query filters symbol names). Cross-file questions first — cheaper and more precise than grep chains.".into(), schema: serde_json::json!({"type": "object", "properties": {"op": {"type": "string"}, "path": {"type": "string"}, "line": {"type": "integer"}, "character": {"type": "integer"}, "query": {"type": "string"}}}) },
             ToolSpec { name: "glob".into(), description: "List workspace paths by glob.".into(), schema: obj(&["pattern"]) },
             ToolSpec { name: "kb_query".into(), description: "Query the workspace knowledge base (Markdown+graphify) AFTER intent is known. Only when AGENTS.md/rules declare a KB dir; the tool says when no KB is configured (then skip). One call with request keywords, budget 4000; follow [[wikilinks]] only if needed.".into(), schema: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}, "budget": {"type": "integer"}}}) },
             ToolSpec { name: "memory_write".into(), description: "Save a durable fact to the rule-declared KB dir (<kb>/<topic>.md, deduped, secrets rejected). Post-completion only after a verified fix; never mid-turn speculation.".into(), schema: obj(&["topic", "content"]) },
@@ -107,6 +143,7 @@ impl Runner {
         ]
         .into_iter()
         .filter(|t| !(hide_websearch && t.name == "websearch"))
+        .filter(|t| !(hide_lsp && t.name == "lsp"))
         .collect()
     }
 
@@ -238,10 +275,14 @@ impl Runner {
         let sub_usage = std::sync::Arc::new(std::sync::Mutex::new(crate::llm::Usage::default()));
         let sub_usage_exec = sub_usage.clone();
         let kb_override = cfg.kb.memory_dir.clone();
+        let lsp_manager = self.lsp.clone();
         let reg = Registry {
             kb_query: Some(std::sync::Arc::new(move |ws, q, b| {
                 let ov = if kb_override.trim().is_empty() { None } else { Some(kb_override.as_str()) };
                 crate::kb::query_in(ws, q, b, ov).map_err(|e| e.to_string())
+            })),
+            lsp_query: Some(std::sync::Arc::new(move |ws, op, path, line, ch, filter| {
+                lsp_manager.query(ws, op, path, line, ch, filter).map_err(|e| e.to_string())
             })),
             kb_memory_dir: cfg.kb.memory_dir.clone(),
             bundle: Some(bundle),            websearch_provider: cfg.websearch.provider.clone(),
@@ -255,17 +296,18 @@ impl Runner {
                 let cfg = cfg.clone();
                 let vault = store.vault.clone();
                 let acc = sub_usage_exec.clone();
+                let lsp = self.lsp.clone();
                 move |sc: &SecCtx, req: &crate::tools::SubagentReq| {
                     // Sync tool context inside the async turn: park this worker
                     // thread and drive the subagent future to completion.
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(run_subtask(&router, &cfg, &vault, sc, req))
+                        tokio::runtime::Handle::current().block_on(run_subtask(
+                            &router, &cfg, &vault, sc, req, &lsp,
+                        ))
                     })
                     .map(|(text, du)| {
                         let mut a = acc.lock().unwrap();
-                        a.input = a.input.saturating_add(du.input);
-                        a.output = a.output.saturating_add(du.output);
+                        a.add(&du);
                         text
                     })
                     .map_err(|e| e.to_string())
@@ -286,6 +328,7 @@ impl Runner {
             bash_rules: cfg.permissions_bash.clone(),
             allow_tooling_write: false,
             depth: 0,
+            sandbox: crate::sandbox::Profile::from_config(&cfg.sandbox),
         };
         let agent_name = sess.agent.clone();
         // Per-agent model default (falls back to the router executor tier).
@@ -295,6 +338,7 @@ impl Runner {
             sess.model.clone()
         };
         let hide_websearch = cfg.websearch.disabled;
+        let hide_lsp = cfg.lsp.disabled;
         // No-progress gate input (stuck session 81bdb764: a fix request
         // ended after 11 explore calls with zero edits and duplicated
         // filler). Plan mode is research-only by design, so it is exempt.
@@ -319,6 +363,7 @@ impl Runner {
                 session_id,
                 &user_turn.id,
                 hide_websearch,
+                hide_lsp,
                 work_requested,
             )
             .await?;
@@ -326,8 +371,14 @@ impl Runner {
         // (All assistant turns are persisted inside the loop as they stream,
         // so transcripts and /resume replay show every tool round.)
         let extra = sub_usage.lock().unwrap();
-        usage.input = usage.input.saturating_add(extra.input);
-        usage.output = usage.output.saturating_add(extra.output);
+        usage.add(&extra);
+        // Persist per-turn usage for cost dashboards (opencode parity) and
+        // emit a trace row so `traces` can answer "what did this turn cost".
+        let _ = store.add_usage(session_id, &usage);
+        let _ = store.add_trace(session_id, "usage", &serde_json::json!({
+            "turn": user_turn.id, "input": usage.input, "output": usage.output,
+            "cache_read": usage.cache_read, "cache_write": usage.cache_write,
+        }).to_string());
         Ok(TurnOutcome { text: final_text, usage })
     }
 
@@ -348,6 +399,7 @@ impl Runner {
         session_id: &str,
         user_turn_id: &str,
         hide_websearch: bool,
+        hide_lsp: bool,
         work_requested: bool,
     ) -> Result<(String, crate::llm::Usage), AgentError> {
         let mut last_text = String::new();
@@ -399,8 +451,22 @@ impl Runner {
         let mut repeat_streak = 0usize;
         // Native-tool redirect: bash cat/grep/find/ls burns rounds the
         // dedicated tools do in one call (session 843e971d: 80 bash for
-        // 4 edits). Nudge once per turn, then stay quiet.
+        // 4 edits). First occurrence is advisory; repeats are blocked in
+        // the execution guard above, so this stays a one-shot nudge.
         let mut bash_nudged = false;
+        // Session de530754 (105 turns, 1.2M tokens on a read-only audit):
+        // 16x identical todowrite, 8x identical glob-no-matches, 5x+4x
+        // verbatim filler text — all with VARIED calls/args, so the
+        // identical-call key never fired. Three ledgers close the gap:
+        // identical OUTPUTS (any tool), todowrite re-plan count, and
+        // identical assistant TEXT. Output/text repeats force a
+        // tools-stripped answer round (max 2/turn); todowrite blocks.
+        let mut out_counts: HashMap<u64, usize> = HashMap::new();
+        let mut todowrite_calls = 0usize;
+        let mut text_hash = 0u64;
+        let mut text_streak = 0usize;
+        let mut forced_answers = 0u8;
+        let mut force_answer = false;
         for round in 0..self.max_steps {
             // Cooperative stop (web Stop button / POST /stop): end the
             // turn at the next round boundary instead of running to the
@@ -410,10 +476,28 @@ impl Runner {
                 return Err(AgentError::Stopped);
             }
             let (tx, mut rx) = mpsc::unbounded_channel::<Chunk>();
+            // Forced answer round: identical outputs/texts kept coming back
+            // while the model kept tooling. Strip tools for exactly one
+            // round so the model states its answer instead of re-running
+            // what produces nothing new (max 2 per turn, then release).
+            let mut req_tools = Self::tool_specs_filtered(hide_websearch, hide_lsp);
+            let mut forced_this_round = false;
+            if force_answer {
+                force_answer = false;
+                if forced_answers < 2 {
+                    forced_answers += 1;
+                    forced_this_round = true;
+                    req_tools = Vec::new();
+                    messages.push(llm::Message { role: "user".into(),
+                        content: "Answer round: state your current answer, findings, or what remains — do NOT call tools this round (tool use is disabled for exactly this round). You can keep using tools afterwards if work remains.".into(),
+                        thinking: String::new() });
+                    on_stage("answering…");
+                }
+            }
             let req = Request {
                 model: model.into(),
                 messages: messages.clone(),
-                tools: Self::tool_specs_filtered(hide_websearch),
+                tools: req_tools,
                 max_tokens: 0,
                 reasoning_effort: effort.into(),
                 images: images.to_vec(),
@@ -467,8 +551,14 @@ impl Runner {
             let u = handle
                 .await
                 .map_err(|e| AgentError::Msg(format!("stream task: {e}")))??;
-            usage.input += u.input;
-            usage.output += u.output;
+            usage.add(&u);
+            // A non-compliant gateway can still emit tool calls on a
+            // tools-stripped round (Anthropic would 400 them as undeclared).
+            // Drop them: the round's contract is text-only.
+            if forced_this_round && !calls.is_empty() {
+                calls.clear();
+                on_stage("tools held this round…");
+            }
             if calls.is_empty() {
                 // Verify-after-fix gate: the model wants to end the turn
                 // with code mutations it never verified. Force up to two
@@ -505,7 +595,7 @@ impl Runner {
                     let capped_thinking: String = thinking_buf.chars().take(4000).collect();
                     if !capped_thinking.trim().is_empty() {
                         let resolved = store.vault.resolve(session_id, &capped_thinking).map_err(AgentError::Msg)?;
-                        store.add_turn(session_id, "thinking", &resolved)?;
+                        let _ = store.add_trace(session_id, "thinking", &resolved);
                         thinking_buf.clear();
                     }
                     return Ok((
@@ -515,11 +605,12 @@ impl Runner {
                     ));
                 }
                 let final_text = std::mem::take(&mut last_text);
-                // Persist trailing reasoning as its own closing dialog.
+                // Trailing reasoning archives to traces (turns stay
+                // replay-clean: only user/assistant re-enter context).
                 let capped_thinking: String = thinking_buf.chars().take(4000).collect();
                 if !capped_thinking.trim().is_empty() {
                     let resolved = store.vault.resolve(session_id, &capped_thinking).map_err(AgentError::Msg)?;
-                    store.add_turn(session_id, "thinking", &resolved)?;
+                    let _ = store.add_trace(session_id, "thinking", &resolved);
                 }
                 // User transparency: stored transcript and return carry
                 // values; refs only ever faced the provider.
@@ -574,7 +665,62 @@ impl Runner {
             }
             let mut round_acted = false;
             let mut round_only_polls = true;
-            for tc in &calls {
+            let mut round_executed = false;
+            // Parallel fast path: a pure batch of side-effect-free reads
+            // (the system prompt already tells the model to batch them)
+            // runs concurrently; mixed batches stay sequential so
+            // ordering/approval semantics never change. Args + block
+            // verdicts are snapshotted up front (cheap, order-independent);
+            // only the I/O runs on scope threads, ledger/render stays
+            // sequential in call order below.
+            let parallel_batch = calls.len() > 1 && calls.iter().all(|tc| is_parallel_tool(&tc.name));
+            let mut batch_args: Vec<HashMap<String, serde_json::Value>> = Vec::new();
+            let mut batch_blocked: Vec<Option<String>> = Vec::new();
+            if parallel_batch {
+                for tc in &calls {
+                    let args_val = serde_json::Value::Object(
+                        tc.args.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    );
+                    let resolved = store.vault.resolve_value(session_id, &args_val);
+                    let args: HashMap<String, serde_json::Value> = resolved
+                        .as_object()
+                        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .unwrap_or_default();
+                    let b = loop_blocked(&tc.name, &args, &seen, &read_counts)
+                        .or_else(|| subagent_guard(&tc.name, &args, &read_counts, subagent_calls));
+                    batch_args.push(args);
+                    batch_blocked.push(b);
+                }
+            }
+            // Concrete I/O results for the parallel batch, in call order.
+            // (Blocked slots stay None; sequential path computes inline.)
+            let mut batch_results: Vec<Option<(Result<crate::tools::Outcome, crate::tools::ToolError>, u64)>> = Vec::new();
+            if parallel_batch {
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(calls.len());
+                    for (i, tc) in calls.iter().enumerate() {
+                        if batch_blocked[i].is_some() {
+                            continue;
+                        }
+                        let args = batch_args[i].clone();
+                        let name = tc.name.clone();
+                        handles.push(scope.spawn(move || {
+                            let t0 = std::time::Instant::now();
+                            let r = reg.call(sc, &name, &args);
+                            (i, r, t0.elapsed().as_millis() as u64)
+                        }));
+                    }
+                    let mut out: Vec<Option<(Result<crate::tools::Outcome, crate::tools::ToolError>, u64)>> =
+                        (0..calls.len()).map(|_| None).collect();
+                    for h in handles {
+                        if let Ok((i, r, ms)) = h.join() {
+                            out[i] = Some((r, ms));
+                        }
+                    }
+                    batch_results = out;
+                });
+            }
+            for (idx, tc) in calls.iter().enumerate() {
                 on_stage(&format!("tool: {}", tool_label(&tc.name, &tc.args)));
                 if tc.name.eq_ignore_ascii_case("edit")
                     || tc.name.eq_ignore_ascii_case("write")
@@ -587,31 +733,80 @@ impl Runner {
                 }
                 // Resolve direction: the model only ever saw refs, so its
                 // args carry them. Resolve before execution (tools get
-                // values). Fail closed on vault errors.
-                let args_val = serde_json::Value::Object(
-                    tc.args.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                );
-                let resolved = store.vault.resolve_value(session_id, &args_val);
-                let args: HashMap<String, serde_json::Value> = resolved
-                    .as_object()
-                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default();
+                // values). Fail closed on vault errors. Parallel batches
+                // reuse the pre-resolved snapshot above so the I/O that
+                // already ran on scope threads lines up with this ledger.
+                let args: HashMap<String, serde_json::Value> = if parallel_batch {
+                    batch_args[idx].clone()
+                } else {
+                    let args_val = serde_json::Value::Object(
+                        tc.args.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    );
+                    let resolved = store.vault.resolve_value(session_id, &args_val);
+                    resolved
+                        .as_object()
+                        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .unwrap_or_default()
+                };
                 let target = crate::tools::tool_target(&tc.name, &args);
                 on_tool(ToolEvent::Start { name: tc.name.clone(), target: target.clone() });
                 // Identical calls hard-stop on the 4th attempt and re-reads
                 // cap at the 6th (task_output exempt; edits clear the ledger
                 // below since the state changed).
                 let call_key = tool_call_key(&tc.name, &args);
-                let blocked = loop_blocked(&tc.name, &args, &seen, &read_counts)
-                    .or_else(|| subagent_guard(&tc.name, &args, &read_counts, subagent_calls));
-                let was_blocked = blocked.is_some();
-                let subagent_ran = tc.name.eq_ignore_ascii_case("subagent") && blocked.is_none();
-                let t0 = std::time::Instant::now();
-                let result = match blocked {
-                    Some(msg) => Err(crate::tools::ToolError::Msg(msg)),
-                    None => reg.call(sc, &tc.name, &args),
-                };
-                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                let was_blocked: bool;
+                let subagent_ran: bool;
+                let result: Result<crate::tools::Outcome, crate::tools::ToolError>;
+                let elapsed_ms: u64;
+                if parallel_batch {
+                    let blocked = batch_blocked[idx].clone();
+                    was_blocked = blocked.is_some();
+                    // Parallel set is read-only by construction: no
+                    // subagent, no ledger-clearing mutation.
+                    subagent_ran = false;
+                    if let Some(msg) = blocked {
+                        result = Err(crate::tools::ToolError::Msg(msg));
+                        elapsed_ms = 0;
+                    } else if let Some(slot) = batch_results[idx].take() {
+                        result = slot.0;
+                        elapsed_ms = slot.1;
+                    } else {
+                        // Scope thread panicked or was skipped: fail closed
+                        // rather than silently dropping the call.
+                        result = Err(crate::tools::ToolError::Msg(format!("{}: parallel execution failed", tc.name)));
+                        elapsed_ms = 0;
+                    }
+                } else {
+                    let blocked = loop_blocked(&tc.name, &args, &seen, &read_counts)
+                        .or_else(|| subagent_guard(&tc.name, &args, &read_counts, subagent_calls))
+                        // Repeat native-redirectable bash (`ls` again after the
+                        // advisory) never executes: the model already has the
+                        // output, and arg variants (`ls` vs `ls -la`) dodge the
+                        // identical-call key. First occurrence always runs.
+                        .or_else(|| {
+                            if !tc.name.eq_ignore_ascii_case("bash") {
+                                return None;
+                            }
+                            bash_native_blocked(&crate::tools::tool_target(&tc.name, &args), bash_nudged)
+                        })
+                        // todowrite re-plan budget (session de530754: 16x
+                        // todowrite with zero progress). Re-planning is
+                        // pre-execution visible, so this actually blocks —
+                        // unlike the output ledger below, which can only
+                        // react after the (wasted) run.
+                        .or_else(|| todowrite_guard(&tc.name, todowrite_calls));
+                    was_blocked = blocked.is_some();
+                    subagent_ran = tc.name.eq_ignore_ascii_case("subagent") && blocked.is_none();
+                    let t0 = std::time::Instant::now();
+                    result = match blocked {
+                        Some(msg) => Err(crate::tools::ToolError::Msg(msg)),
+                        None => reg.call(sc, &tc.name, &args),
+                    };
+                    elapsed_ms = t0.elapsed().as_millis() as u64;
+                }
+                if !was_blocked {
+                    round_executed = true;
+                }
                 let (preview, is_err) = match &result {
                     Ok(o) => (tool_preview(&o.output), false),
                     Err(e) => (tool_preview(&e.to_string()), true),
@@ -628,12 +823,27 @@ impl Runner {
                     Ok(o) => {
                         // Cap what flows back into context (full blobs stay out of
                         // the loop; the model can re-read files if it needs more).
+                        // The overflow spills to a `tool_full` trace (16KB cap)
+                        // so resume/debug keeps the data without re-billing it
+                        // every round — the opencode lesson (4.2GB verbatim
+                        // persistence) in reverse: keep replay lean, archive
+                        // full output out-of-context.
                         let mut out = o.output;
                         let mut note = String::new();
                         if o.truncated || out.len() > 4000 {
                             let total = out.len();
-                            crate::tools::truncate_to(&mut out, 4000);
-                            note = format!("\n[truncated {total} chars to 4000]");
+                            let mut full = std::mem::take(&mut out);
+                            let mut spill: String = full.chars().take(16_000).collect();
+                            if spill.len() < full.len() {
+                                spill.push_str(&format!("\n…[spill truncated at 16000 of {total} chars]"));
+                            }
+                            let _ = store.add_trace(session_id, "tool_full", &serde_json::json!({
+                                "tool": tc.name, "target": target,
+                                "total_chars": total, "output": spill,
+                            }).to_string());
+                            crate::tools::truncate_to(&mut full, 4000);
+                            out = full;
+                            note = format!("\n[truncated {total} chars to 4000; full output archived]");
                         }
                         format!("tool {} →\n{out}{note}", tc.name)
                     }
@@ -677,6 +887,34 @@ impl Runner {
                         bash_nudged = true;
                     }
                 }
+                // todowrite re-plan ledger (session de530754: 16x todowrite,
+                // "Todos updated: 0/3", zero progress). Advisory on the 4th,
+                // hard block from the 6th (see todowrite_guard); the count
+                // only advances on executed calls.
+                if tc.name.eq_ignore_ascii_case("todowrite") && !was_blocked {
+                    todowrite_calls += 1;
+                    if let Some(nudge) = todowrite_nudge(todowrite_calls) {
+                        rendered.push_str(&nudge);
+                    }
+                }
+                // Identical-OUTPUT ledger (session de530754: 8x glob
+                // "(no matches)", 2x identical kb dumps — all with varied
+                // args, so the identical-call key never fired). task_output
+                // polls are progress, not loops — exempt.
+                if !tc.name.eq_ignore_ascii_case("task_output") {
+                    let h = output_key(&rendered);
+                    let n = out_counts.entry(h).or_insert(0);
+                    *n += 1;
+                    if *n >= 3 {
+                        rendered.push_str(&format!(
+                            "\n\nLoop guard: this exact result already came back {n} times with no new information — stop re-running what produces it. State your answer or call only tools that return NEW information."
+                        ));
+                        // Force a tools-stripped answer round (capped).
+                        if forced_answers < 2 {
+                            force_answer = true;
+                        }
+                    }
+                }
                 // Proxy-read ledger: a subagent task naming a file reads it
                 // inside the child trajectory, so share the re-read ledger
                 // (stuck session cc686408 dodged the read cap with 30
@@ -703,7 +941,12 @@ impl Runner {
                     verified = false;
                     // New workspace state: identical-call ledger restarts
                     // (re-running the same check after an edit is new info).
+                    // The output/text/todowrite ledgers restart too: prior
+                    // outputs are stale once the tree changes.
                     seen.clear();
+                    out_counts.clear();
+                    todowrite_calls = 0;
+                    text_streak = 0;
                     let target = crate::tools::tool_target(&tc.name, &args);
                     if !target.is_empty() {
                         read_counts.remove(&target);
@@ -731,35 +974,49 @@ impl Runner {
             } else if !round_only_polls {
                 idle_rounds += 1;
             }
-            // Continuation nudge: the model must not stop with a partial
-            // summary while work remains. Checkpoint every 8 rounds so long
-            // tasks restate done-vs-remaining and keep going.
-            let mut nudge = if (round + 1) % 8 == 0 {
-                "Checkpoint: briefly note what is done vs remaining, then CONTINUE until the original request is fully done (all edits applied, tests/build pass). Do NOT stop with a status summary or ask the user to say 'continue'; call more tools if anything remains, else give the final completed answer.".to_string()
-            } else {
-                "Continue the task until the original request is fully complete; call more tools if anything remains, else give the final completed answer. Do NOT end with a partial summary when work is still pending.".to_string()
-            };
+            // Nudges are context overhead billed every round (~50-100
+            // tokens x 120 rounds = up to 12k/turn) AND cache-prefix
+            // breakers: the growing suffix invalidates the stable prefix
+            // the provider would otherwise serve from cache. Send one only
+            // when the loop actually needs steering: periodic checkpoint,
+            // repeat streak, idle spin, or unverified drift. Steered user
+            // input always joins (that is real input, not scaffolding).
+            let mut nudge = String::new();
+            if (round + 1) % 8 == 0 {
+                nudge.push_str("Checkpoint: done vs remaining, then CONTINUE (finish edits + green verify) or give the final answer.");
+            }
             if repeat_streak >= 3 {
+                // Loop guard is load-bearing (stuck-session fix): name the
+                // stall and demand a new approach.
+                if !nudge.is_empty() {
+                    nudge.push(' ');
+                }
                 nudge.push_str(&format!(
-                    " Loop guard: this is the {repeat_streak}-th identical tool round in a row with no new result. Do NOT call the same tool with the same arguments again — change approach (different args or tool) or give the final text answer now."
+                    "Loop guard: {repeat_streak}-th identical tool round -- do NOT repeat the same call; change args/tool or answer now."
                 ));
             }
             // Idle-round nudge: advisory only (research turns legitimately
             // explore), but a work request 12 rounds deep with zero edits
-            // is spinning — prod it to act or name the blocker. Fires every
+            // is spinning -- prod it to act or name the blocker. Fires every
             // 12th idle round so long loops keep getting prodded.
             if work_requested && idle_rounds > 0 && idle_rounds.is_multiple_of(12) {
+                if !nudge.is_empty() {
+                    nudge.push(' ');
+                }
                 nudge.push_str(&format!(
-                    " Progress note: {idle_rounds} rounds with no edit/write/patch yet — if exploration is done, make the change now (then verify it); otherwise state what is still missing."
+                    "Progress note: {idle_rounds} rounds, no edit yet -- make the change now (then verify) or state what is missing."
                 ));
-                on_stage("idling…");
+                on_stage("idling\u{2026}");
             }
             // Mid-loop verify prod: edits stacked with no green run drift
             // (stuck session cc686408 landed edits but never verified
             // before the budget ran out). Advisory until the end-gate
             // forces it.
             if mutated && !verified && (round + 1).is_multiple_of(12) {
-                nudge.push_str(" Verify now: this turn already ran edit/write/patch with no passing test/build yet — run the relevant verification command and fix failures until green instead of stacking more edits.");
+                if !nudge.is_empty() {
+                    nudge.push(' ');
+                }
+                nudge.push_str("Verify now: edits ran with no passing test/build yet -- run it and fix failures instead of stacking more edits.");
             }
             // Steered input joins the active turn (Go takeSteered parity):
             // stored raw, sent vaulted, answered before anything else.
@@ -767,24 +1024,44 @@ impl Runner {
             if !steered_raw.trim().is_empty() {
                 let _ = store.add_turn(session_id, "user", &steered_raw);
                 let steered_sub = store.vault.substitute(session_id, &steered_raw).map_err(AgentError::Msg)?;
-                nudge.push_str(&format!("\n\nSteered input (answer this too):\n{steered_sub}"));
+                if !nudge.is_empty() {
+                    nudge.push_str("\n\n");
+                }
+                nudge.push_str(&format!("Steered input (answer this too):\n{steered_sub}"));
                 on_stage("steered \u{2713}");
             }
-            messages.push(llm::Message { role: "user".into(), content: nudge, thinking: String::new() });
+            if !nudge.is_empty() {
+                messages.push(llm::Message { role: "user".into(), content: nudge, thinking: String::new() });
+            }
             // Skip empty assistant echoes so the model doesn't pattern-match
             // its own filler ("I'll query...") into a retry loop.
             // (Continuation nudges above are deterministic scaffolding:
             // re-added by the loop, never persisted.)
-            // Flush this round's reasoning as its own dialog (cap mirrors
-            // the 4KB tool-result cap into context).
+            // Reasoning lives in traces, not turns (see persist_stopped):
+            // replay only carries user/assistant, so a thinking turn would
+            // be write-only bloat. Archive the segment for debug instead.
             let capped_thinking: String = thinking_buf.chars().take(4000).collect();
             if !capped_thinking.trim().is_empty() {
                 let resolved = store.vault.resolve(session_id, &capped_thinking).map_err(AgentError::Msg)?;
-                store.add_turn(session_id, "thinking", &resolved)?;
+                let _ = store.add_trace(session_id, "thinking", &resolved);
             }
             if !last_text.trim().is_empty() {
                 messages.push(llm::Message { role: "assistant".into(), content: store.vault.substitute(session_id, &last_text).map_err(AgentError::Msg)?, thinking: String::new() });
                 let interim = store.vault.resolve(session_id, &last_text).map_err(AgentError::Msg)?;
+                // Identical-TEXT streak (session de530754: 5x + 4x verbatim
+                // filler while tooling on). Empty texts are neutral; a
+                // mutation already reset the streak above. Three in a row
+                // with continued tool calls forces an answer round.
+                let h = text_key(&interim);
+                if h == text_hash {
+                    text_streak += 1;
+                } else {
+                    text_hash = h;
+                    text_streak = 1;
+                }
+                if text_streak >= 3 && round_executed && forced_answers < 2 {
+                    force_answer = true;
+                }
                 store.add_turn(session_id, "assistant", &interim)?;
                 last_nonempty = last_text.clone();
             }
@@ -876,6 +1153,18 @@ impl Runner {
 /// Tools whose execution mutates the workspace (checkpoint trigger).
 fn is_mutating(name: &str) -> bool {
     matches!(name, "edit" | "write" | "bash" | "memory_write" | "patch")
+}
+
+/// Side-effect-free tools safe for concurrent execution inside one model
+/// batch: pure reads plus skill-body loads (bundle lookup, no I/O beyond).
+/// Everything else (bash/edit/write/patch/mcp/subagent/question/web*,
+/// kb_query which may call the LLM, task_output polling) stays sequential
+/// so ordering, approval, and ledger semantics never change.
+fn is_parallel_tool(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "read" | "glob" | "grep" | "lsp" | "skill"
+    )
 }
 
 /// Canonicalizes one invocation for loop detection: lowercase name plus
@@ -1026,17 +1315,61 @@ fn read_repeat_nudge(target: &str, n: usize) -> Option<String> {
 /// the dedicated tools do in one call. Matches only when the command
 /// starts with the native binary (piped `git diff | grep` still needs
 /// shell, so it never nudges). Caller fires once per turn.
+/// Sequential `;`/`&&` chains decompose: `pwd; ls -la` is a bare `ls`
+/// wearing a prefix (smoke test 2026-11-02 used exactly this shape twice,
+/// dodging the first-token classifier). Piped commands still need shell
+/// (`git diff | grep foo`), so any `|` exempts the whole line. Returns the
+/// native tool for the first redirectable segment, if any. Compounds that
+/// also verify (`cargo test && ls`) are exempt everywhere — blocking them
+/// would kill the test run the verify gate requires.
+fn native_segment(cmd: &str) -> Option<(String, &'static str)> {
+    if cmd.contains('|') || is_verify_command(cmd) {
+        return None;
+    }
+    let normalized = cmd.replace("&&", ";").replace("||", ";");
+    for seg in normalized.split(';') {
+        let first = seg.split_whitespace().next().unwrap_or("").to_lowercase();
+        if first.is_empty() {
+            continue;
+        }
+        if let Some(native) = native_tool_for(&first) {
+            return Some((first, native));
+        }
+    }
+    None
+}
+
 fn bash_native_nudge(cmd: &str) -> Option<String> {
-    let first = cmd.trim_start().split_whitespace().next().unwrap_or("").to_lowercase();
-    let native = match first.as_str() {
-        "grep" | "rg" | "ag" => "grep",
-        "cat" | "head" | "tail" | "wc" | "less" | "more" => "read",
-        "find" | "ls" | "fd" => "glob",
-        _ => return None,
-    };
+    let (first, native) = native_segment(cmd)?;
     Some(format!(
         "\n\nTool guidance: `bash: {first}` has a native `{native}` tool — use it instead of bash for file search/read/listing; reserve bash for git/cargo/pnpm/tests."
     ))
+}
+
+/// Hard cap behind the nudge: the advisory alone doesn't redirect (smoke
+/// test 2026-11-02: 4x bare `ls` ignored it, `ls`/`ls -la` arg variants
+/// also dodge the identical-call key). Once the advisory has fired, any
+/// further native-redirectable bash call this turn is blocked outright —
+/// the model already has the listing, and the error names the native
+/// tool. First occurrence always runs (advisory path, not this).
+fn bash_native_blocked(cmd: &str, nudged: bool) -> Option<String> {
+    if !nudged {
+        return None;
+    }
+    let (first, native) = native_segment(cmd)?;
+    Some(format!(
+        "bash redirected: `bash {first}` already ran once via bash this turn — use the native `{native}` tool from here on (reserve bash for git/cargo/pnpm/tests)."
+    ))
+}
+
+/// Classifier shared by the advisory nudge and the hard redirect above.
+fn native_tool_for(first: &str) -> Option<&'static str> {
+    match first {
+        "grep" | "rg" | "ag" => Some("grep"),
+        "cat" | "head" | "tail" | "wc" | "less" | "more" => Some("read"),
+        "find" | "ls" | "fd" => Some("glob"),
+        _ => None,
+    }
 }
 
 /// Hard cap behind the nudge: block the 6th+ read of one path per turn.
@@ -1049,6 +1382,27 @@ fn read_repeat_blocked(tool: &str, target: &str, n_before: usize) -> Option<Stri
     }
     Some(format!(
         "read blocked: `{target}` already read {n} times this turn — act on what you have (grep/glob for the next fact, then edit) instead of re-reading it.",
+        n = n_before + 1
+    ))
+}
+
+/// todowrite re-plan ledger (session de530754: 16x todowrite, "Todos
+/// updated: 0/3", zero progress — the same 43-re-plan shape as stuck
+/// session 7614829e). Advisory on the 4th executed call, hard block
+/// from the 6th: re-planning without acting never converges.
+fn todowrite_nudge(n: usize) -> Option<String> {
+    if n != 4 {
+        return None;
+    }
+    Some("\n\nLoop guard: 4 todowrite updates this turn — execute the list (read/grep/edit/bash) instead of re-planning it.".into())
+}
+
+fn todowrite_guard(name: &str, n_before: usize) -> Option<String> {
+    if !name.eq_ignore_ascii_case("todowrite") || n_before < 5 {
+        return None;
+    }
+    Some(format!(
+        "todowrite blocked: {n} plan updates this turn with no intervening action — work the existing list (or state the answer) instead of re-planning it.",
         n = n_before + 1
     ))
 }
@@ -1074,6 +1428,8 @@ fn is_verify_command(cmd: &str) -> bool {
         "npm run build",
         "npm run test",
         "pytest",
+        "unittest",
+        "selftest",
         "go test",
         "make test",
         "make build",
@@ -1128,6 +1484,7 @@ async fn run_subtask(
     vault: &crate::vault::Vault,
     parent: &SecCtx,
     req: &crate::tools::SubagentReq,
+    lsp: &Arc<crate::lsp::Manager>,
 ) -> Result<(String, crate::llm::Usage), AgentError> {
     let bundle = Bundle::load(&parent.workspace, cfg.compat.import_global_rules, cfg.compat.import_global_skills);
     // Custom agents (mode subagent|all) plus builtins; primary-only rejects.
@@ -1188,7 +1545,7 @@ async fn run_subtask(
     prompt_text.push_str(crate::vault::VAULT_GUIDANCE);
     prompt_text.push('\n');
     // Explore is read-only; general gets everything but subagent.
-    let specs: Vec<ToolSpec> = Runner::tool_specs_filtered(cfg.websearch.disabled)
+    let specs: Vec<ToolSpec> = Runner::tool_specs_filtered(cfg.websearch.disabled, cfg.lsp.disabled)
         .into_iter()
         .filter(|t| {
             if req.agent.eq_ignore_ascii_case("explore") {
@@ -1210,6 +1567,12 @@ async fn run_subtask(
                 crate::kb::query_in(ws, q, b, ov).map_err(|e| e.to_string())
             })
         }),
+        lsp_query: Some({
+            let lsp = lsp.clone();
+            std::sync::Arc::new(move |ws, op, path, line, ch, filter| {
+                lsp.query(ws, op, path, line, ch, filter).map_err(|e| e.to_string())
+            })
+        }),
         kb_memory_dir: cfg.kb.memory_dir.clone(),
         bundle: Some(bundle),
         websearch_provider: cfg.websearch.provider.clone(),
@@ -1228,6 +1591,7 @@ async fn run_subtask(
         bash_rules: parent.bash_rules.clone(),
         allow_tooling_write: false,
         depth: parent.depth + 1,
+        sandbox: crate::sandbox::Profile::from_config(&cfg.sandbox),
     };
     let mut messages = vec![
         llm::Message { role: "system".into(), content: prompt_text, thinking: String::new() },
@@ -1270,8 +1634,7 @@ async fn run_subtask(
             }
         }
         let u = handle.await.map_err(|e| AgentError::Msg(format!("subagent task: {e}")))??;
-        sub_usage.input = sub_usage.input.saturating_add(u.input);
-        sub_usage.output = sub_usage.output.saturating_add(u.output);
+        sub_usage.add(&u);
         if calls.is_empty() {
             return vault.resolve(&parent.session, &last).map(|t| (t, sub_usage)).map_err(AgentError::Msg);
         }
@@ -1333,7 +1696,10 @@ impl Runner {
         chars / 4
     }
 
-    /// Compact when the estimate crosses 80% of the advertised window.
+    /// Compact once the estimate crosses 60% of the advertised window (or
+    /// 60 turns regardless): tool-result turns are 2KB each, so waiting for
+    /// 80% leaves no headroom for the multi-round tool loop that follows.
+    /// Opencode compacts incrementally on token budget, not turn count.
     pub async fn maybe_auto_compact(
         store: &Store,
         router: &Router,
@@ -1344,7 +1710,7 @@ impl Runner {
             .get_session(session_id)?
             .ok_or_else(|| AgentError::Msg(format!("session {session_id} not found")))?;
         let turns = store.turns(session_id)?;
-        if turns.len() < 20 {
+        if turns.len() < 12 {
             return Ok(());
         }
         let model = if sess.model.is_empty() { router.model_for("executor", "build") } else { sess.model.clone() };
@@ -1353,22 +1719,30 @@ impl Runner {
         // never compacting (unbounded growth ends in a provider hard-reject
         // mid-turn).
         let window = if window == 0 { 64_000 } else { window };
+        // Turn-count backstop: 60+ turns of tool spam compacts even under
+        // the token threshold (each tool round replays the whole prefix).
+        if turns.len() >= 60 {
+            Self::compact_session(store, router, cfg, session_id).await?;
+            return Ok(());
+        }
         let msgs: Vec<llm::Message> = turns
             .iter()
             .map(|t| llm::Message { role: t.role.clone(), content: t.text.clone(), thinking: String::new() })
             .collect();
         let used = Self::estimate_tokens(&msgs, &Self::tool_specs());
-        if used * 100 < window * 80 {
+        if used * 100 < window * 60 {
             return Ok(());
         }
         Self::compact_session(store, router, cfg, session_id).await?;
         Ok(())
     }
 
-    /// Keep the first 2 + last 6 turns, summarize the middle via the fast
+    /// Keep the first 2 + last 10 turns, summarize the middle via the fast
     /// tier (naive truncation note when no LLM is reachable), and persist a
     /// summary turn. Mirrors Go auto-compaction (rules/diffs/memory pointers
-    /// are rebuilt from disk, never summarized away).
+    /// are rebuilt from disk, never summarized away). The wider tail (10 vs
+    /// 6) preserves the most recent tool results verbatim so the model does
+    /// not re-read files it just saw.
     pub async fn compact_session(
         store: &Store,
         router: &Router,
@@ -1376,11 +1750,11 @@ impl Runner {
         session_id: &str,
     ) -> Result<String, AgentError> {
         let turns = store.turns(session_id)?;
-        if turns.len() < 20 {
+        if turns.len() < 12 {
             return Ok("already compact".into());
         }
         let keep_head = 2.min(turns.len());
-        let keep_tail = 6.min(turns.len() - keep_head);
+        let keep_tail = 10.min(turns.len() - keep_head);
         let middle = &turns[keep_head..turns.len() - keep_tail];
         if middle.is_empty() {
             return Ok("already compact".into());
@@ -1454,13 +1828,31 @@ mod specs_tests {
 
     #[test]
     fn tool_specs_filtered_hides_websearch() {
-        let specs = Runner::tool_specs_filtered(true);
+        let specs = Runner::tool_specs_filtered(true, false);
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(!names.contains(&"websearch"), "{names:?}");
         assert!(names.contains(&"webfetch"), "{names:?}");
-        let all_specs = Runner::tool_specs_filtered(false);
+        let all_specs = Runner::tool_specs_filtered(false, false);
         let all: Vec<&str> = all_specs.iter().map(|s| s.name.as_str()).collect();
         assert!(all.contains(&"websearch"), "{all:?}");
+    }
+
+    #[test]
+    fn tool_specs_filtered_hides_lsp() {
+        let specs = Runner::tool_specs_filtered(false, true);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"lsp"), "{names:?}");
+        assert!(names.contains(&"grep"), "{names:?}");
+    }
+
+    #[test]
+    fn parallel_set_is_read_only() {
+        for t in ["read", "glob", "grep", "lsp", "skill", "READ"] {
+            assert!(is_parallel_tool(t), "{t}");
+        }
+        for t in ["bash", "edit", "write", "patch", "subagent", "task_output", "kb_query", "question", "webfetch", "mcp"] {
+            assert!(!is_parallel_tool(t), "{t}");
+        }
     }
 }
 
@@ -1533,6 +1925,55 @@ mod loop_key_tests {
     }
 
     #[test]
+    fn todowrite_budget_nudges_then_blocks() {
+        assert!(todowrite_nudge(3).is_none());
+        assert!(todowrite_nudge(4).expect("4th re-plan nudges").contains("instead of re-planning"));
+        assert!(todowrite_nudge(5).is_none(), "fires once, not spam");
+        assert!(todowrite_guard("todowrite", 4).is_none(), "5 executions still run");
+        let block = todowrite_guard("todowrite", 5).expect("6th re-plan blocks");
+        assert!(block.contains("re-planning"), "{block}");
+        assert!(todowrite_guard("read", 9).is_none(), "other tools unaffected");
+    }
+
+    #[test]
+    fn text_key_ignores_case_and_spacing() {
+        let a = text_key("Checking X — pulling Y.");
+        let b = text_key("  checking   x — pulling  y. ");
+        assert_eq!(a, b, "filler repeats must hash equal");
+        assert_ne!(a, text_key("Checking X — pulling Z."), "new content must differ");
+    }
+
+    #[test]
+    fn output_key_is_deterministic() {
+        assert_eq!(output_key("tool glob →\n(no matches)"), output_key("tool glob →\n(no matches)"));
+        assert_ne!(output_key("tool glob →\n(no matches)"), output_key("tool grep →\n(no matches)"));
+    }
+
+    #[test]
+    fn bash_native_redirect_escalates_to_block() {
+        // First occurrence always runs (advisory, never blocked).
+        assert!(bash_native_nudge("ls").is_some());
+        assert!(bash_native_blocked("ls", false).is_none());
+        // Repeat — including arg variants that dodge the identical-call
+        // key (`ls` vs `ls -la`) — is blocked with the native tool named.
+        let msg = bash_native_blocked("ls", true).expect("2nd ls blocks");
+        assert!(msg.contains("glob"), "{msg}");
+        let msg = bash_native_blocked("ls -la /tmp", true).expect("arg variant blocks");
+        assert!(msg.contains("glob"), "{msg}");
+        assert!(bash_native_blocked("cat todo.py", true).expect("2nd cat blocks").contains("read"));
+        // Verify/build commands are never redirected, before or after.
+        assert!(bash_native_blocked("cargo test", true).is_none());
+        assert!(bash_native_blocked("git diff --stat HEAD", true).is_none());
+        assert!(bash_native_blocked("cargo test", false).is_none());
+        // `pwd;`-prefixed chains are bare native calls in disguise.
+        assert!(bash_native_nudge("pwd; ls -la").unwrap().contains("native `glob`"));
+        assert!(bash_native_blocked("pwd; ls -la", true).expect("chained ls blocks").contains("glob"));
+        // Piped grep still needs shell; verify compounds are never blocked.
+        assert!(bash_native_nudge("git diff | grep foo").is_none());
+        assert!(bash_native_blocked("cargo test && ls", true).is_none(), "verify compound must run");
+    }
+
+    #[test]
     fn bash_native_nudge_redirects_file_ops() {
         assert!(bash_native_nudge("grep -r foo src").unwrap().contains("native `grep`"));
         assert!(bash_native_nudge("cat src/main.rs").unwrap().contains("native `read`"));
@@ -1560,6 +2001,8 @@ mod loop_key_tests {
         assert!(is_verify_command("pnpm --dir web test && pnpm --dir web build"));
         assert!(is_verify_command("tsc --noEmit"));
         assert!(is_verify_command("pytest -x tests/"));
+        assert!(is_verify_command("python3 -m unittest discover"));
+        assert!(is_verify_command("python3 todo.py selftest"), "custom selftest entrypoint counts");
         assert!(is_verify_command("go test ./..."));
         assert!(!is_verify_command("ls -la"), "listing is not verification");
         assert!(!is_verify_command("cat tsconfig.json"), "tsconfig trap: no bare tsc");
@@ -1871,10 +2314,21 @@ mod guard_tests {
     fn scripted_e2e(
         payloads: Vec<&'static str>,
     ) -> (Router, crate::config::Config, std::sync::Arc<AtomicUsize>) {
+        let (router, cfg, hits, _) = scripted_e2e_capture(payloads);
+        (router, cfg, hits)
+    }
+
+    /// Same, plus captured request bodies for asserting what the loop sent
+    /// (e.g. tools:[] on forced answer rounds).
+    fn scripted_e2e_capture(
+        payloads: Vec<&'static str>,
+    ) -> (Router, crate::config::Config, std::sync::Arc<AtomicUsize>, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = std::sync::Arc::new(AtomicUsize::new(0));
         let hits2 = hits.clone();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let bodies2 = bodies.clone();
         std::thread::spawn(move || {
             for p in payloads {
                 let Ok((mut s, _)) = listener.accept() else { return };
@@ -1899,6 +2353,7 @@ mod guard_tests {
                 if len > 0 && s.read_exact(&mut body).is_err() {
                     return;
                 }
+                bodies2.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
                 hits2.fetch_add(1, Ordering::SeqCst);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1930,7 +2385,7 @@ mod guard_tests {
             ..Default::default()
         };
         let router = Router::new(&cfg).unwrap();
-        (router, cfg, hits)
+        (router, cfg, hits, bodies)
     }
 
     /// No-progress gate: a fix request ending with zero edits forces action
@@ -2047,6 +2502,108 @@ mod guard_tests {
         );
     }
 
+    /// Identical outputs force an answer round (session de530754: 8x glob
+    /// "(no matches)", 2x identical kb dumps with varied args). Three
+    /// identical tool results in a row strip tools for exactly one round;
+    /// the 4th request must carry `"tools":[]` plus the Answer-round demand.
+    #[tokio::test]
+    async fn identical_outputs_force_answer_round() {
+        fn echo(cmd: &str) -> &'static str {
+            let body = serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "1", "function": {"name": "bash", "arguments": serde_json::json!({"command": cmd}).to_string()}}]}}]});
+            Box::leak(format!("data: {body}\n\n").into_boxed_str())
+        }
+        let (router, cfg, hits, bodies) = scripted_e2e_capture(vec![
+            echo("echo same"),
+            echo("echo  same"),
+            echo("echo same #x"),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all good\"}}]}\n\n",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "check the weather").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 4, "3 tool rounds + 1 forced answer round");
+        assert!(out.text.contains("all good"), "forced round returns its text, got {out:?}");
+        let bodies = bodies.lock().unwrap();
+        // Empty tool lists are omitted from the wire body (not `"tools":[]`),
+        // so assert the absence of tool definitions plus the demand text.
+        assert!(!bodies[3].contains("\"name\":\"bash\""), "4th request must advertise no tools");
+        assert!(bodies[3].contains("Answer round"), "4th request must carry the demand");
+        assert!(bodies[0].contains("\"name\":\"bash\""), "earlier rounds keep tools");
+        let turns = store.turns(&sess.id).unwrap();
+        assert_eq!(turns.iter().filter(|t| t.text.starts_with("[tool result bash]")).count(), 3);
+    }
+
+    /// A non-compliant gateway can still emit tool calls on a tools-stripped
+    /// round (Anthropic would 400 them as undeclared). The loop drops them:
+    /// the 4th scripted call must never execute.
+    #[tokio::test]
+    async fn forced_round_drops_defiant_tool_calls() {
+        fn echo(cmd: &str) -> &'static str {
+            let body = serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "1", "function": {"name": "bash", "arguments": serde_json::json!({"command": cmd}).to_string()}}]}}]});
+            Box::leak(format!("data: {body}\n\n").into_boxed_str())
+        }
+        let (router, cfg, hits, _) = scripted_e2e_capture(vec![
+            echo("echo same"),
+            echo("echo  same"),
+            echo("echo same #x"),
+            echo("echo defiant"),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "check the weather").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 5, "3 tool rounds + held round + empty-final round");
+        assert!(out.text.contains("done"), "turn completes, got {out:?}");
+        let turns = store.turns(&sess.id).unwrap();
+        assert_eq!(turns.iter().filter(|t| t.text.starts_with("[tool result bash]")).count(), 3, "defiant 4th call must not execute");
+    }
+
+    /// Verbatim filler text with continued tooling forces an answer round
+    /// (session de530754: 5x + 4x identical status lines). Outputs differ
+    /// here, so only the text streak can fire.
+    #[tokio::test]
+    async fn identical_filler_text_forces_answer_round() {
+        fn status_call(n: u32) -> &'static str {
+            let body = serde_json::json!({"choices": [{"delta": {"content": "checking status", "tool_calls": [{"index": 0, "id": n.to_string(), "function": {"name": "bash", "arguments": serde_json::json!({"command": format!("echo {n}")}).to_string()}}]}}]});
+            Box::leak(format!("data: {body}\n\n").into_boxed_str())
+        }
+        let (router, cfg, hits, bodies) = scripted_e2e_capture(vec![
+            status_call(1),
+            status_call(2),
+            status_call(3),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done here\"}}]}\n\n",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "check the weather").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 4, "3 tool rounds + 1 forced answer round");
+        assert!(out.text.contains("done here"), "forced round returns its text, got {out:?}");
+        let bodies = bodies.lock().unwrap();
+        assert!(!bodies[3].contains("\"name\":\"bash\""), "4th request must advertise no tools");
+        assert!(bodies[3].contains("Answer round"), "4th request must carry the demand");
+    }
+
     /// Idle-round nudge: 12 mutation-free rounds on a work request prod
     /// the model mid-loop (observable as an `idling…` stage); the turn
     /// still ends through the normal no-progress gate afterwards.
@@ -2083,7 +2640,10 @@ mod guard_tests {
         let (router, cfg, hits) = scripted_e2e(all);
         let dir = tempfile::tempdir().unwrap();
         for i in 0..12 {
-            std::fs::write(dir.path().join(format!("a{i:02}.txt")), "x").unwrap();
+            // Distinct contents: identical outputs across varied reads are
+            // the output-ledger's business (forced answer round), not this
+    // test’s — keep reads distinct so only the idle path fires.
+            std::fs::write(dir.path().join(format!("a{i:02}.txt")), format!("content {i}")).unwrap();
         }
         let ws = dir.path().display().to_string();
         let db = dir.path().join("t.db").display().to_string();
@@ -2171,7 +2731,7 @@ mod compact_tests {
         let msg = Runner::compact_session(&store, &router, &cfg, &id).await.unwrap();
         assert!(msg.starts_with("compacted"), "{msg}");
         let turns = store.turns(&id).unwrap();
-        assert_eq!(turns.len(), 2 + 6 + 1, "kept head+tail+summary, got {}", turns.len());
+        assert_eq!(turns.len(), 2 + 10 + 1, "kept head+tail+summary, got {}", turns.len());
         assert!(turns.last().unwrap().text.contains("Prior context summary"));
     }
 

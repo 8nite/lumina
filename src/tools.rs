@@ -44,6 +44,8 @@ pub struct SecCtx {
     pub allow_tooling_write: bool,
     /// Subagent nesting depth (children may not delegate further).
     pub depth: u8,
+    /// Bubblewrap confinement for `bash` (off by default; see `sandbox`).
+    pub sandbox: crate::sandbox::Profile,
 }
 
 #[derive(Debug, Clone)]
@@ -52,9 +54,16 @@ pub struct Outcome {
     pub truncated: bool,
 }
 
+/// `lsp::query` adapter: (workspace, op, path, line, character, filter)
+/// -> context text. Wired by the agent to the shared `lsp::Manager`;
+/// absent (unit tests) the `lsp` tool fails closed with guidance.
+pub type LspQueryFn = Arc<dyn Fn(&Path, &str, &str, u64, u64, &str) -> Result<String, String> + Send + Sync>;
+
 pub struct Registry {
     /// Attached KB engine (agent wires `kb::query` here; absent → clean error).
     pub kb_query: Option<KbQueryFn>,
+    /// Attached language-server manager (agent wires `lsp::query` here).
+    pub lsp_query: Option<LspQueryFn>,
     /// Explicit KB dir override (colon-separated, from `[kb] memory_dir`).
     /// Empty = rule-md + `LUMINA_MEMORY_DIR` + legacy resolution in `kb`.
     pub kb_memory_dir: String,
@@ -98,7 +107,7 @@ pub type KbQueryFn = Arc<dyn Fn(&Path, &str, usize) -> Result<String, String> + 
 
 impl Registry {
     pub fn new() -> Self {
-        Self { kb_query: None, kb_memory_dir: String::new(), bundle: None, websearch_provider: String::new(), websearch_disabled: false, plugins: None, subagent: None, disabled_tools: HashSet::new() }
+        Self { kb_query: None, lsp_query: None, kb_memory_dir: String::new(), bundle: None, websearch_provider: String::new(), websearch_disabled: false, plugins: None, subagent: None, disabled_tools: HashSet::new() }
     }
 
     pub fn call(
@@ -175,7 +184,8 @@ impl Registry {
             "edit" => do_edit(sc, &args),
             "write" => do_write(sc, &args),
             "bash" | "shell" => do_bash(self, sc, &args),
-            "grep" | "lsp" => do_grep(sc, &args),
+            "grep" => do_grep(sc, &args),
+            "lsp" => do_lsp(self, sc, &args),
             "glob" => do_glob(sc, &args),
             "kb_query" => do_kb_query(self, sc, &args),
             "memory_write" => do_memory_write(self, sc, &args),
@@ -232,7 +242,18 @@ pub(crate) fn tool_target(name: &str, args: &HashMap<String, serde_json::Value>)
             if t.is_empty() { String::new() } else { format!("memory/{t}") }
         }
         "bash" | "shell" => s(&["command", "cmd"]),
-        "grep" | "lsp" => s(&["pattern", "query"]),
+        "grep" => s(&["pattern", "query"]),
+        "lsp" => {
+            let t = s(&["path", "file", "target"]);
+            let op = s(&["op"]);
+            if op.is_empty() {
+                t
+            } else if t.is_empty() {
+                op
+            } else {
+                format!("{t}:{op}")
+            }
+        }
         "glob" => s(&["pattern", "glob"]),
         "skill" => s(&["name", "skill"]),
         "kb_query" => s(&["query", "q"]),
@@ -516,8 +537,11 @@ fn do_bash(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value
         let slot = task_slot(&id);
         let session = sc.session.clone();
         let id2 = id.clone();
+        let sandbox = sc.sandbox.clone();
+        let dir2 = dir.clone();
+        let ws = sc.workspace.clone();
         std::thread::spawn(move || {
-            let out = match exec_bash(&cmd_str, &dir, &session, &extra_env, timeout, false) {
+            let out = match exec_bash(&cmd_str, &dir2, &session, &extra_env, timeout, false, &ws, &sandbox) {
                 Ok(s) => s,
                 Err(e) => format!("error: {e}"),
             };
@@ -525,7 +549,7 @@ fn do_bash(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value
         });
         return Ok(Outcome { output: format!("started background task {id} (poll with task_output)"), truncated: false });
     }
-    exec_bash(&cmd_str, &dir, &sc.session, &extra_env, timeout, true).map(cap)
+    exec_bash(&cmd_str, &dir, &sc.session, &extra_env, timeout, true, &sc.workspace, &sc.sandbox).map(cap)
 }
 
 /// Synchronous shell run shared by foreground `bash` and background tasks.
@@ -537,16 +561,24 @@ fn exec_bash(
     extra_env: &[(String, String)],
     timeout: Option<Duration>,
     kill_on_stop: bool,
+    sandbox_root: &Path,
+    sandbox: &crate::sandbox::Profile,
 ) -> Result<String, ToolError> {
     // Per-session TMPDIR hygiene (cleaned on session.deleted). Ensure the
     // dir exists so tools (and test suites run via bash) can use it.
     let tmpdir = std::env::temp_dir().join(format!("lumina-ses-{session}"));
     let _ = std::fs::create_dir_all(&tmpdir);
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c")
-        .arg(cmd_str)
-        .current_dir(workspace)
-        .env("TMPDIR", tmpdir)
+    let mut cmd = if sandbox.enabled {
+        // Fail closed: no silent unsandboxed fallback. The workspace root
+        // for binds is the session workspace (the fence already confined
+        // `dir` inside it or an explicit allowlist).
+        crate::sandbox::wrap(sandbox, sandbox_root, workspace, &tmpdir, cmd_str).map_err(ToolError::Msg)?
+    } else {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(cmd_str).current_dir(workspace);
+        cmd
+    };
+    cmd.env("TMPDIR", &tmpdir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     for (k, v) in extra_env {
@@ -824,6 +856,31 @@ fn do_grep(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Out
         }
     });
     Ok(Outcome { output: out.join("\n"), truncated: out.len() >= limit })
+}
+
+/// Semantic code intelligence via the workspace language server
+/// (`src/lsp.rs`): `op` is `symbols | definition | references |
+/// diagnostics`, `path` a workspace-relative file, `line`/`character`
+/// 1-based (0/0 = start of file), `query` an optional symbol-name filter.
+/// Credential files are refused like `read` (servers get full file text).
+fn do_lsp(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
+    let f = match &reg.lsp_query {
+        Some(f) => f,
+        None => return Err(ToolError::Msg("lsp: no language-server manager (agent wires one per turn)".into())),
+    };
+    let op = str_arg(args, &["op"]);
+    let path = str_arg(args, &["path", "file", "target"]);
+    if path.is_empty() {
+        return Err(ToolError::Msg("lsp: missing `path` (workspace-relative file)".into()));
+    }
+    if crate::security::is_credential_path(&path) {
+        return Err(ToolError::Denied("lsp: credential file".into()));
+    }
+    let line = int_arg_any(args, &["line", "row"], 0);
+    let character = int_arg_any(args, &["character", "col", "column"], 0);
+    let filter = str_arg(args, &["query", "filter", "pattern"]);
+    let text = f(&sc.workspace, &op, &path, line, character, &filter).map_err(ToolError::Msg)?;
+    Ok(Outcome { output: text, truncated: false })
 }
 
 fn do_glob(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Outcome, ToolError> {
@@ -1392,7 +1449,7 @@ mod tests {
     use super::*;
 
     fn ctx(dir: &Path, agent: Agent, mode: PermissionMode) -> SecCtx {
-        SecCtx { workspace: dir.to_path_buf(), session: "t".into(), agent, mode, headless: true, gate: ApprovalGate::default(), bash_rules: HashMap::new(), allow_tooling_write: false, depth: 0 }
+        SecCtx { workspace: dir.to_path_buf(), session: "t".into(), agent, mode, headless: true, gate: ApprovalGate::default(), bash_rules: HashMap::new(), allow_tooling_write: false, depth: 0, sandbox: Default::default() }
     }
 
     fn args(pairs: &[(&str, &str)]) -> HashMap<String, serde_json::Value> {
@@ -1491,6 +1548,47 @@ mod tests {
         let err = reg.call(&sc, "read", &args(&[("path", "../secret")])).unwrap_err();
         assert!(matches!(err, ToolError::Denied(_)), "{err}");
     }
+
+    #[test]
+    fn sandbox_disabled_by_default_runs_direct() {
+        // No [sandbox] section: plain `sh -c`, byte-for-byte old behavior.
+        let d = tempfile::tempdir().unwrap();
+        let sc = ctx(d.path(), Agent::Build, PermissionMode::Bypass);
+        assert!(!sc.sandbox.enabled);
+        let out = exec_bash("echo hi", d.path(), "t", &[], Some(Duration::from_secs(10)), true, d.path(), &sc.sandbox).unwrap();
+        assert!(out.contains("hi"), "{out}");
+    }
+
+    #[test]
+    fn sandbox_missing_binary_fails_closed() {
+        // Enabled but no binary: hard error, never a silent direct run.
+        let d = tempfile::tempdir().unwrap();
+        let prof = crate::sandbox::Profile { enabled: true, network: false, command: "definitely-not-bwrap-xyz".into() };
+        let err = exec_bash("echo hi", d.path(), "t", &[], Some(Duration::from_secs(10)), true, d.path(), &prof).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("No such file") || s.contains("not found"), "{s}");
+    }
+
+    #[test]
+    fn sandbox_live_confines_home() {
+        // Where user namespaces work, `ls $HOME` must fail inside the
+        // sandbox (HOME is deliberately unbound). Where they don't
+        // (locked-down containers), bwrap fails loudly — that path is a
+        // skip (structural fail-closed is proven by
+        // missing_binary_fails_closed). This test fails ONLY on
+        // demonstrated leakage: a successful home listing.
+        let d = tempfile::tempdir().unwrap();
+        let prof = crate::sandbox::Profile { enabled: true, network: false, command: "bwrap".into() };
+        let out = exec_bash("ls \"$HOME\"", d.path(), "t-live", &[], Some(Duration::from_secs(30)), true, d.path(), &prof);
+        match out {
+            Ok(text) => {
+                assert!(text.contains("[exit ") || text.to_lowercase().contains("no such file"), "HOME leaked into sandbox: {text}");
+            }
+            Err(e) => {
+                eprintln!("skip: sandbox unavailable here ({e})");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1502,6 +1600,7 @@ mod extended_tests {
             workspace: dir.to_path_buf(), session: "t".into(), agent: Agent::Build,
             mode: PermissionMode::Bypass, headless: true, gate: ApprovalGate::default(),
             bash_rules: HashMap::new(), allow_tooling_write: false, depth: 0,
+            sandbox: Default::default(),
         }
     }
 
@@ -1687,12 +1786,35 @@ mod extended_tests {
         // shell runs like bash.
         let out = reg.call(&ctx2(d.path()), "shell", &args(&[("command", "echo hi")])).unwrap();
         assert!(out.output.contains("hi"), "{}", out.output);
-        // lsp greps like grep.
-        let out = reg.call(&ctx2(d.path()), "lsp", &args(&[("pattern", "hello")])).unwrap();
-        assert!(out.output.contains("a.txt"), "{}", out.output);
-        // tool_target mirrors the alias.
+        // lsp without a wired manager fails closed with guidance.
+        let err = reg.call(&ctx2(d.path()), "lsp", &args(&[("path", "a.txt"), ("op", "symbols")])).unwrap_err();
+        assert!(err.to_string().contains("manager"), "{err}");
+        // tool_target names the file and op.
         assert_eq!(tool_target("shell", &args(&[("command", "echo hi")])), "echo hi");
-        assert_eq!(tool_target("lsp", &args(&[("pattern", "hello")])), "hello");
+        assert_eq!(tool_target("lsp", &args(&[("path", "a.txt"), ("op", "symbols")])), "a.txt:symbols");
+    }
+
+    #[test]
+    fn lsp_forwards_args_to_manager() {
+        let d = tempfile::tempdir().unwrap();
+        let mut reg = Registry::new();
+        reg.lsp_query = Some(Arc::new(|ws, op, path, line, ch, filter| {
+            Ok(format!("{op}|{}|{path}|{line}|{ch}|{filter}", ws.display()))
+        }));
+        let out = reg
+            .call(
+                &ctx2(d.path()),
+                "lsp",
+                &args(&[("op", "definition"), ("path", "a.rs"), ("line", "3"), ("character", "5"), ("query", "foo")]),
+            )
+            .unwrap();
+        let ws = d.path().display().to_string();
+        assert_eq!(out.output, format!("definition|{ws}|a.rs|3|5|foo"), "{}", out.output);
+        // Credential files are refused before reaching the server.
+        let err = reg
+            .call(&ctx2(d.path()), "lsp", &args(&[("path", ".env"), ("op", "symbols")]))
+            .unwrap_err();
+        assert!(err.to_string().contains("denied"), "{err}");
     }
 
     #[test]

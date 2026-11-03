@@ -58,6 +58,39 @@ pub struct Chunk {
 pub struct Usage {
     pub input: u32,
     pub output: u32,
+    /// Prompt tokens served from provider prefix cache (Anthropic
+    /// cache_read_input_tokens, OpenAI prompt_tokens_details.cached_tokens).
+    /// Carried separately so cost math can price them at cache rates.
+    pub cache_read: u32,
+    /// Prompt tokens written to the provider cache on this request
+    /// (Anthropic cache_creation_input_tokens). Zero on most providers.
+    pub cache_write: u32,
+}
+
+impl Usage {
+    pub fn add(&mut self, o: &Usage) {
+        self.input = self.input.saturating_add(o.input);
+        self.output = self.output.saturating_add(o.output);
+        self.cache_read = self.cache_read.saturating_add(o.cache_read);
+        self.cache_write = self.cache_write.saturating_add(o.cache_write);
+    }
+}
+
+/// Extract cached-token counts from an OpenAI-style `usage` object.
+/// Providers disagree on the key (`cached_tokens` under
+/// `prompt_tokens_details`, flat `prompt_cache_hit_tokens`, …) — accept all.
+pub fn openai_cached_tokens(u: &serde_json::Value) -> (u32, u32) {
+    let mut read = 0u32;
+    let mut write = 0u32;
+    if let Some(d) = u.get("prompt_tokens_details") {
+        read = read.saturating_add(d.get("cached_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+    }
+    // Some gateways flatten the detail one level up.
+    read = read.saturating_add(u.get("cached_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+    read = read.saturating_add(u.get("prompt_cache_hit_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+    read = read.saturating_add(u.get("prefix_cached_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+    write = write.saturating_add(u.get("prompt_cache_miss_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+    (read, write)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -807,9 +840,15 @@ async fn chat_openai(
                 Err(_) => continue,
             };
             if let Some(u) = v.get("usage") {
-                // Frames repeat per chunk: sum, don't overwrite.
-                usage.input = usage.input.saturating_add(u.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
-                usage.output = usage.output.saturating_add(u.get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+                // `stream_options.include_usage` repeats totals per frame on
+                // some gateways; only the growth counts. Cached counts ride
+                // inside the same object — track maxima, not sums.
+                usage.input = usage.input.max(u.get("prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+                usage.output = usage.output.max(u.get("completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+                // OpenAI prefix caching: cached tokens ride inside usage.
+                let (cr, cw) = openai_cached_tokens(u);
+                usage.cache_read = usage.cache_read.max(cr);
+                usage.cache_write = usage.cache_write.max(cw);
             }
             let Some(choice) = v.get("choices").and_then(|c| c.get(0)) else {
                 continue;
@@ -889,12 +928,21 @@ async fn chat_anthropic(
         .map(|m| m.content.as_str())
         .collect();
     // Vision rides EVERY user turn as content blocks (anthropic.go parity).
-    let messages: Vec<_> = req
-        .messages
+    let non_system: Vec<&Message> = req.messages.iter().filter(|m| m.role != "system").collect();
+    let last_user_pos = non_system.iter().rposition(|m| m.role == "user");
+    let messages: Vec<_> = non_system
         .iter()
-        .filter(|m| m.role != "system")
-        .map(|m| {
+        .enumerate()
+        .map(|(i, m)| {
             if m.role != "user" || req.images.is_empty() {
+                if Some(i) == last_user_pos {
+                    // Prompt-caching breakpoint: the stable prefix
+                    // (system + history) is served from cache; only the
+                    // growing suffix is billed at full input rates. Mark
+                    // the last user block so prefix-cache hits apply.
+                    return serde_json::json!({"role": m.role, "content": [
+                        {"type": "text", "text": m.content, "cache_control": {"type": "ephemeral"}}]});
+                }
                 return serde_json::json!({"role": m.role, "content": m.content});
             }
             let mut parts = vec![serde_json::json!({"type": "text", "text": m.content})];
@@ -902,6 +950,9 @@ async fn chat_anthropic(
                 let mt = if im.media_type.is_empty() { "image/png" } else { im.media_type.as_str() };
                 parts.push(serde_json::json!({"type": "image",
                     "source": {"type": "base64", "media_type": mt, "data": im.data}}));
+            }
+            if Some(i) == last_user_pos {
+                parts.push(serde_json::json!({"type": "text", "text": "", "cache_control": {"type": "ephemeral"}}));
             }
             serde_json::json!({"role": "user", "content": parts})
         })
@@ -919,13 +970,23 @@ async fn chat_anthropic(
         "stream": true,
     });
     if !system.is_empty() {
-        body["system"] = serde_json::json!(system);
+        // System is the most stable prefix: always a cache breakpoint.
+        body["system"] = serde_json::json!([{"type": "text", "text": system,
+            "cache_control": {"type": "ephemeral"}}]);
     }
     if !req.tools.is_empty() {
-        body["tools"] = serde_json::json!(req.tools.iter().map(|t|
+        let mut tools: Vec<serde_json::Value> = req.tools.iter().map(|t|
             serde_json::json!({"name": t.name, "description": t.description,
                 "input_schema": if t.schema.is_null() { serde_json::json!({"type":"object"}) } else { t.schema.clone() }})
-        ).collect::<Vec<_>>());
+        ).collect();
+        // Tools are stable across the turn: cache them too (last tool
+        // carries the breakpoint — Anthropic allows up to 4).
+        if let Some(last) = tools.last_mut() {
+            if let Some(o) = last.as_object_mut() {
+                o.insert("cache_control".into(), serde_json::json!({"type": "ephemeral"}));
+            }
+        }
+        body["tools"] = serde_json::Value::Array(tools);
     }
     if budget > 0 {
         body["thinking"] =
@@ -1015,12 +1076,17 @@ async fn chat_anthropic(
                 }
                 "message_delta" => {
                     if let Some(u) = v.get("usage") {
-                        usage.output = u.get("output_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+                        usage.output = usage.output.max(u.get("output_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
                     }
                 }
                 "message_start" => {
                     if let Some(m) = v.get("message").and_then(|m| m.get("usage")) {
-                        usage.input = m.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+                        usage.input = usage.input.max(m.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+                        // Anthropic prompt caching: creation + read counts.
+                        usage.cache_write = usage.cache_write.max(
+                            m.get("cache_creation_input_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
+                        usage.cache_read = usage.cache_read.max(
+                            m.get("cache_read_input_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32);
                     }
                 }
                 // Per-block tool emission (anthropic.go parity): a finished
@@ -1446,6 +1512,21 @@ async fn chat_responses(
                     }
                 }
                 "response.completed" | "response.incomplete" | "response.failed" => {
+                    // Responses API terminal usage (input/output + cached).
+                    if let Some(u) = v.get("response").and_then(|r| r.get("usage")) {
+                        let (cr, cw) = openai_cached_tokens(u);
+                        let cached_detail = u.get("input_tokens_details")
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(|n| n.as_u64()).unwrap_or(0) as u32;
+                        let ru = Usage {
+                            input: u.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+                            output: u.get("output_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+                            cache_read: cr.max(cached_detail),
+                            cache_write: cw,
+                        };
+                        flush_openai_calls(&mut pending, &tx);
+                        return Ok(ru);
+                    }
                     if !pending.is_empty() {
                         let mut idxs: Vec<u32> = pending.keys().copied().collect();
                         idxs.sort();
@@ -1479,6 +1560,26 @@ mod tests {
     fn split_model_shapes() {
         assert_eq!(split_model("openrouter/deepseek-r1"), ("openrouter".into(), "deepseek-r1".into()));
         assert_eq!(split_model("qwen"), ("".into(), "qwen".into()));
+    }
+
+    #[test]
+    fn usage_add_saturates_cache_counters() {
+        let mut a = Usage { input: 10, output: 5, cache_read: u32::MAX, cache_write: 1 };
+        a.add(&Usage { input: 1, output: 2, cache_read: 7, cache_write: 3 });
+        assert_eq!((a.input, a.output), (11, 7));
+        assert_eq!(a.cache_read, u32::MAX, "saturating, never wraps");
+        assert_eq!(a.cache_write, 4);
+    }
+
+    #[test]
+    fn openai_cached_tokens_accepts_gateway_variants() {
+        let v = serde_json::json!({"prompt_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 60}});
+        assert_eq!(openai_cached_tokens(&v), (60, 0));
+        let v = serde_json::json!({"prompt_cache_hit_tokens": 25});
+        assert_eq!(openai_cached_tokens(&v), (25, 0));
+        let v = serde_json::json!({"prompt_tokens": 100});
+        assert_eq!(openai_cached_tokens(&v), (0, 0));
     }
 
     #[test]

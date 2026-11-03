@@ -42,6 +42,9 @@ pub struct AppState {
     /// Monotonic SSE sequence number: clients detect dropped (lagged)
     /// broadcast events by gaps and refetch /api/state to reconcile.
     pub seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared language-server manager: servers persist for daemon lifetime,
+    /// cloned into each per-turn Runner (never rebuilt per turn).
+    pub lsp: Arc<crate::lsp::Manager>,
 }
 
 impl AppState {
@@ -67,6 +70,7 @@ impl AppState {
             }
             let _ = tx.send(v);
         }));
+        let lsp = Arc::new(crate::lsp::Manager::new(cfg.lsp.clone()));
         Self {
             gate: ApprovalGate::new(events.clone()),
             store: Arc::new(store),
@@ -80,6 +84,7 @@ impl AppState {
             sweeper: KbSweeper::new(),
             cfg_path,
             seq,
+            lsp,
         }
     }
 
@@ -183,6 +188,10 @@ struct SessionView {
     permission_mode: String,
     model: String,
     title: String,
+    tokens_input: i64,
+    tokens_output: i64,
+    tokens_cache_read: i64,
+    tokens_cache_write: i64,
 }
 
 fn view(s: &crate::store::Session) -> SessionView {
@@ -194,6 +203,10 @@ fn view(s: &crate::store::Session) -> SessionView {
         permission_mode: s.permission_mode.clone(),
         model: s.model.clone(),
         title: s.title.clone(),
+        tokens_input: s.tokens_input,
+        tokens_output: s.tokens_output,
+        tokens_cache_read: s.tokens_cache_read,
+        tokens_cache_write: s.tokens_cache_write,
     }
 }
 
@@ -452,6 +465,7 @@ async fn prompt(
     }
     let mut runner = Runner::new();
     runner.approval = Some(st.gate.clone());
+    runner.lsp = st.lsp.clone();
     // Workspace plugin worker (started on demand, cached per workspace).
     if let Ok(Some(sess)) = st.store.get_session(&id) {
         let host = st.plugins.host_for(std::path::Path::new(&sess.workspace_dir));
@@ -519,6 +533,7 @@ async fn prompt(
         }
         let mut runner2 = Runner::new();
         runner2.approval = Some(st2.gate.clone());
+        runner2.lsp = st2.lsp.clone();
         if let Ok(Some(sess)) = st2.store.get_session(&id2) {
             let host = st2.plugins.host_for(std::path::Path::new(&sess.workspace_dir));
             if !host.is_empty() {
@@ -679,17 +694,17 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: Que
     let tx3 = tx.clone();
     let sid3 = sid.clone();
     let mut on_event = |d: &str, t: &str| {
-        let _ = tx.send(ev("turn.delta", &sid, serde_json::json!({"delta": d, "thinking": t})));
+        let _ = tx.send(ev("turn.delta", &sid, serde_json::json!({"delta": d, "thinking": t, "elapsed_ms": started.elapsed().as_millis() as u64})));
     };
     let mut on_stage = |stage: &str| {
-        let _ = tx2.send(ev("turn.progress", &sid2, serde_json::json!({"stage": stage})));
+        let _ = tx2.send(ev("turn.progress", &sid2, serde_json::json!({"stage": stage, "elapsed_ms": started.elapsed().as_millis() as u64})));
     };
     let mut on_tool = |tool: crate::agent::ToolEvent| match tool {
         crate::agent::ToolEvent::Start { name, target } => {
-            let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "start", "tool": name, "target": target})));
+            let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "start", "tool": name, "target": target, "elapsed_ms": started.elapsed().as_millis() as u64})));
         }
         crate::agent::ToolEvent::Done { name, target, preview, error, duration_ms } => {
-            let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "done", "tool": name, "target": target, "preview": preview, "error": error, "duration_ms": duration_ms})));
+            let _ = tx3.send(ev("turn.tool", &sid3, serde_json::json!({"phase": "done", "tool": name, "target": target, "preview": preview, "error": error, "duration_ms": duration_ms, "elapsed_ms": started.elapsed().as_millis() as u64})));
         }
     };
     // Claim heartbeat: refresh our ownership while the turn runs so a
@@ -739,6 +754,7 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: Que
         st.emit(ev("turn.completed", id, serde_json::json!({
             "text": crate::agent::STOPPED_TEXT, "model": "", "duration_ms": ms,
             "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
             "context_tokens": 0, "max_tokens": 0,
         })));
         standing_ops(st, id);
@@ -751,6 +767,7 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: Que
             st.emit(ev("turn.completed", id, serde_json::json!({
                 "text": outcome.text, "model": model, "duration_ms": ms,
                 "input_tokens": outcome.usage.input, "output_tokens": outcome.usage.output,
+                "cache_read_tokens": outcome.usage.cache_read, "cache_write_tokens": outcome.usage.cache_write,
                 "context_tokens": used, "max_tokens": max,
             })));
             st.emit(ev("turn.context", id, serde_json::json!({"context_tokens": used, "max_tokens": max})));

@@ -179,6 +179,104 @@ function renderBlocks(text: string, kid: string, onFile?: (t: FileTarget) => voi
   return renderProse(text, kid, onFile);
 }
 
+// GFM tables: header row + delimiter row (`|---|---|`, colons set
+// alignment) + body rows. Only a delimiter row promotes preceding pipes
+// to a table, so stray `a | b` prose stays a paragraph. Code spans are
+// pipe-safe (`` `a|b` `` never splits). Exported for unit testing.
+export function splitRow(line: string): string[] | null {
+  if (!line.includes('|')) return null;
+  const cells: string[] = [];
+  let cur = '';
+  let inCode = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '`' && line[i - 1] !== '\\') {
+      inCode = !inCode;
+      cur += ch;
+      continue;
+    }
+    if (ch === '\\' && line[i + 1] === '|') {
+      cur += '|';
+      i++;
+      continue;
+    }
+    if (ch === '|' && !inCode) {
+      cells.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  cells.push(cur);
+  // Strip the empty cells from optional outer pipes: `| a |` -> ["", " a ", ""].
+  if (cells.length > 0 && cells[0].trim() === '') cells.shift();
+  if (cells.length > 0 && cells[cells.length - 1].trim() === '') cells.pop();
+  if (cells.length === 0) return null;
+  return cells.map((c) => c.trim());
+}
+
+type Align = 'left' | 'center' | 'right';
+
+export function delimAlign(cells: string[]): Align[] | null {
+  if (cells.length === 0) return null;
+  const out: Align[] = [];
+  for (const c of cells) {
+    const m = /^\s*(:?)-+(:?)\s*$/.exec(c);
+    if (!m) return null;
+    out.push(m[1] && m[2] ? 'center' : m[2] ? 'right' : 'left');
+  }
+  return out;
+}
+
+const alignCls: Record<Align, string> = {
+  left: 'text-left',
+  center: 'text-center',
+  right: 'text-right',
+};
+
+const cellBorder = 'border border-[var(--v2-border-base)] px-2 py-1 align-top';
+
+function renderTable(
+  head: string[],
+  align: Align[],
+  body: string[][],
+  kid: string,
+  onFile?: (t: FileTarget) => void,
+): React.ReactNode {
+  const width = head.length;
+  const norm = (cells: string[]) => {
+    const row = cells.slice(0, width);
+    while (row.length < width) row.push('');
+    return row;
+  };
+  return (
+    <div key={kid} className="my-1 overflow-x-auto">
+      <table className="w-full border-collapse text-[12px] leading-relaxed">
+        <thead>
+          <tr className="bg-white/[0.04]">
+            {head.map((h, i) => (
+              <th key={`${kid}-h${i}`} className={`${cellBorder} ${alignCls[align[i]]} font-semibold`}>
+                {renderInline(h, `${kid}-h${i}`, onFile)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {body.map((row, r) => (
+            <tr key={`${kid}-r${r}`} className={r % 2 === 1 ? 'bg-white/[0.02]' : undefined}>
+              {norm(row).map((c, i) => (
+                <td key={`${kid}-r${r}c${i}`} className={`${cellBorder} ${alignCls[align[i]]}`}>
+                  {renderInline(c, `${kid}-r${r}c${i}`, onFile)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function renderProse(text: string, kid: string, onFile?: (t: FileTarget) => void): React.ReactNode[] {
   const lines = text.split('\n');
   const out: React.ReactNode[] = [];
@@ -194,7 +292,8 @@ function renderProse(text: string, kid: string, onFile?: (t: FileTarget) => void
       para = [];
     }
   };
-  for (const line of lines) {
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
     const hm = /^(#{1,4})\s+(.*)$/.exec(line);
     if (hm) {
       flush();
@@ -220,6 +319,28 @@ function renderProse(text: string, kid: string, onFile?: (t: FileTarget) => void
     if (line.trim() === '') {
       flush();
       continue;
+    }
+    // GFM table: header row + delimiter row, then consecutive pipe rows.
+    // The delimiter must match the header width, so `| a | b |` prose
+    // without a delimiter stays a paragraph.
+    const head = splitRow(line);
+    if (head && head.length > 0 && li + 1 < lines.length) {
+      const delim = splitRow(lines[li + 1]);
+      const align = delim && delim.length === head.length ? delimAlign(delim) : null;
+      if (align) {
+        const body: string[][] = [];
+        let lj = li + 2;
+        while (lj < lines.length && lines[lj].trim() !== '') {
+          const cells = splitRow(lines[lj]);
+          if (!cells || cells.length === 0) break;
+          body.push(cells);
+          lj++;
+        }
+        flush();
+        out.push(renderTable(head, align, body, `${kid}-t${k++}`, onFile));
+        li = lj - 1;
+        continue;
+      }
     }
     para.push(line);
   }

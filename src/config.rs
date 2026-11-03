@@ -103,6 +103,21 @@ pub struct WebSearchConfig {
     pub disabled: bool,
 }
 
+/// Bubblewrap confinement for the `bash` tool (`src/sandbox.rs`).
+/// Default OFF: sandboxing only engages with explicit opt-in.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SandboxConfig {
+    /// Master switch. Off = current behavior, byte for byte.
+    #[serde(default)]
+    pub enabled: bool,
+    /// When true the sandbox keeps host networking (cargo fetch, npm…).
+    #[serde(default)]
+    pub network: bool,
+    /// Sandbox binary (default `bwrap`). Must be a bare path.
+    #[serde(default)]
+    pub command: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KbConfig {
     #[serde(default = "default_idle")]
@@ -122,6 +137,21 @@ fn default_idle() -> u64 {
     15
 }
 
+/// Language-server wiring for the `lsp` tool (`src/lsp.rs`). Servers are
+/// spawned lazily per workspace root and language; a missing binary fails
+/// the single tool call with an install hint, never the turn.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LspConfig {
+    /// Kill-switch: when true the `lsp` tool is removed from the tool list.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Per-language server command line, e.g. `rust = "rust-analyzer"`,
+    /// `typescript = "typescript-language-server --stdio"`. Unset languages
+    /// use the built-in defaults.
+    #[serde(default)]
+    pub commands: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 struct RawConfig {
     #[serde(default)]
@@ -136,6 +166,10 @@ struct RawConfig {
     router: RouterConfig,
     #[serde(default)]
     kb: KbConfig,
+    #[serde(default)]
+    lsp: LspConfig,
+    #[serde(default)]
+    sandbox: SandboxConfig,
     #[serde(default)]
     websearch: WebSearchConfig,
     /// `[permissions] edit="allow"` plus nested `[permissions.bash]` table.
@@ -152,6 +186,8 @@ pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
     pub router: RouterConfig,
     pub kb: KbConfig,
+    pub lsp: LspConfig,
+    pub sandbox: SandboxConfig,
     pub websearch: WebSearchConfig,
     pub permissions: HashMap<String, String>,
     pub permissions_bash: HashMap<String, String>,
@@ -189,6 +225,8 @@ impl Config {
             cfg.providers = raw.providers;
             cfg.router = raw.router;
             cfg.kb = raw.kb;
+            cfg.lsp = raw.lsp;
+            cfg.sandbox = raw.sandbox;
             cfg.websearch = raw.websearch;
             for (k, v) in raw.permissions {
                 if k == "bash" {
@@ -460,6 +498,30 @@ mod tests {
         assert!(!cfg2.websearch.disabled);
         assert!(!cfg2.kb.auto_commit_ast_hook);
         assert!(cfg2.kb.memory_dir.is_empty());
+    }
+
+    #[test]
+    fn lsp_section_parses() {
+        let f = write_tmp("[lsp]\ndisabled = true\n[lsp.commands]\nrust = \"rust-analyzer\"\n");
+        let cfg = Config::load(Some(f.path().into())).unwrap();
+        assert!(cfg.lsp.disabled);
+        assert_eq!(cfg.lsp.commands.get("rust").map(|s| s.as_str()), Some("rust-analyzer"));
+        let cfg2 = Config::load(Some(write_tmp("").path().into())).unwrap();
+        assert!(!cfg2.lsp.disabled);
+        assert!(cfg2.lsp.commands.is_empty());
+    }
+
+    #[test]
+    fn sandbox_section_parses() {
+        let f = write_tmp("[sandbox]\nenabled = true\nnetwork = true\ncommand = \"/usr/bin/bwrap\"\n");
+        let cfg = Config::load(Some(f.path().into())).unwrap();
+        assert!(cfg.sandbox.enabled);
+        assert!(cfg.sandbox.network);
+        assert_eq!(cfg.sandbox.command, "/usr/bin/bwrap");
+        let cfg2 = Config::load(Some(write_tmp("").path().into())).unwrap();
+        assert!(!cfg2.sandbox.enabled);
+        assert!(!cfg2.sandbox.network);
+        assert!(cfg2.sandbox.command.is_empty());
     }
 }
 

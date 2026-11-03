@@ -10,10 +10,12 @@ mod copilot;
 mod harness;
 mod kb;
 mod llm;
+mod lsp;
 mod mcp;
 mod plugins;
 mod pty;
 mod rules;
+mod sandbox;
 mod sdk;
 mod security;
 mod server;
@@ -325,6 +327,7 @@ async fn main() -> MainResult {
                 std::process::exit(64);
             }
             let mut runner = Runner::new();
+            runner.set_lsp(cfg.lsp.clone());
             {
                 let files = plugins::discover(std::path::Path::new(&sess.workspace_dir), false);
                 if !files.is_empty() {
