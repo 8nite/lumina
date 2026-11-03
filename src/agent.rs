@@ -458,11 +458,12 @@ impl Runner {
         // 16x identical todowrite, 8x identical glob-no-matches, 5x+4x
         // verbatim filler text — all with VARIED calls/args, so the
         // identical-call key never fired. Three ledgers close the gap:
-        // identical OUTPUTS (any tool), todowrite re-plan count, and
-        // identical assistant TEXT. Output/text repeats force a
-        // tools-stripped answer round (max 2/turn); todowrite blocks.
+        // identical OUTPUTS (any tool), consecutive-identical todowrite
+        // results, and identical assistant TEXT. Output/text repeats force
+        // a tools-stripped answer round (max 2/turn); todowrite blocks.
         let mut out_counts: HashMap<u64, usize> = HashMap::new();
-        let mut todowrite_calls = 0usize;
+        let mut todowrite_streak = 0usize;
+        let mut todowrite_last = 0u64;
         let mut text_hash = 0u64;
         let mut text_streak = 0usize;
         let mut forced_answers = 0u8;
@@ -789,12 +790,13 @@ impl Runner {
                             }
                             bash_native_blocked(&crate::tools::tool_target(&tc.name, &args), bash_nudged)
                         })
-                        // todowrite re-plan budget (session de530754: 16x
-                        // todowrite with zero progress). Re-planning is
-                        // pre-execution visible, so this actually blocks —
-                        // unlike the output ledger below, which can only
-                        // react after the (wasted) run.
-                        .or_else(|| todowrite_guard(&tc.name, todowrite_calls));
+                        // todowrite consecutive-identical guard (session
+                        // de530754: 16x identical). Unlike the output ledger
+                        // below (which can only react post-run), a streak of
+                        // 7 identical results is pre-execution visible, so the
+                        // 8th identical call never executes. Status flips
+                        // reset the streak — only no-progress repeats block.
+                        .or_else(|| todowrite_guard(&tc.name, todowrite_streak));
                     was_blocked = blocked.is_some();
                     subagent_ran = tc.name.eq_ignore_ascii_case("subagent") && blocked.is_none();
                     let t0 = std::time::Instant::now();
@@ -887,13 +889,19 @@ impl Runner {
                         bash_nudged = true;
                     }
                 }
-                // todowrite re-plan ledger (session de530754: 16x todowrite,
-                // "Todos updated: 0/3", zero progress). Advisory on the 4th,
-                // hard block from the 6th (see todowrite_guard); the count
-                // only advances on executed calls.
+                // todowrite consecutive-identical ledger: status flips
+                // (0/4 -> 1/4) reset the streak; only back-to-back repeats
+                // advance it. Advisory on the 4th, hard block from the 8th
+                // (see todowrite_guard); streak advances on executed calls.
                 if tc.name.eq_ignore_ascii_case("todowrite") && !was_blocked {
-                    todowrite_calls += 1;
-                    if let Some(nudge) = todowrite_nudge(todowrite_calls) {
+                    let h = output_key(&rendered);
+                    if todowrite_streak > 0 && h == todowrite_last {
+                        todowrite_streak += 1;
+                    } else {
+                        todowrite_streak = 1;
+                        todowrite_last = h;
+                    }
+                    if let Some(nudge) = todowrite_nudge(todowrite_streak) {
                         rendered.push_str(&nudge);
                     }
                 }
@@ -945,7 +953,7 @@ impl Runner {
                     // outputs are stale once the tree changes.
                     seen.clear();
                     out_counts.clear();
-                    todowrite_calls = 0;
+                    todowrite_streak = 0;
                     text_streak = 0;
                     let target = crate::tools::tool_target(&tc.name, &args);
                     if !target.is_empty() {
@@ -1386,24 +1394,27 @@ fn read_repeat_blocked(tool: &str, target: &str, n_before: usize) -> Option<Stri
     ))
 }
 
-/// todowrite re-plan ledger (session de530754: 16x todowrite, "Todos
-/// updated: 0/3", zero progress — the same 43-re-plan shape as stuck
-/// session 7614829e). Advisory on the 4th executed call, hard block
-/// from the 6th: re-planning without acting never converges.
-fn todowrite_nudge(n: usize) -> Option<String> {
-    if n != 4 {
+/// todowrite consecutive-identical ledger (session de530754: 16x
+/// identical "Todos updated: 0/4", zero progress — the same re-plan shape
+/// as stuck session 7614829e). Advisory on the 4th consecutive identical
+/// result, hard block from the 8th. Consecutive-identical, NOT absolute
+/// count: legit status flips (0/4 -> 1/4 -> 2/4 as subtasks complete, seen
+/// live in session 265e3298) reset the streak and are never blocked —
+/// identical output carries no new information by definition.
+fn todowrite_nudge(streak: usize) -> Option<String> {
+    if streak != 4 {
         return None;
     }
-    Some("\n\nLoop guard: 4 todowrite updates this turn — execute the list (read/grep/edit/bash) instead of re-planning it.".into())
+    Some("\n\nLoop guard: 4 identical todowrite results in a row — execute the list (read/grep/edit/bash) instead of re-planning it.".into())
 }
 
-fn todowrite_guard(name: &str, n_before: usize) -> Option<String> {
-    if !name.eq_ignore_ascii_case("todowrite") || n_before < 5 {
+fn todowrite_guard(name: &str, streak_before: usize) -> Option<String> {
+    if !name.eq_ignore_ascii_case("todowrite") || streak_before < 7 {
         return None;
     }
     Some(format!(
-        "todowrite blocked: {n} plan updates this turn with no intervening action — work the existing list (or state the answer) instead of re-planning it.",
-        n = n_before + 1
+        "todowrite blocked: {n} identical plan updates in a row with no new information — act on the existing list (or state the answer) instead of re-planning it.",
+        n = streak_before + 1
     ))
 }
 
@@ -1927,10 +1938,10 @@ mod loop_key_tests {
     #[test]
     fn todowrite_budget_nudges_then_blocks() {
         assert!(todowrite_nudge(3).is_none());
-        assert!(todowrite_nudge(4).expect("4th re-plan nudges").contains("instead of re-planning"));
+        assert!(todowrite_nudge(4).expect("4th consecutive identical nudges").contains("instead of re-planning"));
         assert!(todowrite_nudge(5).is_none(), "fires once, not spam");
-        assert!(todowrite_guard("todowrite", 4).is_none(), "5 executions still run");
-        let block = todowrite_guard("todowrite", 5).expect("6th re-plan blocks");
+        assert!(todowrite_guard("todowrite", 6).is_none(), "7th identical still runs");
+        let block = todowrite_guard("todowrite", 7).expect("8th consecutive identical blocks");
         assert!(block.contains("re-planning"), "{block}");
         assert!(todowrite_guard("read", 9).is_none(), "other tools unaffected");
     }
