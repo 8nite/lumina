@@ -66,6 +66,11 @@ export default function App() {
   const [qText, setQText] = useState<string[]>([]);
   const [turnStart, setTurnStart] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
+  // Freshest server-side turn clock: {ms at receipt time}. The Working
+  // seconds counter ticks from this (daemon-measured `started.elapsed()`,
+  // carried on every live turn event); client `now - turnStart` is only the
+  // fallback before the first anchored event arrives.
+  const [serverElapsed, setServerElapsed] = useState<{ ms: number; at: number } | null>(null);
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
   const [effort, setEffort] = useState('xhigh');
   // v2 working-event state: queued prompts behind the active turn, terminal
@@ -358,6 +363,7 @@ export default function App() {
         setWorking(true);
         setTurnStart(Date.now());
         setNow(Date.now());
+        setServerElapsed(null);
         setLiveText('');
         setLiveThinking('');
         thinkAccumRef.current = '';
@@ -419,7 +425,8 @@ export default function App() {
         if (d.context_tokens) setCtx({ used: d.context_tokens, max: d.max_tokens || 0 });
       }
       if ((e.type === 'turn.delta') && forSession) {
-        const d = (e.data || {}) as { delta?: string; thinking?: string };
+        const d = (e.data || {}) as { delta?: string; thinking?: string; elapsed_ms?: number };
+        if (typeof d.elapsed_ms === 'number') setServerElapsed({ ms: d.elapsed_ms, at: Date.now() });
         // A delta for a session we thought was idle means we missed
         // turn.started while offline: recover the spinner now.
         if (d.delta || d.thinking) {
@@ -442,7 +449,8 @@ export default function App() {
         }
       }
       if (e.type === 'turn.progress' && forSession) {
-        const d = (e.data || {}) as { stage?: string };
+        const d = (e.data || {}) as { stage?: string; elapsed_ms?: number };
+        if (typeof d.elapsed_ms === 'number') setServerElapsed({ ms: d.elapsed_ms, at: Date.now() });
         if (d.stage) {
           const stage: string = d.stage;
           // Progress for an apparently-idle session also implies a missed
@@ -458,7 +466,8 @@ export default function App() {
         }
       }
       if (e.type === 'turn.tool' && forSession) {
-        const d = (e.data || {}) as Partial<LiveStep> & { phase?: 'start' | 'done' };
+        const d = (e.data || {}) as Partial<LiveStep> & { phase?: 'start' | 'done'; elapsed_ms?: number };
+        if (typeof d.elapsed_ms === 'number') setServerElapsed({ ms: d.elapsed_ms, at: Date.now() });
         if (d.tool) {
           setWorking((was) => {
             if (!was && sessionRef.current) {
@@ -495,6 +504,7 @@ export default function App() {
         const sid = e.session_id;
         const d = (e.data || {}) as { text?: string; model?: string; duration_ms?: number; output_tokens?: number; input_tokens?: number; context_tokens?: number; max_tokens?: number };
         setSummary({ model: d.model, duration_ms: d.duration_ms, output_tokens: d.output_tokens, input_tokens: d.input_tokens, context_tokens: d.context_tokens, max_tokens: d.max_tokens });
+        if (typeof d.duration_ms === 'number') setServerElapsed({ ms: d.duration_ms, at: Date.now() });
         if (d.context_tokens) setCtx({ used: d.context_tokens, max: d.max_tokens || 0 });
         // Flush trailing reasoning first: export replaces the timeline on
         // success (server replays the same persisted segments in order),
@@ -792,6 +802,7 @@ export default function App() {
     setWorking(true);
     setTurnStart(Date.now());
     setNow(Date.now());
+    setServerElapsed(null);
     try {
       const r = await api.prompt(s.id, text, atts, effort || undefined, delivery);
       if (r.status === 'queued') setStage(`queued #${r.position ?? ''}`.trim());
@@ -976,7 +987,11 @@ export default function App() {
     }
   };
 
-  const elapsedMs = turnStart != null ? Math.max(0, now - turnStart) : 0;
+  // Live seconds counter: server-anchored when available (freshest
+  // daemon `elapsed_ms` + local tick since receipt), client fallback else.
+  const elapsedMs = serverElapsed != null
+    ? Math.max(0, serverElapsed.ms + (now - serverElapsed.at))
+    : turnStart != null ? Math.max(0, now - turnStart) : 0;
 
   return (
     <div

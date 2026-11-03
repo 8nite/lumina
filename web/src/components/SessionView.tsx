@@ -316,6 +316,8 @@ export function SessionView(props: {
 }) {
   const [showAllChanged, setShowAllChanged] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Working card starts collapsed: header-only ("Working Ns") until expanded.
+  const [workOpen, setWorkOpen] = useState(false);
   const summaryText = formatSummary(props.summary);
   let lastAssistant = -1;
   props.turns.forEach((t, i) => {
@@ -526,20 +528,31 @@ export function SessionView(props: {
           <div ref={workRef} className="mb-2 max-h-[38vh] overflow-y-auto rounded-[8px] bg-[var(--v2-bg-base)] px-4 py-3"
             style={{ border: '1px solid var(--v2-border-base)' }}
           >
-            {/* v2 working card pinned above the msg box: full live status at the bottom. */}
-            <div className="mb-1 flex h-9 items-center gap-2 text-[13px]">
+            {/* Working card header-only by default: "Working Ns". Click to expand details. */}
+            <button
+              className="mb-1 flex h-9 w-full items-center gap-2 text-left text-[13px]"
+              onClick={() => setWorkOpen((o) => !o)}
+              aria-expanded={workOpen}
+              title={workOpen ? 'Collapse' : 'Expand working details'}
+            >
               <span className="v2-shimmer font-medium" role="status">Working</span>
               {props.elapsedMs > 0 && (
                 <span className="text-[12px] tabular-nums" style={{ color: 'var(--c-shell)', fontWeight: 600 }}>{Math.floor(props.elapsedMs / 1000)}s</span>
               )}
               {props.stage && <span className="truncate text-[12px]" style={{ color: 'var(--c-search)' }}>· {props.stage}</span>}
+              {!workOpen && props.liveSteps.length > 0 && (
+                <span className="truncate text-[12px] text-[var(--v2-text-faint)]">· {props.liveSteps.length} step{props.liveSteps.length === 1 ? '' : 's'}</span>
+              )}
               <span className="flex-1" />
               {formatCtx(props.ctx) && (
                 <span className="rounded border px-1.5 py-0.5 font-mono text-[11px]" style={{ borderColor: 'var(--c-agent)', color: 'var(--c-agent)' }}>
                   {formatCtx(props.ctx)}
                 </span>
               )}
-            </div>
+              <span className="shrink-0 text-[11px] text-[var(--v2-text-faint)]">{workOpen ? '⌃' : '⌄'}</span>
+            </button>
+            {workOpen && (
+              <>
             {props.liveSteps.length > 0 && (
               <div className="mb-2 space-y-1">
                 {props.liveSteps.map((s, i) => (
@@ -559,6 +572,8 @@ export function SessionView(props: {
                 {props.liveText.slice(-4000)}
                 <span className="animate-pulse">▊</span>
               </div>
+            )}
+              </>
             )}
           </div>
         )}

@@ -1,5 +1,5 @@
 ---
-date_modified: 2026-11-01
+date_modified: 2026-11-03
 tags: [index, memory, lumina]
 ---
 
@@ -36,3 +36,7 @@ tags: [index, memory, lumina]
 - [[harness-silent-turn-death]] — `String::truncate` mid-UTF8 panic killing the turn worker silently; fixed with `crate::tools::truncate_to` (char-boundary floor) at 5 sites, no-progress releases now carry a NOT-done pointer.
 - [[kb-lazy-resolution]] — Lazy rule-based KB resolution (request-first, one `kb_query`, per-workspace dir resolver, post-completion writes).
 - [[todo-pill-3of3]] — TodoPill 3/3 fix (match user-role `[tool result todowrite]` turns, not just role tool; `SessionView.tsx` `isToolText` mirror).
+- [[conversation-efficiency]] — Conversation-log efficiency (opencode comparison): Anthropic/OpenAI prompt caching + `cache_read/write` usage, `sessions` token columns, nudge tax cut, thinking write-only, 60% compaction trigger, `tool_full` spill, parallel pure-read batches.
+- [[harness-gap-analysis]] — Harness gap analysis (Nov 2026): at-parity/ahead map (Harness², graphify RAG, static Rust binary), 8 ranked gaps (OS sandbox critical → benchmark proof minor).
+- [[over-exploration-fix]] — Over-exploration loop guards (de530754 audit: 105 turns for ~8 reads): identical-output ledger, todowrite 4th-advisory/6th-block budget, identical-text streak forced answer, reset on edit/write/patch.
+- [[webui-tables]] — WebUI pipe tables rendered as literal text: `LinkifiedText.tsx` GFM table grammar (`splitRow` code-span-aware split, `delimAlign`, strict header/delimiter match, ragged-row pad/truncate); `tsc` + `vite build` green.

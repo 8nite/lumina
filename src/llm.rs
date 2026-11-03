@@ -820,6 +820,10 @@ async fn chat_openai(
             } else if let Some(d) = line.strip_prefix("data:") {
                 let d = d.trim();
                 if d == "[DONE]" {
+                    // Terminal marker without finish_reason: flush pending
+                    // calls or the whole batch is dropped and the turn ends
+                    // on the model's "now I'll …" text (session df1834c6).
+                    flush_openai_calls(&mut arg_bufs, &tx);
                     fr_done = true;
                     break;
                 }
@@ -886,6 +890,14 @@ async fn chat_openai(
                             ..Default::default()
                         });
                     }
+                }
+                // finish_reason can ride the same frame as the last tool-call
+                // fragment; the old `continue` skipped this flush and the
+                // call was lost on [DONE]/EOF.
+                if v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("finish_reason")).is_some_and(|f| !f.is_null()) {
+                    flush_openai_calls(&mut arg_bufs, &tx);
+                    fr_done = true;
+                    break;
                 }
                 continue;
             }
@@ -1527,28 +1539,17 @@ async fn chat_responses(
                         flush_openai_calls(&mut pending, &tx);
                         return Ok(ru);
                     }
-                    if !pending.is_empty() {
-                        let mut idxs: Vec<u32> = pending.keys().copied().collect();
-                        idxs.sort();
-                        let calls = idxs
-                            .into_iter()
-                            .map(|i| {
-                                let (id, name, raw) = pending.remove(&i).unwrap();
-                                let args = parse_args(&raw);
-                                ToolCall { id, name, args, raw_args: raw }
-                            })
-                            .collect();
-                        let _ = tx.send(Chunk { tool_calls: calls, done: true, ..Default::default() });
-                    } else {
-                        let _ = tx.send(Chunk { done: true, ..Default::default() });
-                    }
+                    flush_openai_calls(&mut pending, &tx);
                     return Ok(Usage::default());
                 }
                 _ => {}
             }
         }
     }
-    let _ = tx.send(Chunk { done: true, ..Default::default() });
+    // Gateway closed (or sent [DONE]) without a terminal event: still flush
+    // calls it already streamed. Dropping them made the harness end the turn
+    // on the model's "now I'll …" text with no tool call (session df1834c6).
+    flush_openai_calls(&mut pending, &tx);
     Ok(Usage::default())
 }
 
@@ -1974,6 +1975,131 @@ mod mixed_tests {
         assert!(done);
         assert_eq!(text, "working", "delta text must survive alongside tool calls");
         assert_eq!(calls, 1, "tool call must survive alongside delta text");
+        h.join().unwrap();
+    }
+
+    /// A gateway that closes without `response.completed` must still deliver
+    /// the function calls it streamed. Dropping them ends the turn on the
+    /// model's "now I'll …" text with no tool call (session df1834c6).
+    #[tokio::test]
+    async fn responses_eof_flushes_pending_calls() {
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"x\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}\n\n",
+        );
+        let (base, h) = serve_script(body);
+        let def = ProviderDef {
+            protocol: "openai-responses".into(),
+            base_url: base,
+            api_key: String::new(),
+            github_token: String::new(),
+            token_url: String::new(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = Request {
+            model: "m".into(),
+            messages: vec![Message { role: "user".into(), content: "hi".into(), thinking: String::new() }],
+            tools: vec![],
+            max_tokens: 0,
+            reasoning_effort: String::new(),
+            images: vec![],
+        };
+        chat_responses(&def, req, tx).await.expect("stream");
+        let mut calls = Vec::new();
+        let mut done = false;
+        while let Some(c) = rx.recv().await {
+            calls.extend(c.tool_calls);
+            if c.done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "stream must terminate at EOF");
+        assert_eq!(calls.len(), 1, "pending call must survive a stream cut");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].args.get("path").and_then(|v| v.as_str()), Some("a.txt"));
+        h.join().unwrap();
+    }
+
+    /// OpenAI-compat `[DONE]` without a finish_reason frame: the last delta's
+    /// tool call must be flushed instead of dropped (same silent-stop class).
+    #[tokio::test]
+    async fn openai_done_flushes_pending_calls() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Switching to native file tools\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base, h) = serve_script(body);
+        let def = ProviderDef {
+            protocol: "openai-compatible".into(),
+            base_url: base,
+            api_key: String::new(),
+            github_token: String::new(),
+            token_url: String::new(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = Request {
+            model: "m".into(),
+            messages: vec![Message { role: "user".into(), content: "hi".into(), thinking: String::new() }],
+            tools: vec![],
+            max_tokens: 0,
+            reasoning_effort: String::new(),
+            images: vec![],
+        };
+        chat_openai(&def, req, tx, &[]).await.expect("stream");
+        let mut calls = Vec::new();
+        let mut done = false;
+        while let Some(c) = rx.recv().await {
+            calls.extend(c.tool_calls);
+            if c.done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(calls.len(), 1, "call streamed before [DONE] must survive");
+        assert_eq!(calls[0].name, "read");
+        h.join().unwrap();
+    }
+
+    /// finish_reason riding the same frame as the last tool-call fragment:
+    /// the pre-fix `continue` skipped the flush and the call vanished.
+    #[tokio::test]
+    async fn openai_same_frame_finish_flushes_pending_calls() {
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n";
+        let (base, h) = serve_script(body);
+        let def = ProviderDef {
+            protocol: "openai-compatible".into(),
+            base_url: base,
+            api_key: String::new(),
+            github_token: String::new(),
+            token_url: String::new(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let req = Request {
+            model: "m".into(),
+            messages: vec![Message { role: "user".into(), content: "hi".into(), thinking: String::new() }],
+            tools: vec![],
+            max_tokens: 0,
+            reasoning_effort: String::new(),
+            images: vec![],
+        };
+        chat_openai(&def, req, tx, &[]).await.expect("stream");
+        let mut calls = Vec::new();
+        let mut done = false;
+        while let Some(c) = rx.recv().await {
+            calls.extend(c.tool_calls);
+            if c.done {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+        assert_eq!(calls.len(), 1, "same-frame finish must flush the call");
+        assert_eq!(calls[0].name, "read");
         h.join().unwrap();
     }
 }

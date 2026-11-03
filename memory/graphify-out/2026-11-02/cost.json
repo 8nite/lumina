@@ -1,0 +1,325 @@
+{
+  "runs": [
+    {
+      "date": "2026-10-29T19:33:14.322329+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2
+    },
+    {
+      "date": "2026-10-29T19:38:13.510826+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2
+    },
+    {
+      "date": "2026-10-29T19:40:57.471420+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2
+    },
+    {
+      "date": "2026-10-30T00:02:11.534734+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 4
+    },
+    {
+      "date": "2026-10-30T11:34:47.893589+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 7
+    },
+    {
+      "date": "2026-10-30T12:28:36.659272+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 8
+    },
+    {
+      "date": "2026-10-30T12:39:27.500595+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 9
+    },
+    {
+      "date": "2026-10-30T12:45:11.116414+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of long-session-fixes.md (no-key flow)"
+    },
+    {
+      "date": "2026-10-30T13:18:56.297936+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of prompts-parity.md (no-key flow)"
+    },
+    {
+      "date": "2026-10-30T15:21:07.249015+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 3,
+      "note": "host-agent inline refresh of config-defaults-fix.md + lumina-live.md routing headers (no-key flow)"
+    },
+    {
+      "date": "2026-10-30T22:42:45.975964+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of browser-skills.md + MEMORY.md index (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T14:28:56.660797+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of browser-skills.md (ad-fix + global/keyless-fallback nodes) + lumina-live.md coverage re-verify (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T14:48:25.187901+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of vault-placeholders.md + MEMORY.md index (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T15:30:38.747616+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 4,
+      "note": "host-agent inline refresh of resync-variants.md + MEMORY.md index + lumina-live.md date + vault-placeholders.md re-stamp (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T15:39:24.524129+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of loops-and-claims.md + MEMORY.md index (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T16:40:21.377669+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2
+    },
+    {
+      "date": "2026-10-31T17:46:18.532431+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of rust-port.md parity+harden passes (ee2c159/2ead19e) (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T21:11:37.613623+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 4,
+      "note": "host-agent inline refresh of resync-variants.md (120-cap + effort clamp) + long-session-fixes.md (30m timeout + review default-on) + loops-and-claims.md cross-ref (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T21:21:25.063729+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 3,
+      "note": "host-agent inline refresh of resync-variants.md (xhigh default + empty-final guard + gateway models note) + loops-and-claims.md ceiling pointer + reviewOpen key fix (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T21:30:32.988666+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of rust-port.md replay dup-guard (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T22:15:25.928470+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2
+    },
+    {
+      "date": "2026-10-31T23:22:21.047956+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of rust-port.md (SPA MIME+CSP, serve DB banner, full tool-round transcript) + long-session-fixes.md (session-gone 404, model refresh-on-open) (no-key flow)"
+    },
+    {
+      "date": "2026-10-31T23:58:37.652274+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of rust-port.md deep-audit round 2 (LLM transport, Copilot session, stage progress, begin-patch, tool/server/TUI parity, verify + deferrals) (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T06:24:09.520485+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of web-ui-sticky-scroll.md (dedup + index) + rust-port.md source_file dedup (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T06:52:42.783889+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of opencode-zen-models.md (3 nodes, 4 links) + MEMORY.md index description (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T07:02:02.704140+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 21,
+      "note": "host-agent inline refresh of rust-migration.md + model-picker-filter.md + model-switch-ui.md (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T07:19:27.018616+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 22
+    },
+    {
+      "date": "2026-11-01T07:31:00.568370+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of zen-twin-suppression.md (2 nodes, 4 links) + MEMORY.md index description (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T07:41:21.973205+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 3,
+      "note": "host-agent inline refresh of effort-stepdown.md (2 nodes) + rules-dir.md (2 nodes) + MEMORY.md index descriptions (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T10:59:39.905722+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of effort-ladder.md (3 nodes, 4 links) + MEMORY.md index description (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T11:59:05.757968+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "host-agent inline refresh of stuck-session-fix.md (4 nodes, 5 links) + MEMORY.md index entry (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T13:37:37.166252+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "host-agent inline refresh of session-resume-workspace.md (dangling [[session-loop-guard-stall]] -> [[stuck-session-fix]] + orphan stash fragment removal) (no-key flow)"
+    },
+    {
+      "date": "2026-11-01T14:50:55.844381+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 28,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 4 nodes added for stuck-session-fix.md"
+    },
+    {
+      "date": "2026-11-01T15:19:31.436170+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 1 node + 2 edges for prompt request-id idempotency (stuck-session-fix.md fourth case, 6ad0f21); deduped stale repeat lines; MEMORY.md index updated"
+    },
+    {
+      "date": "2026-11-01T15:42:19.653080+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 2 nodes + 3 edges for follow-up task inheritance + 12-round idle nudge (stuck-session-fix.md fifth case, 7614829e continue spin, landed 32a5da3); duplicate Fifth-case headings merged; MEMORY.md index updated"
+    },
+    {
+      "date": "2026-11-01T16:05:00+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 2 nodes + 4 edges for subagent budget/proxy-read guard + mid-loop verify prod (stuck-session-fix.md sixth case, cc686408, uncommitted); MEMORY.md index updated"
+    },
+    {
+      "date": "2026-11-02T00:17:47.438080+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "inline host-agent delta: loop-harness-audit.md + MEMORY.md index desc (no transcript source provided; no headless extract)"
+    },
+    {
+      "date": "2026-11-02T01:19:04.754748+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 2 nodes + 3 links for truncate_to char-boundary fix + NOT-done pointer (harness-silent-turn-death.md); MEMORY.md index desc filled (no transcript source provided; no headless extract)"
+    },
+    {
+      "date": "2026-11-02T02:08:17.077214+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), project.md repo rename 8nite/lumina->lumina (no new concepts, 0 nodes); no transcript source provided; no headless extract"
+    },
+    {
+      "date": "2026-11-02T13:39:38.895224+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 2 nodes + 3 links for lazy rule-based KB resolution + per-workspace dir resolver/post-completion write (kb-lazy-resolution.md); MEMORY.md index desc filled (no transcript source provided; no headless extract)"
+    },
+    {
+      "date": "2026-11-02T22:15:53.410056+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 2,
+      "note": "standing-ops kb refresh: host-agent inline semantic extraction (no-key flow), 4 nodes + 3 links (conversation-efficiency caching/usage/nudge-compaction, verbose-streaming stop-midtool f17350f); MEMORY.md index + manifest stamped (conversation-efficiency.md); no transcript source provided; no headless extract"
+    },
+    {
+      "date": "2026-11-02T22:42:12.769480+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 0,
+      "note": "standing-ops kb refresh (ses_e61de16b3ffe): no transcript source provided, nothing new to distill; verified 33/33 memory files in manifest, graph.json fresh (155 nodes/208 links incl. conversation-efficiency + verbose-streaming stop-midtool/server-clock/working-collapsed), MEMORY.md index complete, frontmatter + secret scan clean; no headless extract"
+    },
+    {
+      "date": "2026-11-03T00:47:48.901357+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 11,
+      "note": "standing-ops kb refresh: no transcript source provided; distilled from git history + uncovered sections; MEMORY.md index += harness-gap-analysis; inline semantic extract: 6 harness_gap nodes (community 4) + 3 conversation-efficiency smoke/verify/redirect nodes (community 1); no headless extract"
+    },
+    {
+      "date": "2026-11-03T01:02:30.420702+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 0,
+      "note": "standing-ops kb refresh (ses_e61dbb351ffelFHVoiGANa53Yz ended): no transcript source provided, nothing new to distill; verified manifest covers 34/34 memory files, graph.json fresh (164 nodes/220 links/4 hyperedges incl. 12 conversation-efficiency + harness-gap nodes), MEMORY.md index complete, frontmatter + secret scan clean; no headless extract"
+    },
+    {
+      "date": "2026-11-03T01:15:10.678222+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 1,
+      "note": "standing-ops kb refresh (ses_e61de16b3ffe ended): no transcript source provided; host-agent inline semantic extraction (no-key flow) for post-stamp harness-gap-analysis.md delta: 2 nodes + 5 links (ACP src/acp.rs plan, MCP-serve lumina_run delegation + serve-mode deny-destructive ceiling); MEMORY.md index + manifest already complete (34/34), frontmatter + secret scan clean; no headless extract"
+    },
+    {
+      "date": "2026-11-03T01:40:38.716048+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 34,
+      "note": "standing-ops kb refresh (ses_e61de16b3ffe ended): no transcript source provided; verify-only \u2014 manifest 34/34 already stamped, graph 166 nodes/225 links current (verbose-streaming collapsed-card/server-clock/stop-midtool + conversation-efficiency + harness-gap-analysis nodes present), MEMORY.md index complete, frontmatter + secret scan clean; no headless extract"
+    },
+    {
+      "date": "2026-11-03T01:52:23.700047+00:00",
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "files": 34,
+      "note": "standing-ops kb refresh (ses_e61de16b3ffe ended): no transcript source provided; verify-only \u2014 manifest 34/34 stamped, graph 166 nodes/225 links current (all 34 mds covered, MEMORY.md index 33/33 complete), frontmatter + live-secret scan clean; no headless extract (no-key flow)"
+    }
+  ],
+  "total_input_tokens": 0,
+  "total_output_tokens": 0
+}
