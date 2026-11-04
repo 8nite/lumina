@@ -294,16 +294,22 @@ impl Runner {
         }
         let history = store.turns(session_id)?;
         // Follow-up prompts ("continue", "done?") carry no intent by
-        // themselves: inherit the session's original task for gate
-        // decisions, or the gates stay blind exactly when the user says
-        // the least (7614829e "continue" turn: 124 tools, zero edits, no
-        // gate fired). First non-tool user turn is the task by
-        // construction (tool results only ever follow a prompt).
-        let first_task = history
-            .iter()
-            .find(|t| t.role == "user" && !t.text.trim_start().starts_with("[tool result "))
-            .map(|t| t.text.clone())
-            .unwrap_or_default();
+        // themselves: inherit work intent from recent user turns, or the
+        // gates stay blind exactly when the user says the least (7614829e
+        // "continue" turn: 124 tools, zero edits, no gate fired; 6f6d0684
+        // "continue until finished" turn: todowrite/kb_query spin, zero
+        // edits, original task "help to check…" reads as diagnostic).
+        // Window of 6 (current + 5 prior): intent flips back to research
+        // as soon as recent prompts stop asking for work, so a stale "fix"
+        // can't nag a later read-only question. First non-tool user turn
+        // is the task by construction (tool results only follow a prompt).
+        let work_requested = agent != Agent::Plan
+            && history
+                .iter()
+                .rev()
+                .filter(|t| t.role == "user" && !t.text.trim_start().starts_with("[tool result "))
+                .take(6)
+                .any(|t| looks_like_work(&t.text));
         for t in &history {
             // Replay persisted history, skipping the user turn just stored
             // above (re-added below) to avoid sending it twice.
@@ -393,10 +399,8 @@ impl Runner {
         // No-progress gate input (stuck session 81bdb764: a fix request
         // ended after 11 explore calls with zero edits and duplicated
         // filler). Plan mode is research-only by design, so it is exempt.
-        // The original task counts, not just this prompt, so bare
-        // follow-ups ("continue") keep the gate armed.
-        let work_requested =
-            agent != Agent::Plan && (looks_like_work(&user_text) || looks_like_work(&first_task));
+        // `work_requested` above already folds in recent user turns, so
+        // bare follow-ups ("continue") keep the gate armed.
         let mut outcome = self
             .loop_until_done(
                 router,
@@ -1601,6 +1605,11 @@ fn looks_like_work(text: &str) -> bool {
         // Deliberately no "port" (matches report/support/import).
         // False positives cost at most 2 forced rounds, then release.
         "copy", "sync", "clone", "move",
+        // Completion verbs (session 6f6d0684: "continue until finished"
+        // carried no hint while recent turns asked for fixes — bare
+        // "finished" alone is NOT a hint ("are we finished?" stays
+        // diagnostic), only the "until finished" continuation).
+        "until finish",
     ];
     let lower = text.to_lowercase();
     HINTS.iter().any(|h| lower.contains(h))
@@ -2198,7 +2207,8 @@ mod loop_key_tests {
         assert!(!looks_like_work("chk the logs and see whats the issue"));
         assert!(!looks_like_work("what changed in the last commit"));
         assert!(!looks_like_work("check the weather"));
-        assert!(!looks_like_work("are we finished?"));
+        assert!(!looks_like_work("are we finished?"), "bare finished stays diagnostic");
+        assert!(looks_like_work("continue until finished"), "until-finished continuation is work");
         assert!(!looks_like_work("read a.txt"));
         assert!(!looks_like_work("say nothing"));
     }
@@ -2697,8 +2707,40 @@ mod guard_tests {
         assert_eq!(
             turns.iter().filter(|t| t.text.contains("No changes made yet")).count(),
             0,
-            "control-plane demands stay in-memory; transcript holds real turns only"
+            "control-plane demands stay in-memory; transcript holds real turns only (recent)"
         );
+    }
+
+    /// Recent-work inheritance: a bare follow-up ("continue") keeps the
+    /// gate armed when a RECENT user turn asked for work, even though the
+    /// original task was diagnostic (session 6f6d0684: first task "help
+    /// to check…" plus "continue until finished" spun todowrite/kb_query
+    /// with zero edits while the gate stayed blind).
+    #[tokio::test]
+    async fn bare_followup_inherits_recent_work_not_just_first_task() {
+        let (router, cfg, hits) = scripted_e2e(vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"still on it\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"almost there\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"blocked: need the file\"}}]}\n\n",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        let ws = dir.path().display().to_string();
+        let db = dir.path().join("t.db").display().to_string();
+        let store = Store::open(Some(Box::leak(db.into_boxed_str()))).unwrap();
+        let sess = store.create_session(&ws, "build", "bypass", "").unwrap();
+        store.add_turn(&sess.id, "user", "help to check the logs").unwrap();
+        store.add_turn(&sess.id, "assistant", "checked: all quiet").unwrap();
+        store.add_turn(&sess.id, "user", "fix them").unwrap();
+        store.add_turn(&sess.id, "assistant", "on it").unwrap();
+        let runner = Runner::new();
+        let out = runner
+            .run_prompt(&store, &router, &cfg, &sess.id, &runner.begin_turn(&store, &sess.id, "continue").unwrap(), "", &[], |_, _| {}, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "recent work must arm the gate");
+        assert!(out.text.contains("NOT done"), "released text must name the miss, got {out:?}");
+        assert!(out.needs_continue, "unfinished work must auto-continue, got {out:?}");
     }
 
     /// Identical outputs force an answer round (session de530754: 8x glob
