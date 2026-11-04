@@ -765,6 +765,65 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: Que
             .run_prompt(&st.store, &st.router, &st.cfg, id, &user_turn, &q.effort, &q.images, &mut on_event, &mut on_stage, &mut on_tool)
             .await;
     }
+    // Auto-continue until green (Always mode): an unfinished outcome
+    // (unverified edits, zero-edit work request, budget ceiling) loops
+    // back in with a synthetic continue turn instead of asking the user
+    // to type `continue`. Bounded by config; every break below is
+    // load-bearing (infinite-loop / cost-blowout guards).
+    // Heartbeat stays alive across auto turns (they can run minutes).
+    let mut auto_usage = crate::llm::Usage::default();
+    let mut auto_n = 0usize;
+    let mut prev_text = String::new();
+    loop {
+        if !matches!(&out, Ok(o) if o.needs_continue) {
+            break;
+        }
+        let cap = st.cfg.agent.max_auto_continues as usize;
+        if !st.cfg.agent.auto_continue || auto_n >= cap {
+            break;
+        }
+        // Cooperative stop lands as Stopped so the normal stop path
+        // below (note + flag clear) handles it.
+        if st.store.stop_requested(id) {
+            out = Err(crate::agent::AgentError::Stopped);
+            break;
+        }
+        let (cur_text, reason) = match &out {
+            Ok(o) => (o.text.clone(), o.continue_reason.clone()),
+            Err(_) => break,
+        };
+        // Identical consecutive tails = the model is echoing, not
+        // working. Stop instead of burning turns.
+        if !prev_text.is_empty() && cur_text == prev_text {
+            on_stage("auto-continue stopped: identical result twice");
+            break;
+        }
+        prev_text = cur_text;
+        // Context guard: stop before the window fills (85%+).
+        let (_, used, max) = context_snapshot(st, id).await;
+        if context_full(used, max) {
+            on_stage("auto-continue stopped: context 85%+ full");
+            break;
+        }
+        auto_n += 1;
+        on_stage(&format!("auto-continuing {auto_n}/{cap}…"));
+        let next_turn = match runner.begin_turn(&st.store, id, &reason.auto_prompt(auto_n, cap)) {
+            Ok(t) => t,
+            Err(_) => break,
+        };
+        // No retry on auto turns: a gateway failure ends the turn
+        // through the normal failure path below (the transcript keeps
+        // everything completed so far).
+        out = runner
+            .run_prompt(&st.store, &st.router, &st.cfg, id, &next_turn, &q.effort, &q.images, &mut on_event, &mut on_stage, &mut on_tool)
+            .await;
+        if let Ok(o) = &out {
+            auto_usage.add(&o.usage);
+        }
+    }
+    if let Ok(o) = &mut out {
+        o.usage.add(&auto_usage);
+    }
     hb.abort();
     if matches!(out, Err(crate::agent::AgentError::Stopped)) {
         // Stop honored: the loop already persisted the note. Complete
@@ -816,9 +875,13 @@ async fn drive_one(st: &AppState, runner: &Runner, id: &str, owner: &str, q: Que
     }
 }
 
+/// Pure context-full check for the auto-continue guard (85%+ of window).
+fn context_full(used: usize, max: usize) -> bool {
+    max > 0 && used.saturating_mul(100) >= max.saturating_mul(85)
+}
+
 /// Shared model + usage snapshot for the completed payload + gauge event.
-async fn context_snapshot(st: &AppState, id: &str) -> (String, usize, usize) {
-    let Ok(Some(sess)) = st.store.get_session(id) else { return (String::new(), 0, 0) };
+async fn context_snapshot(st: &AppState, id: &str) -> (String, usize, usize) {    let Ok(Some(sess)) = st.store.get_session(id) else { return (String::new(), 0, 0) };
     let model = if sess.model.is_empty() { st.router.model_for("executor", "build") } else { sess.model.clone() };
     let used = st
         .store
@@ -1817,6 +1880,67 @@ mod drive_tests {
 
     fn drive_state(payloads: Vec<(&'static str, &'static str)>) -> (AppState, Runner, String, std::sync::Arc<AtomicUsize>) {
         let (addr, hits) = scripted_gateway(payloads);
+        let (st, runner, id) = app_state_for(&format!("http://{addr}"));
+        (st, runner, id, hits)
+    }
+
+    /// Chat-scripted gateway for auto-continue tests: POSTs serve payloads
+    /// in order (counted); GET /models answers `{"data":[]}` uncounted so
+    /// the context guard's window lookup can't eat a chat payload.
+    fn chat_gateway(payloads: Vec<String>) -> (String, std::sync::Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            let mut payloads = payloads.into_iter();
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { return };
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 65536 {
+                    let mut b = [0u8; 1];
+                    if s.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    head.push(b[0]);
+                }
+                let head_str = String::from_utf8_lossy(&head).into_owned();
+                if head_str.starts_with("GET") {
+                    let body = "{\"data\":[]}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                    continue;
+                }
+                let len = head_str
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("Content-Length:")
+                            .or_else(|| l.strip_prefix("content-length:"))
+                    })
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let mut rest = vec![0u8; len];
+                if len > 0 && s.read_exact(&mut rest).is_err() {
+                    return;
+                }
+                let Some(p) = payloads.next() else { return };
+                hits2.fetch_add(1, Ordering::SeqCst);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    p.len(),
+                    p
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (base, hits)
+    }
+
+    fn app_state_for(base_url: &str) -> (AppState, Runner, String) {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().display().to_string();
         // tempdir must outlive the test: leak the path join like the
@@ -1833,7 +1957,7 @@ mod drive_tests {
             "testprov".into(),
             crate::config::ProviderConfig {
                 protocol: "openai-compatible".into(),
-                base_url: format!("http://{addr}"),
+                base_url: base_url.into(),
                 api_key_env: String::new(),
                 api_key_cmd: String::new(),
                 token_url: String::new(),
@@ -1852,7 +1976,7 @@ mod drive_tests {
         let router = crate::llm::Router::new(&cfg).unwrap();
         let st = AppState::new(store, router, cfg, None);
         let sess = st.store.create_session(ws_leak, "build", "bypass", "").unwrap();
-        (st, Runner::new(), sess.id, hits)
+        (st, Runner::new(), sess.id)
     }
 
     const FINISH: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n";
@@ -1907,6 +2031,60 @@ mod drive_tests {
         let last = turns.last().unwrap();
         assert_eq!(last.role, "assistant");
         assert!(last.text.contains("Stopped by user"), "stop note must persist, got {:?}", last.text);
+    }
+
+    fn text_payload(s: &str) -> String {
+        let body = serde_json::json!({"choices": [{"delta": {"content": s}}]});
+        format!("data: {body}\n\n")
+    }
+
+    /// Auto-continue: a work request ending with zero edits loops back in
+    /// server-side (cap 1 → 2 run_prompts = 6 gateway hits) instead of
+    /// asking the user to type `continue`.
+    #[tokio::test]
+    async fn drive_one_auto_continues_unfinished_work() {
+        let payloads: Vec<String> = ["w1", "w2", "fin-one", "x1", "x2", "fin-two"]
+            .iter()
+            .map(|s| text_payload(s))
+            .collect();
+        let (base, hits) = chat_gateway(payloads);
+        let (mut st, runner, id) = app_state_for(&base);
+        st.cfg.agent.max_auto_continues = 1;
+        let q = QueuedPrompt { text: "fix the orange glow".into(), effort: String::new(), images: Vec::new() };
+        let out = drive_one(&st, &runner, &id, "test-owner", q).await;
+        let done = out.unwrap();
+        assert!(!done.stopped);
+        assert_eq!(hits.load(Ordering::SeqCst), 6, "initial turn + 1 auto turn (3 rounds each)");
+        assert!(done.text.contains("fin-two"), "final text is the auto turn's, got {:?}", done.text);
+        assert!(done.text.contains("NOT done"), "pointer preserved, got {:?}", done.text);
+        let synth = st.store.turns(&id).unwrap().into_iter().filter(|t| t.role == "user" && t.text.starts_with("auto-continue")).count();
+        assert_eq!(synth, 1, "exactly one synthetic continue turn persisted");
+    }
+
+    /// Identical consecutive tails stop the loop early: same payloads twice
+    /// with cap 3 ends after 2 run_prompts (6 hits), not 4 (12 hits).
+    #[tokio::test]
+    async fn drive_one_auto_continue_stops_on_identical_tail() {
+        let payloads: Vec<String> = ["s1", "s2", "same-end", "s1", "s2", "same-end"]
+            .iter()
+            .map(|s| text_payload(s))
+            .collect();
+        let (base, hits) = chat_gateway(payloads);
+        let (st, runner, id) = app_state_for(&base);
+        assert_eq!(st.cfg.agent.max_auto_continues, 3, "default cap covers 4 run_prompts");
+        let q = QueuedPrompt { text: "fix the orange glow".into(), effort: String::new(), images: Vec::new() };
+        let out = drive_one(&st, &runner, &id, "test-owner", q).await;
+        let done = out.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 6, "identical tail must break before the cap, got {:?}", done.text);
+        assert!(done.text.contains("same-end"), "keeps the completed text, got {:?}", done.text);
+    }
+
+    #[test]
+    fn context_full_trips_at_85_percent() {
+        assert!(!context_full(0, 0), "unknown window never trips");
+        assert!(!context_full(84, 100));
+        assert!(context_full(85, 100));
+        assert!(context_full(9_000, 10_000));
     }
 
     fn queued(

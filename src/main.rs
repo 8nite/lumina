@@ -344,7 +344,7 @@ async fn main() -> MainResult {
             let user_turn = runner
                 .begin_turn(&store, &sess.id, &text)
                 .map_err(|e| format!("store: {e}"))?;
-            let outcome = runner
+            let mut outcome = runner
                 .run_prompt(&store, &router, &cfg, &sess.id, &user_turn, llm::normalize_effort(&effort), &images,
                     |d, t| {
                         let preview = if d.is_empty() { t } else { d };
@@ -369,6 +369,56 @@ async fn main() -> MainResult {
                     })
                 .await
                 .map_err(|e| format!("{e}"))?;
+            // Auto-continue until green (same bounds as the daemon):
+            // unfinished outcomes loop back in with a synthetic turn.
+            let mut auto_n = 0usize;
+            let mut prev_text = String::new();
+            while outcome.needs_continue
+                && cfg.agent.auto_continue
+                && auto_n < cfg.agent.max_auto_continues as usize
+            {
+                if !prev_text.is_empty() && outcome.text == prev_text {
+                    eprintln!("\u{203a} auto-continue stopped: identical result twice");
+                    break;
+                }
+                prev_text = outcome.text.clone();
+                auto_n += 1;
+                let cap = cfg.agent.max_auto_continues;
+                eprintln!("\u{203a} auto-continuing {auto_n}/{cap}…");
+                let msg = outcome.continue_reason.auto_prompt(auto_n, cap as usize);
+                let next_turn = runner
+                    .begin_turn(&store, &sess.id, &msg)
+                    .map_err(|e| format!("store: {e}"))?;
+                let next = runner
+                    .run_prompt(&store, &router, &cfg, &sess.id, &next_turn, llm::normalize_effort(&effort), &images,
+                        |d, t| {
+                            let preview = if d.is_empty() { t } else { d };
+                            let one: String = preview.chars().take(120).collect();
+                            if !one.trim().is_empty() {
+                                eprintln!("\u{2192} {}", one.trim());
+                            }
+                        },
+                        |s| eprintln!("\u{203a} {s}"),
+                        |tool| match tool {
+                            crate::agent::ToolEvent::Start { name, target } => {
+                                let t = if target.is_empty() { name.clone() } else { format!("{name} {target}") };
+                                eprintln!("\u{25b8} {t}");
+                            }
+                            crate::agent::ToolEvent::Done { preview, error, .. } => {
+                                let mark = if error { "error: " } else { "" };
+                                let one: String = preview.chars().take(160).collect();
+                                if !one.trim().is_empty() {
+                                    eprintln!("\u{2192} {mark}{}", one.trim());
+                                }
+                            }
+                        })
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                let mut total = outcome.usage.clone();
+                total.add(&next.usage);
+                outcome = next;
+                outcome.usage = total;
+            }
             eprintln!("\u{2713} done");
             let answer = outcome.text;
             if dflt_format == "json" {

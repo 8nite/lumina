@@ -45,10 +45,59 @@ pub enum ToolEvent {
 }
 
 /// Turn result: final text plus token usage for turn.completed stats.
+/// `needs_continue` drives server-side auto-continue: an unfinished turn
+/// (unverified edits, zero-edit work request, budget ceiling) loops back
+/// in instead of asking the user to type `continue`.
 #[derive(Debug, Clone, Default)]
 pub struct TurnOutcome {
     pub text: String,
     pub usage: crate::llm::Usage,
+    pub needs_continue: bool,
+    pub continue_reason: ContinueReason,
+}
+
+/// Why a turn is unfinished (for the synthetic auto-continue prompt).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ContinueReason {
+    #[default]
+    None,
+    NeedsVerify,
+    NeedsAction,
+    BudgetExhausted,
+}
+
+impl ContinueReason {
+    /// Synthetic user turn that re-arms the gates: names the miss and
+    /// forbids ending with another status summary. Ends with a `fix`
+    /// hint so the work gate stays armed even on a bare follow-up.
+    pub fn auto_prompt(&self, n: usize, cap: usize) -> String {
+        match self {
+            ContinueReason::NeedsVerify => format!("auto-continue {n}/{cap}: this turn's edits were never verified (no passing test/build run) — fix: run the relevant tests/build now and repair failures until green. Do not end with a status summary."),
+            ContinueReason::NeedsAction => format!("auto-continue {n}/{cap}: no edit/write/patch ran yet but the request needs a fix — make the change now, then verify it (run tests/build and fix failures until green). Do not end with another status summary."),
+            ContinueReason::BudgetExhausted => format!("auto-continue {n}/{cap}: tool budget hit with work pending — fix: list exactly what remains and continue with the precise next tool calls. Do not end with a status summary."),
+            ContinueReason::None => format!("auto-continue {n}/{cap}: fix: continue the work until done."),
+        }
+    }
+}
+
+/// Pure classifier shared by both turn exits (normal finish + budget
+/// ceiling). Unverified edits and zero-edit work requests always need
+/// another turn; a clean finish only continues when the budget gave out.
+fn continue_status(
+    mutated: bool,
+    verified: bool,
+    work_requested: bool,
+    budget_exhausted: bool,
+) -> (bool, ContinueReason) {
+    if mutated && !verified {
+        (true, ContinueReason::NeedsVerify)
+    } else if !mutated && work_requested {
+        (true, ContinueReason::NeedsAction)
+    } else if budget_exhausted {
+        (true, ContinueReason::BudgetExhausted)
+    } else {
+        (false, ContinueReason::None)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -348,7 +397,7 @@ impl Runner {
         // follow-ups ("continue") keep the gate armed.
         let work_requested =
             agent != Agent::Plan && (looks_like_work(&user_text) || looks_like_work(&first_task));
-        let (final_text, mut usage) = self
+        let mut outcome = self
             .loop_until_done(
                 router,
                 &reg,
@@ -373,15 +422,15 @@ impl Runner {
         // (All assistant turns are persisted inside the loop as they stream,
         // so transcripts and /resume replay show every tool round.)
         let extra = sub_usage.lock().unwrap();
-        usage.add(&extra);
+        outcome.usage.add(&extra);
         // Persist per-turn usage for cost dashboards (opencode parity) and
         // emit a trace row so `traces` can answer "what did this turn cost".
-        let _ = store.add_usage(session_id, &usage);
+        let _ = store.add_usage(session_id, &outcome.usage);
         let _ = store.add_trace(session_id, "usage", &serde_json::json!({
-            "turn": user_turn.id, "input": usage.input, "output": usage.output,
-            "cache_read": usage.cache_read, "cache_write": usage.cache_write,
+            "turn": user_turn.id, "input": outcome.usage.input, "output": outcome.usage.output,
+            "cache_read": outcome.usage.cache_read, "cache_write": outcome.usage.cache_write,
         }).to_string());
-        Ok(TurnOutcome { text: final_text, usage })
+        Ok(outcome)
     }
 
     // ponytail: allow 18-arg turn loop (single call site; struct would churn diff).
@@ -405,7 +454,7 @@ impl Runner {
         hide_websearch: bool,
         hide_lsp: bool,
         work_requested: bool,
-    ) -> Result<(String, crate::llm::Usage), AgentError> {
+    ) -> Result<TurnOutcome, AgentError> {
         let mut last_text = String::new();
         // Thinking never reaches the transcript through the pump below
         // (only deltas join last_text), so accumulate it here: each tool
@@ -603,11 +652,12 @@ impl Runner {
                         let _ = store.add_trace(session_id, "thinking", &resolved);
                         thinking_buf.clear();
                     }
-                    return Ok((
-                        self.empty_final_text(router, agent_name, model, effort, messages, store, session_id)
-                            .await,
-                        usage,
-                    ));
+                    let text = self
+                        .empty_final_text(router, agent_name, model, effort, messages, store, session_id)
+                        .await;
+                    let (needs_continue, continue_reason) =
+                        continue_status(mutated, verified, work_requested, false);
+                    return Ok(TurnOutcome { text, usage, needs_continue, continue_reason });
                 }
                 let final_text = std::mem::take(&mut last_text);
                 // Trailing reasoning archives to traces (turns stay
@@ -632,7 +682,9 @@ impl Runner {
                     final_text.push_str(NO_PROGRESS_POINTER);
                 }
                 store.add_turn(session_id, "assistant", &final_text)?;
-                return Ok((final_text, usage));
+                let (needs_continue, continue_reason) =
+                    continue_status(mutated, verified, work_requested, false);
+                return Ok(TurnOutcome { text: final_text, usage, needs_continue, continue_reason });
             }
             did_work = true;
             // Identical-round streak: same tool round 3+ times in a row
@@ -1106,7 +1158,9 @@ impl Runner {
         // User transparency: resolve any refs the model echoed before storing.
         let tail = store.vault.resolve(session_id, &tail).map_err(AgentError::Msg)?;
         store.add_turn(session_id, "assistant", &tail)?;
-        Ok((tail, usage))
+        let (needs_continue, continue_reason) =
+            continue_status(mutated, verified, work_requested, true);
+        Ok(TurnOutcome { text: tail, usage, needs_continue, continue_reason })
     }
 
     /// One tools-stripped round asking the model to state done-vs-remaining
@@ -2147,6 +2201,27 @@ mod loop_key_tests {
         assert!(!looks_like_work("are we finished?"));
         assert!(!looks_like_work("read a.txt"));
         assert!(!looks_like_work("say nothing"));
+    }
+
+    #[test]
+    fn continue_status_classifies_unfinished_turns() {
+        // Unverified edits always need another turn (both exits).
+        assert_eq!(continue_status(true, false, true, false), (true, ContinueReason::NeedsVerify));
+        assert_eq!(continue_status(true, false, false, true), (true, ContinueReason::NeedsVerify));
+        // Zero-edit work requests need action (both exits).
+        assert_eq!(continue_status(false, false, true, false), (true, ContinueReason::NeedsAction));
+        assert_eq!(continue_status(false, false, true, true), (true, ContinueReason::NeedsAction));
+        // Clean finish continues only when the budget gave out.
+        assert_eq!(continue_status(false, false, false, true), (true, ContinueReason::BudgetExhausted));
+        assert_eq!(continue_status(true, true, false, true), (true, ContinueReason::BudgetExhausted));
+        assert_eq!(continue_status(false, false, false, false), (false, ContinueReason::None));
+        assert_eq!(continue_status(true, true, false, false), (false, ContinueReason::None));
+        // Synthetic prompts re-arm the work gate and forbid summaries.
+        for r in [ContinueReason::NeedsVerify, ContinueReason::NeedsAction, ContinueReason::BudgetExhausted] {
+            let p = r.auto_prompt(1, 3);
+            assert!(p.contains("fix"), "prompt must carry a work hint, got {p}");
+            assert!(p.contains("Do not end with"), "prompt must forbid summaries, got {p}");
+        }
     }
 }
 

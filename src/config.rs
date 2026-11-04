@@ -104,6 +104,28 @@ pub struct WebSearchConfig {
     pub disabled: bool,
 }
 
+/// Auto-continue until green: an unfinished turn (unverified edits,
+/// zero-edit work request, budget ceiling) loops back in server-side
+/// instead of asking the user to type `continue`. Bounded by
+/// `max_auto_continues` (each turn up to 120 rounds).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentConfig {
+    /// Master switch. Default ON (Always mode).
+    #[serde(default = "default_true")]
+    pub auto_continue: bool,
+    /// Extra turns after the first (default 3 → up to 4×120 rounds).
+    #[serde(default = "default_max_auto")]
+    pub max_auto_continues: u8,
+}
+fn default_max_auto() -> u8 {
+    3
+}
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self { auto_continue: true, max_auto_continues: default_max_auto() }
+    }
+}
+
 /// Bubblewrap confinement for the `bash` tool (`src/sandbox.rs`).
 /// Default OFF: sandboxing only engages with explicit opt-in.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -169,6 +191,8 @@ struct RawConfig {
     #[serde(default)]
     kb: KbConfig,
     #[serde(default)]
+    agent: AgentConfig,
+    #[serde(default)]
     lsp: LspConfig,
     #[serde(default)]
     sandbox: SandboxConfig,
@@ -188,6 +212,7 @@ pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
     pub router: RouterConfig,
     pub kb: KbConfig,
+    pub agent: AgentConfig,
     pub lsp: LspConfig,
     pub sandbox: SandboxConfig,
     pub websearch: WebSearchConfig,
@@ -227,6 +252,7 @@ impl Config {
             cfg.providers = raw.providers;
             cfg.router = raw.router;
             cfg.kb = raw.kb;
+            cfg.agent = raw.agent;
             cfg.lsp = raw.lsp;
             cfg.sandbox = raw.sandbox;
             cfg.websearch = raw.websearch;

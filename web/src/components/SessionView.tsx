@@ -192,6 +192,8 @@ function ToolRow(props: { name: string; body: string; error: boolean; live?: boo
 }
 
 function ToolGroup(props: { tools: { idx: number; t: Turn }[] }) {
+  // Every multi-tool run starts as one collapsed header
+  // ("N tools · read · bash · …"); click expands the rows.
   const [show, setShow] = useState(false);
   const parsed = props.tools.map(({ idx, t }) => {
     const p = parseTool(t.text);
@@ -199,22 +201,30 @@ function ToolGroup(props: { tools: { idx: number; t: Turn }[] }) {
     return { idx, error: failed, ...p };
   });
   const allRead = parsed.length > 1 && parsed.every((p) => READ_TOOLS.has(p.name));
-  if (allRead && !show) {
+  if (parsed.length > 1 && !show) {
+    const names: string[] = [];
+    for (const p of parsed) if (!names.includes(p.name)) names.push(p.name);
+    const errs = parsed.filter((p) => p.error).length;
     return (
       <button
-        className="v2-row flex items-center gap-1.5 rounded-[6px] border border-[var(--v2-border-base)] px-2 py-1 text-[11px] text-[var(--v2-text-muted)]"
+        className="v2-row flex w-full items-center gap-1.5 rounded-[6px] border border-[var(--v2-border-base)] px-2 py-1 text-left text-[11px] text-[var(--v2-text-muted)]"
         onClick={() => setShow(true)}
+        aria-expanded={false}
+        title={parsed.map((p) => `${p.name}: ${oneLine(p.body, 80)}`).join('\n').slice(0, 300)}
       >
-        <span className="font-mono">{parsed.length} reads</span>
-        <span className="truncate">{parsed.map((p) => oneLine(p.body, 40)).join(' · ').slice(0, 100)}</span>
+        <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${errs > 0 ? 'bg-red-500' : ''}`} style={errs > 0 ? undefined : { background: 'var(--c-agent)' }} />
+        <span className="shrink-0 font-mono">{parsed.length} {allRead ? 'reads' : 'tools'}</span>
+        <span className="min-w-0 flex-1 truncate font-mono">{names.slice(0, 4).join(' · ')}{names.length > 4 ? ' · …' : ''}</span>
+        {errs > 0 && <span className="shrink-0 font-medium text-red-500">{errs} failed</span>}
+        <span className="shrink-0 text-[var(--v2-text-faint)]">⌄</span>
       </button>
     );
   }
   return (
     <div className="space-y-1">
-      {allRead && (
+      {parsed.length > 1 && (
         <button className="text-[11px] text-[var(--v2-text-faint)] hover:text-[var(--v2-text-muted)]" onClick={() => setShow(false)}>
-          Collapse reads
+          {allRead ? 'Collapse reads' : 'Collapse tools'}
         </button>
       )}
       {parsed.map((p) => (
