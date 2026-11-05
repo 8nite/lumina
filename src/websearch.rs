@@ -301,7 +301,7 @@ pub fn search(want: &str, query: &str) -> Result<String, WebError> {
     }))
 }
 
-/// Fetch one HTTP(S) URL (cap 100KB); credential/Google targets are blocked,
+/// Fetch one HTTP(S) URL (cap 100KB); credential targets are blocked,
 /// and every redirect hop is re-checked (no silent cross-host hops).
 pub fn fetch(raw_url: &str, format: &str, timeout: Duration) -> Result<(String, bool), WebError> {
     let raw_url = raw_url.trim();
@@ -312,7 +312,7 @@ pub fn fetch(raw_url: &str, format: &str, timeout: Duration) -> Result<(String, 
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         return Err(WebError::Msg("webfetch: only http(s) URLs are allowed".into()));
     }
-    if crate::security::is_credential_path(raw_url) || crate::security::is_google_target(raw_url) {
+    if crate::security::is_credential_path(raw_url) {
         return Err(WebError::Msg("webfetch: blocked target".into()));
     }
     let policy = reqwest::redirect::Policy::custom(|attempt| {
@@ -320,7 +320,7 @@ pub fn fetch(raw_url: &str, format: &str, timeout: Duration) -> Result<(String, 
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return attempt.stop();
         }
-        if crate::security::is_credential_path(url) || crate::security::is_google_target(url) {
+        if crate::security::is_credential_path(url) {
             return attempt.stop();
         }
         attempt.follow()
@@ -422,8 +422,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blocks_google_and_creds() {
-        assert!(fetch("https://generativelanguage.googleapis.com/x", "text", Duration::from_secs(5)).is_err());
+    fn blocks_creds() {
         assert!(fetch("ftp://x/y", "text", Duration::from_secs(5)).is_err());
     }
 
@@ -479,7 +478,6 @@ mod fetch_tests {
     #[test]
     fn fetch_rejects_bad_targets() {
         assert!(fetch("ftp://x/y", "text", Duration::from_secs(5)).is_err());
-        assert!(fetch("https://x.googleapis.com/v1", "text", Duration::from_secs(5)).is_err());
         assert!(fetch("", "text", Duration::from_secs(5)).is_err());
     }
 }

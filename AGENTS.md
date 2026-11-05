@@ -39,11 +39,11 @@ Keep changes boring, minimal, and reversible.
 
 - `src/main.rs` — single CLI entry (TUI, `run`, `serve`, `web`, `attach`, `session`, `plugin`, `kb`, `evolve`, `models`, `auth`, `pair`, `openapi`, `vault`).
 - `src/server.rs` — axum daemon: REST + SSE + PTY WS on `127.0.0.1:4089` (fixed port, see above), embedded SPA (`rust-embed`).
-- `src/security.rs` — plan/build fence + 4-mode broker + credential/Google hard-deny.
+- `src/security.rs` — plan/build fence + 4-mode broker + credential hard-deny.
 - `src/llm.rs` — BYO-LLM adapters (OpenAI-compat, Anthropic, Ollama, Copilot, Responses) + 3-tier router.
 - `src/agent.rs` — turn loop, compaction, loop guards, subagents, steer/queue.
 - `src/tools.rs` + `src/begin_patch.rs` — tool registry, `*** Begin Patch ***` engine.
-- `src/kb.rs` — Markdown + `graphify` RAG (no vector DBs, no Google services).
+- `src/kb.rs` — Markdown + `graphify` RAG (no vector DBs, no external services).
 - `src/harness.rs` — Harness² self-improvement (quality-floor gated).
 - `src/store.rs` / `src/vault.rs` / `src/checkpoints.rs` — SQLite sessions, session secret vault, shadow-git undo.
 - `src/tui.rs` / `src/sdk.rs` / `src/pty.rs` / `src/approve.rs` — ratatui client, typed client, web terminal, permission broker.

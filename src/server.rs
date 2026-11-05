@@ -1203,9 +1203,6 @@ async fn models(State(st): State<AppState>, Query(q): Query<ModelsQ>) -> impl In
     let Some(def) = r.providers.get(&q.provider).cloned() else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown provider"}))).into_response();
     };
-    if crate::config::is_google_url(&def.base_url) {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Google endpoints blocked"}))).into_response();
-    }
     match st.router.list_models(&q.provider).await {
         Ok(models) => {
             let models = plugin_models(&st, &q.provider, &def, models);
@@ -1660,9 +1657,6 @@ async fn mcp_tools(Query(q): Query<HashMap<String, String>>) -> impl IntoRespons
     let cfg = crate::mcp::ConfigFile::load(&ws);
     let Some(conf) = cfg.servers.get(server) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown MCP server"}))).into_response();
-    };
-    if crate::config::is_google_url(&conf.url) {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Google endpoints blocked"}))).into_response();
     };
     match crate::mcp::Client::dial(conf.clone()).and_then(|mut c| c.list_tools().map_err(|e| crate::mcp::McpError::Msg(e.to_string()))) {
         Ok(tools) => Json(serde_json::json!({"server": server, "tools": tools})).into_response(),

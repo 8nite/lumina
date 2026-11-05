@@ -1,4 +1,4 @@
-//! Lumina config: TOML loader + secret indirection + Google-domain block.
+//! Lumina config: TOML loader + secret indirection.
 //! Secrets only via `api_key_env` / `api_key_cmd`; plaintext keys are rejected.
 
 use serde::Deserialize;
@@ -286,44 +286,12 @@ impl Config {
             "ollama",
             "copilot",
         ];
-        const CREDENTIAL_ENV_BLOCKLIST: &[&str] = &[
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY",
-            "GOOGLE_APPLICATION_CREDENTIALS",
-        ];
         for (name, p) in &self.providers {
             if !PROTOCOLS.contains(&p.protocol.as_str()) {
                 return Err(ConfigError::Msg(format!(
                     "config: provider {name:?} has unknown protocol {:?}",
                     p.protocol
                 )));
-            }
-            if is_google_url(&p.base_url) {
-                return Err(ConfigError::Msg(format!(
-                    "config: provider {name:?}: Google endpoints are blocked (zero-Google rule)"
-                )));
-            }
-            if is_google_url(&p.token_url) {
-                return Err(ConfigError::Msg(format!(
-                    "config: provider {name:?} token_url: Google endpoints are blocked"
-                )));
-            }
-            if CREDENTIAL_ENV_BLOCKLIST.contains(&p.api_key_env.as_str()) {
-                return Err(ConfigError::Msg(format!(
-                    "config: provider {name:?} uses blocked Google credential env {:?}",
-                    p.api_key_env
-                )));
-            }
-            if !p.api_key_cmd.is_empty() {
-                let lc = p.api_key_cmd.to_lowercase();
-                if lc.contains("gemini")
-                    || lc.contains("google-workspace")
-                    || lc.contains("google_workspace")
-                {
-                    return Err(ConfigError::Msg(format!(
-                        "config: provider {name:?} api_key_cmd touches a Google path"
-                    )));
-                }
             }
         }
         let ws = self.websearch.provider.trim().to_lowercase();
@@ -362,28 +330,6 @@ impl Config {
         }
         Ok(None)
     }
-}
-
-pub fn is_google_url(url: &str) -> bool {
-    let u = url.to_lowercase();
-    for b in [
-        "googleapis.com",
-        "google.com",
-        "gstatic.com",
-        "fonts.googleapis.com",
-        "fonts.gstatic.com",
-        "generativelanguage",
-        "aiplatform",
-        "vertexai",
-        "gemini",
-        "google-workspace",
-        "bard.google",
-    ] {
-        if u.contains(b) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Hot-swap a tier model and persist it to the config file when one is
@@ -466,43 +412,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_google_endpoint() {
-        let f = write_tmp(
-            "[providers.g]\nprotocol=\"openai-compatible\"\nbase_url=\"https://generativelanguage.googleapis.com\"\n",
-        );
-        let err = Config::load(Some(f.path().into())).unwrap_err();
-        assert!(err.to_string().contains("Google"), "{err}");
-    }
-
-    #[test]
     fn bash_table_parses() {
         let f = write_tmp("[permissions.bash]\n\"git status*\" = \"allow\"\n");
         let cfg = Config::load(Some(f.path().into())).unwrap();
         assert_eq!(cfg.permissions_bash.get("git status*").unwrap(), "allow");
-    }
-
-    #[test]
-    fn token_url_google_blocked() {
-        let f = write_tmp("[providers.g]\nprotocol=\"copilot\"\nbase_url=\"https://api.githubcopilot.com\"\ntoken_url=\"https://generativelanguage.googleapis.com/x\"\n");
-        let err = Config::load(Some(f.path().into())).unwrap_err();
-        assert!(err.to_string().contains("Google"), "{err}");
-    }
-
-    #[test]
-    fn credential_env_blocklist() {
-        for env in ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"] {
-            let body = format!("[providers.g]\nprotocol=\"ollama\"\napi_key_env=\"{env}\"\n");
-            let f = write_tmp(&body);
-            let err = Config::load(Some(f.path().into())).unwrap_err();
-            assert!(err.to_string().contains("blocked"), "{err}");
-        }
-    }
-
-    #[test]
-    fn api_key_cmd_google_path_denied() {
-        let f = write_tmp("[providers.g]\nprotocol=\"ollama\"\napi_key_cmd=\"get-gemini-key\"\n");
-        let err = Config::load(Some(f.path().into())).unwrap_err();
-        assert!(err.to_string().contains("Google"), "{err}");
     }
 
     #[test]

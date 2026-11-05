@@ -1,5 +1,4 @@
 //! Local MCP client (stdio + SSE JSON-RPC): initialize → tools/list → tools/call.
-//! Google URLs are rejected at dial time.
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -99,13 +98,10 @@ pub struct Client {
 }
 
 impl Client {
-    /// Dial a server (Google URLs rejected here, before any network).
+    /// Dial a server.
     pub fn dial(mut conf: ServerConf) -> Result<Self, McpError> {
         if conf.transport.is_empty() {
             conf.transport = "stdio".into();
-        }
-        if !conf.url.is_empty() && crate::config::is_google_url(&conf.url) {
-            return Err(McpError::Msg("mcp: Google URLs are blocked".into()));
         }
         match conf.transport.as_str() {
             "stdio" => {
@@ -274,18 +270,6 @@ for line in sys.stdin:
         assert_eq!(tools[0].name, "echo");
         let out = c.call_tool("echo", serde_json::json!({})).expect("call tool");
         assert_eq!(out, "ok:echo");
-    }
-
-    #[test]
-    fn google_url_rejected_at_dial() {
-        let conf = ServerConf {
-            transport: "sse".into(),
-            command: String::new(),
-            args: vec![],
-            url: "https://generativelanguage.googleapis.com/mcp".into(),
-            env: HashMap::new(),
-        };
-        assert!(Client::dial(conf).is_err());
     }
 
     #[test]

@@ -1,8 +1,6 @@
 //! Immutable security floor: plan/build structural fence + 4-mode broker.
-//! Credential and Google hard-denies are evaluated first in every decision.
-//!
-//! Hard denies (credential files, Google targets) win over everything,
-//! including `bypass`. `plan` agent is read-only except scoped
+//! Credential hard-denies are evaluated first in every decision and win over
+//! everything, including `bypass`. `plan` agent is read-only except scoped
 //! `plan.md` / `.lumina/plans/*.md` writes inside the workspace.
 
 use std::path::{Path, PathBuf};
@@ -90,26 +88,10 @@ pub fn is_credential_path(target: &str) -> bool {
         .any(|s| base.contains(s) || lower.contains(s))
 }
 
-pub fn is_google_target(target: &str) -> bool {
-    let u = target.to_lowercase();
-    for b in [
-        "googleapis.com",
-        "generativelanguage",
-        "gemini",
-        "google-workspace",
-        "fonts.googleapis",
-        "vertexai",
-        "aiplatform",
-    ] {
-        if u.contains(b) {
-            return true;
-        }
-    }
-    // Literal secret injection flags are always denied (Go parity).
-    if target.contains("--from-literal=") {
-        return true;
-    }
-    false
+/// Literal secret-injection flags are always denied: `kubectl create secret
+/// --from-literal=` would embed secret values in shell commands (Go parity).
+pub fn has_forbidden_literal(target: &str) -> bool {
+    target.contains("--from-literal=")
 }
 
 /// Home directory (`os.UserHomeDir` then `$HOME`).
@@ -425,11 +407,11 @@ pub fn is_destructive_bash(cmd: &str) -> bool {
 
 pub fn decide(e: &Eval) -> Decision {
     // Layer 0 hard denies first (credential paths honor the explicit
-    // external-whitelist override; Google targets never do).
+    // external-whitelist override).
     if is_credential_path(&e.target) && !credential_override_allowed(&e.workspace, &e.tool, &e.target) {
         return Decision::Deny;
     }
-    if is_google_target(&e.target) || is_google_target(&e.tool) {
+    if has_forbidden_literal(&e.target) || has_forbidden_literal(&e.tool) {
         return Decision::Deny;
     }
     let tool = e.tool.as_str();
@@ -579,8 +561,8 @@ mod tests {
     }
 
     #[test]
-    fn bypass_still_denies_credentials_and_google() {
-        for t in [".env", "auth.json", "https://x.googleapis.com/v1"] {
+    fn bypass_still_denies_credentials() {
+        for t in [".env", "auth.json"] {
             let e = Eval {
                 agent: Agent::Build,
                 mode: PermissionMode::Bypass,
@@ -716,22 +698,11 @@ mod parity_tests {
     }
 
     #[test]
-    fn google_widened_blocklist() {
-        for t in [
-            "https://generativelanguage.googleapis.com/v1",
-            "https://aiplatform.googleapis.com/x",
-            "https://vertexai.example.com/y",
-            "https://example.com/google-workspace/z",
-            "https://fonts.googleapis.com/css",
-            "cmd --from-literal=password",
-        ] {
-            assert!(is_google_target(t), "{t}");
-            assert_eq!(decide(&eval("bash", t)), Decision::Deny, "{t}");
-        }
-        // Note: bare google.com / bard.google are config-level URL blocks
-        // (is_google_url), not tool-target denies — Go IsGoogleTarget parity.
-        assert!(!is_google_target("https://bard.google/x"));
-        assert!(!is_google_target("https://api.github.com"));
+    fn from_literal_flag_denied() {
+        // `kubectl --from-literal=` would embed secret values in commands.
+        assert!(has_forbidden_literal("cmd --from-literal=password"));
+        assert_eq!(decide(&eval("bash", "cmd --from-literal=password")), Decision::Deny);
+        assert!(!has_forbidden_literal("https://api.github.com"));
     }
 
     #[test]

@@ -20,7 +20,7 @@ pub fn workspace_root(start: &Path) -> PathBuf {
 }
 
 
-pub const IMMUTABLE_SECURITY_CORE: &str = "# Lumina Immutable Security Core (Layer 0)\n- Workspace fence: agents may only touch the session workspace_dir (+ TMPDIR).\n- Credential files (.env, auth.json, lumina.json, *secret*, *credential*, *.pem) are HARD DENY in every mode.\n- Google services (googleapis.com, generativelanguage, gemini, google-workspace) are HARD DENY.\n- plan-mode agents are read-only except plan.md / .lumina/plans/*.md.\n";
+pub const IMMUTABLE_SECURITY_CORE: &str = "# Lumina Immutable Security Core (Layer 0)\n- Workspace fence: agents may only touch the session workspace_dir (+ TMPDIR).\n- Credential files (.env, auth.json, lumina.json, *secret*, *credential*, *.pem) are HARD DENY in every mode.\n- plan-mode agents are read-only except plan.md / .lumina/plans/*.md.\n";
 
 /// One discovered skill (only name+description ship in the tool list;
 /// the full SKILL.md loads lazily via the `skill` tool).

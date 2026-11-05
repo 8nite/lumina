@@ -373,9 +373,6 @@ impl Router {
                     p.protocol
                 )));
             }
-            if crate::config::is_google_url(&p.base_url) {
-                return Err(LlmError::Msg(format!("provider {name:?}: Google endpoints blocked")));
-            }
             let key = cfg
                 .resolve_secret(name)
                 .map_err(|e| LlmError::Msg(e.to_string()))?

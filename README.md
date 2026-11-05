@@ -153,7 +153,7 @@ any time with `lumina models --provider copilot`.
 | Shell matching `[permissions.bash]` `allow` globs | allow | allow | allow | allow |
 | Other general shell | ask | ask | allow | allow (no prompts) |
 | Destructive shell (`rm -rf`, `git push --force`) | ask | ask | ask | allow |
-| Credential files / Google domains | **deny** | **deny** | **deny** | **deny** |
+| Credential files | **deny** | **deny** | **deny** | **deny** |
 
 `plan` agent is read-only except `plan.md` / `.lumina/plans/*.md` — even
 under `bypass`. Approving a plan hands the session to `build` in place.
@@ -222,7 +222,7 @@ providers that support it.
 ```
 
 The model calls tools via `initialize → tools/list → tools/call` (stdio is
-newline-delimited JSON-RPC). Google URLs are rejected at dial time.
+newline-delimited JSON-RPC).
 
 ## Memory & knowledge (`kb` tool)
 
