@@ -174,7 +174,7 @@ impl Runner {
             ToolSpec { name: "read".into(), description: "Read a workspace file (paged for large files).".into(), schema: obj(&["path", "offset", "limit"]) },
             ToolSpec { name: "edit".into(), description: "Replace exactly one needle occurrence in a file.".into(), schema: obj(&["path", "old_string", "new_string"]) },
             ToolSpec { name: "write".into(), description: "Create or overwrite a workspace file.".into(), schema: obj(&["path", "content"]) },
-            ToolSpec { name: "bash".into(), description: "Run a shell command in the workspace (git/cargo/pnpm/tests; workdir optional; background:true runs detached; poll with task_output). Prefer native read/grep/glob for file search/read/listing, not bash equivalents.".into(), schema: obj(&["command", "timeout_ms"]) },
+            ToolSpec { name: "bash".into(), description: "Run a shell command in the workspace (tests/builds/logs; workdir optional; background:true runs detached; poll with task_output). Files: prefer native read/grep/glob, never bash cat/grep/find/ls. Live/runtime (logs, status HTTP, read-only DB/journal queries found in code): bash is required, not discouraged.".into(), schema: obj(&["command", "timeout_ms"]) },
             ToolSpec { name: "grep".into(), description: "Regex-search workspace files.".into(), schema: obj(&["pattern", "include"]) },
             ToolSpec { name: "lsp".into(), description: "Semantic code intelligence via the workspace language server (rust-analyzer/gopls/typescript-language-server/pylsp): op=symbols|definition|references|diagnostics on a workspace-relative path (1-based line/character, 0/0 = file start; query filters symbol names). Cross-file questions first — cheaper and more precise than grep chains.".into(), schema: serde_json::json!({"type": "object", "properties": {"op": {"type": "string"}, "path": {"type": "string"}, "line": {"type": "integer"}, "character": {"type": "integer"}, "query": {"type": "string"}}}) },
             ToolSpec { name: "glob".into(), description: "List workspace paths by glob.".into(), schema: obj(&["pattern"]) },
@@ -205,7 +205,7 @@ impl Runner {
         if agent == Agent::Plan {
             s.push_str("PLAN MODE: research and blueprint only. Never edit source files; scoped writes to plan.md or .lumina/plans/*.md only.\n");
         }
-        s.push_str("Tool guidance: use native tools, not bash equivalents — read (not bash cat/head/tail), grep (not bash grep/rg), glob (not bash find/ls); KB protocol is lazy: read the user request FIRST, use `question` when intent is ambiguous, then at most one `kb_query` with request keywords (budget 4000) and only when a KB is configured (the tool reports when none exists — then skip KB and proceed with code/tools); never preload memory bodies into the prompt, carry IDs/stubs; `memory_write` runs post-completion only after a verified fix, never mid-turn speculation; batch independent reads; quote file:line references. After tool results arrive, keep going until done; call more tools if anything remains.\n");
+        s.push_str("Tool guidance: files → native tools, never bash equivalents — read (not bash cat/head/tail), grep (not bash grep/rg), glob (not bash find/ls); live/runtime → bash + webfetch are required (log tails, status HTTP, read-only DB/journal/store queries discovered in code), never discouraged; KB protocol is lazy: read the user request FIRST, use `question` when intent is ambiguous, then at most one `kb_query` with request keywords (budget 4000) against the workspace KB first (fallback corpora share remainder) and only when a KB is configured (the tool reports when none exists — then skip KB and proceed with code/tools); never preload memory bodies into the prompt, carry IDs/stubs; `memory_write` runs post-completion only after a verified fix, never mid-turn speculation; batch independent reads; quote file:line references. Runtime/behavior questions: find primary sources from workspace code/routes first (status APIs, logs, journals/DBs/stores), query them before concluding; cite record IDs + timestamps; never present docs/memory/static inference as fact; never ask the user for data a tool can retrieve. After tool results arrive, keep going until done; call more tools if anything remains.\n");
         s.push_str(crate::vault::VAULT_GUIDANCE);
         s.push('\n');
         s.push_str(&bundle.skills_block());
@@ -310,6 +310,17 @@ impl Runner {
                 .filter(|t| t.role == "user" && !t.text.trim_start().starts_with("[tool result "))
                 .take(6)
                 .any(|t| looks_like_work(&t.text));
+        // Info-seeking gate input: same 6-turn window, but only when no
+        // change is requested (change turns already have progress/verify
+        // gates). Bare follow-ups inherit diagnostic intent the same way.
+        let diagnostic_requested = agent != Agent::Plan
+            && !work_requested
+            && history
+                .iter()
+                .rev()
+                .filter(|t| t.role == "user" && !t.text.trim_start().starts_with("[tool result "))
+                .take(6)
+                .any(|t| looks_like_diagnostic(&t.text));
         for t in &history {
             // Replay persisted history, skipping the user turn just stored
             // above (re-added below) to avoid sending it twice.
@@ -420,6 +431,7 @@ impl Runner {
                 hide_websearch,
                 hide_lsp,
                 work_requested,
+                diagnostic_requested,
             )
             .await?;
         // Merge subagent cost (side-channel: the executor closure above).
@@ -458,6 +470,7 @@ impl Runner {
         hide_websearch: bool,
         hide_lsp: bool,
         work_requested: bool,
+        diagnostic_requested: bool,
     ) -> Result<TurnOutcome, AgentError> {
         let mut last_text = String::new();
         // Thinking never reaches the transcript through the pump below
@@ -525,6 +538,14 @@ impl Runner {
         let mut text_streak = 0usize;
         let mut forced_answers = 0u8;
         let mut force_answer = false;
+        // Info-seeking gate: diagnostic turns with zero primary-source
+        // calls loop on static reads + filler. Static = file/memory reads
+        // (read/grep/glob/kb_query/lsp/skill); live = primary sources
+        // (bash/webfetch/mcp for logs, status, journals/DBs/stores).
+        // task_output polls are waiting, not evidence either way.
+        let mut static_streak = 0usize;
+        let mut live_seen = false;
+        let mut diagnostic_rounds = 0usize;
         for round in 0..self.max_steps {
             // Cooperative stop (web Stop button / POST /stop): end the
             // turn at the next round boundary instead of running to the
@@ -643,6 +664,18 @@ impl Runner {
                     on_stage("acting…");
                     continue;
                 }
+                // Info-seeking gate: the model wants to end a runtime/
+                // behavior question with zero primary-source calls
+                // (static reads only). Force up to two primary-source
+                // rounds instead; a false positive costs at most two
+                // extra rounds, then the turn releases.
+                if diagnostic_requested && !live_seen && diagnostic_rounds < 2 {
+                    diagnostic_rounds += 1;
+                    let demand = "No primary source queried yet: this question is about runtime behavior/state. Find the primary sources from workspace code/routes (status APIs, logs, journals/DBs/stores) and query them now via bash/webfetch/mcp — then cite record IDs + timestamps. Do NOT end with docs/memory/static inference, and do NOT ask the user for data a tool can retrieve.";
+                    messages.push(llm::Message { role: "user".into(), content: demand.to_string(), thinking: String::new() });
+                    on_stage("checking primary sources…");
+                    continue;
+                }
                 // Empty-final guard: silence after real work gets one more
                 // tools-stripped round asking for done-vs-remaining, so the
                 // transcript never ends in silence. Pure-empty turns (no
@@ -727,6 +760,7 @@ impl Runner {
             let mut round_acted = false;
             let mut round_only_polls = true;
             let mut round_executed = false;
+            let mut round_live = false;
             // Parallel fast path: a pure batch of side-effect-free reads
             // (the system prompt already tells the model to batch them)
             // runs concurrently; mixed batches stay sequential so
@@ -868,6 +902,17 @@ impl Runner {
                 }
                 if !was_blocked {
                     round_executed = true;
+                    // Primary-source attempt: live/runtime tools count even
+                    // when they error (a failed log query is still an
+                    // attempt; static-only spin is the failure mode).
+                    // Generic classes only — no domain tool names here.
+                    if tc.name.eq_ignore_ascii_case("bash")
+                        || tc.name.eq_ignore_ascii_case("webfetch")
+                        || tc.name.eq_ignore_ascii_case("websearch")
+                        || tc.name.eq_ignore_ascii_case("mcp")
+                    {
+                        round_live = true;
+                    }
                 }
                 let (preview, is_err) = match &result {
                     Ok(o) => (tool_preview(&o.output), false),
@@ -1060,6 +1105,17 @@ impl Runner {
             } else if !round_only_polls {
                 idle_rounds += 1;
             }
+            // Static/live accounting for the info-seeking gate: edits and
+            // live queries reset the static streak; pure poll rounds
+            // neither reset nor advance it (waiting, not spinning).
+            if round_acted || round_live {
+                static_streak = 0;
+                if round_live {
+                    live_seen = true;
+                }
+            } else if !round_only_polls {
+                static_streak += 1;
+            }
             // Nudges are context overhead billed every round (~50-100
             // tokens x 120 rounds = up to 12k/turn) AND cache-prefix
             // breakers: the growing suffix invalidates the stable prefix
@@ -1103,6 +1159,19 @@ impl Runner {
                     nudge.push(' ');
                 }
                 nudge.push_str("Verify now: edits ran with no passing test/build yet -- run it and fix failures instead of stacking more edits.");
+            }
+            // Info-seeking nudge: diagnostic turn spinning on static
+            // reads with zero primary-source calls. Advisory every 4th
+            // static round from the 2nd on; the end-gate forces it.
+            // Generic classes only — no domain tool names here.
+            if diagnostic_requested && !live_seen && static_streak >= 2 && (static_streak - 2).is_multiple_of(4) {
+                if !nudge.is_empty() {
+                    nudge.push(' ');
+                }
+                nudge.push_str(&format!(
+                    "Primary-source note: {static_streak} rounds with file/memory reads only and no live query (bash/webfetch/mcp for logs, status, journals/DBs/stores). Name the exact primary-source query next and run it now; do not conclude without record IDs + timestamps."
+                ));
+                on_stage("checking primary sources…");
             }
             // Steered input joins the active turn (Go takeSteered parity):
             // stored raw, sent vaulted, answered before anything else.
@@ -1612,6 +1681,32 @@ fn looks_like_work(text: &str) -> bool {
         "until finish",
     ];
     let lower = text.to_lowercase();
+    HINTS.iter().any(|h| lower.contains(h))
+}
+
+/// Info-seeking gate input: does this request ask about runtime behavior
+/// or state (vs a doc/memory lookup or a change)? Generic across
+/// workspaces: state verbs + question shape, minus knowledge-base topics.
+/// Fires only when no change is requested (change turns already have the
+/// progress/verify gates); a false positive costs at most two extra
+/// primary-source rounds, then the turn releases.
+fn looks_like_diagnostic(text: &str) -> bool {
+    if looks_like_work(text) {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    // Knowledge lookups are answered from KB/code, not primary sources.
+    for kw in ["memory", "graphify", "kb_query", "skill", "agents.md", "tool_guidance"] {
+        if lower.contains(kw) {
+            return false;
+        }
+    }
+    const HINTS: &[&str] = &[
+        "why", "what happened", "what changed", "closed", "opened", "holding", "hold",
+        "status", "mismatch", "still", "unexpected", "supposed", "logs",
+        "investigat", "diagnos", "showing", "shows",
+        "happening", "wrong with", "not working",
+    ];
     HINTS.iter().any(|h| lower.contains(h))
 }
 
@@ -2211,6 +2306,32 @@ mod loop_key_tests {
         assert!(looks_like_work("continue until finished"), "until-finished continuation is work");
         assert!(!looks_like_work("read a.txt"));
         assert!(!looks_like_work("say nothing"));
+    }
+
+    #[test]
+    fn looks_like_diagnostic_matches_runtime_questions_not_work_or_kb() {
+        // Runtime/behavior questions arm the info-seeking gate.
+        assert!(looks_like_diagnostic("chk the logs and see whats the issue"));
+        assert!(looks_like_diagnostic("what changed in the last commit"));
+        assert!(looks_like_diagnostic("why is the service still showing old status?"));
+        // Generic lookups without runtime-state signals stay out.
+        assert!(!looks_like_diagnostic("check the weather"));
+        // Change requests never count as diagnostic (work gate owns them).
+        assert!(!looks_like_diagnostic("fix the orange glow"));
+        assert!(!looks_like_diagnostic("add a collapse toggle"));
+        // Knowledge lookups are answered from KB/code, not primary sources.
+        assert!(!looks_like_diagnostic("what does memory say about auth?"));
+        assert!(!looks_like_diagnostic("check the skill docs for deploy"));
+    }
+
+    #[test]
+    fn system_prompt_states_primary_source_fence() {
+        let bundle = Bundle::default();
+        let s = Runner::system_prompt(&bundle, Agent::Build);
+        assert!(s.contains("primary sources"), "{s}");
+        assert!(s.contains("record IDs"), "{s}");
+        assert!(s.contains("native"), "{s}");
+        assert!(s.contains("live/runtime"), "{s}");
     }
 
     #[test]

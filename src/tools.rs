@@ -359,6 +359,19 @@ pub fn truncate_to(s: &mut String, max_bytes: usize) {
     s.truncate(end);
 }
 
+/// Tooling/vendor dirs never searched by grep/glob: version control,
+/// deps, and build outputs. Generic across workspaces (JS, Python,
+/// Rust, Go): keeps broad patterns from drowning in vendored noise.
+/// ponytail: component-name match, not a crate; upgrade to `ignore` only if
+/// a test proves .gitignore respect is needed.
+fn is_skipped_search_dir(path_str: &str) -> bool {
+    const SKIPS: &[&str] =
+        &[".git", "node_modules", "venv", ".venv", "__pycache__", "target", "dist", ".next", ".turbo"];
+    Path::new(path_str)
+        .components()
+        .any(|c| c.as_os_str().to_str().is_some_and(|s| SKIPS.contains(&s)))
+}
+
 const MAX_BYTES: u64 = 256 * 1024;
 
 fn cap(s: String) -> Outcome {
@@ -818,8 +831,7 @@ fn do_grep(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Out
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
-                let s = p.to_string_lossy();
-                if s.contains("/.git/") || s.contains("/node_modules/") {
+                if is_skipped_search_dir(&p.to_string_lossy()) {
                     continue;
                 }
                 walk(&p, cb);
@@ -834,7 +846,7 @@ fn do_grep(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Out
             return;
         }
         let s = p.to_string_lossy();
-        if s.contains("/.git/") || s.contains("/node_modules/") {
+        if is_skipped_search_dir(&s) {
             return;
         }
         // Workspace secrets are never indexed; external whitelist allows dotfiles.
@@ -941,8 +953,7 @@ fn do_glob(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Out
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
-                    let s = p.to_string_lossy();
-                    if s.contains("/.git/") || s.contains("/node_modules/") {
+                    if is_skipped_search_dir(&p.to_string_lossy()) {
                         continue;
                     }
                     walk2(&p, cb);
@@ -964,6 +975,9 @@ fn do_glob(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Out
                 return; // workspace secrets hidden; external whitelist lists all dotfiles
             }
             if pat.matches(&rps) {
+                if is_skipped_search_dir(&p.to_string_lossy()) {
+                    return;
+                }
                 rel.push(rps);
             }
         });
@@ -974,6 +988,7 @@ fn do_glob(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Out
             .filter(|p| {
                 !(crate::security::is_credential_path(&p.to_string_lossy()) && p.starts_with(&ws))
             })
+            .filter(|p| !is_skipped_search_dir(&p.to_string_lossy()))
             .filter_map(|p| p.strip_prefix(&root).ok().map(|r| r.display().to_string()))
             .collect();
         hits.sort();
@@ -1536,6 +1551,25 @@ mod tests {
         m.insert("literal".into(), serde_json::Value::Bool(true));
         let out = reg.call(&sc, "grep", &m).unwrap();
         assert!(out.output.is_empty() || !out.output.contains("a.go"), "{}", out.output);
+    }
+
+    #[test]
+    fn grep_glob_skip_vendor_dirs() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("keep.txt"), "needle here\n").unwrap();
+        for dir in ["venv", ".venv", "__pycache__", "target", "dist", ".next", "node_modules", ".git"] {
+            let p = d.path().join(dir);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("vendored.txt"), "needle buried\n").unwrap();
+        }
+        let reg = Registry::new();
+        let sc = ctx(d.path(), Agent::Build, PermissionMode::Bypass);
+        let out = reg.call(&sc, "grep", &args(&[("pattern", "needle")])).unwrap();
+        assert!(out.output.contains("keep.txt"), "{}", out.output);
+        assert!(!out.output.contains("vendored"), "{}", out.output);
+        let out = reg.call(&sc, "glob", &args(&[("pattern", "**/*.txt")])).unwrap();
+        assert!(out.output.contains("keep.txt"), "{}", out.output);
+        assert!(!out.output.contains("vendored"), "{}", out.output);
     }
 
     #[test]

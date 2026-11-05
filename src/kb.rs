@@ -737,7 +737,27 @@ pub fn query_in(
     }
     let dirs: Vec<PathBuf> = match override_dir.filter(|s| !s.trim().is_empty()) {
         Some(ov) => resolve_override_dirs(workspace, ov),
-        None => resolve_memory_dirs(workspace),
+        None => {
+            let mut resolved = resolve_memory_dirs(workspace);
+            // Workspace-first: shallower KB dirs (workspace/memory,
+            // workspace/docs/notes style) outrank deeper fallback trees
+            // (e.g. workspace/upstream/*/memory) regardless of mention
+            // order in rule text. Stable by depth, then mention order.
+            // Explicit overrides keep caller order.
+            let mut indexed: Vec<(usize, usize, PathBuf)> = resolved
+                .drain(..)
+                .enumerate()
+                .map(|(i, p)| {
+                    let depth = p
+                        .strip_prefix(workspace)
+                        .map(|r| r.components().count())
+                        .unwrap_or(usize::MAX);
+                    (depth, i, p)
+                })
+                .collect();
+            indexed.sort_by_key(|(d, i, _)| (*d, *i));
+            indexed.into_iter().map(|(_, _, p)| p).collect()
+        }
     };
     if dirs.is_empty() {
         let mut out = String::from("## reflect\n");
@@ -745,9 +765,35 @@ pub fn query_in(
         out.push_str("\nkb: no knowledge base configured for this workspace (no memory/knowledge dir mentioned in AGENTS.md/rules and no memory/*.md found) — skipping KB; proceed with code/tools, and do NOT call kb_query again this turn (re-querying returns this same skip note).\n");
         return Ok(out);
     }
+    // Fallback corpora share at most ~30% of the budget; workspace KB
+    // owns the rest. Generic across workspaces (no domain names).
+    // Primary = shallowest depth present (usually workspace/memory).
+    let fallback_cap = budget * 3 / 10;
+    let min_depth = dirs
+        .iter()
+        .map(|p| p.strip_prefix(workspace).map(|r| r.components().count()).unwrap_or(usize::MAX))
+        .min()
+        .unwrap_or(0);
+    let primary_count = dirs
+        .iter()
+        .take_while(|p| {
+            p.strip_prefix(workspace).map(|r| r.components().count()).unwrap_or(usize::MAX) == min_depth
+        })
+        .count()
+        .max(1);
+    let (primary_dirs, fallback_dirs) = dirs.split_at(primary_count.min(dirs.len()));
     let lq_words: Vec<String> = q.to_lowercase().split_whitespace().map(|w| w.to_string()).collect();
     let mut out = String::from("## reflect\n");
-    out.push_str(&reflect_dirs(workspace, &dirs));
+    out.push_str(&reflect_dirs(workspace, primary_dirs));
+    if !fallback_dirs.is_empty() {
+        let mut fallback_out = reflect_dirs(workspace, fallback_dirs);
+        if fallback_out.len() > fallback_cap {
+            let mut cut: String = fallback_out.chars().take(fallback_cap).collect();
+            cut.push_str("\n…[fallback reflect capped at ~30% of budget; workspace KB first]\n");
+            fallback_out = cut;
+        }
+        out.push_str(&fallback_out);
+    }
     let mut graph_paths: Vec<PathBuf> = Vec::new();
     for dir in &dirs {
         graph_paths.push(dir.join("graphify-out/graph.json"));
@@ -1113,5 +1159,29 @@ mod fallback_tests {
         assert!(v2.iter().any(|s| s.contains("kb")), "{v2:?}");
         // Escapes are dropped.
         assert!(explicit_kb_dirs_from_text("see ../outside/memory/x").is_empty());
+    }
+
+    #[test]
+    fn workspace_kb_outranks_deeper_fallback() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path();
+        // Mention order deliberately lists the deeper tree first: the
+        // harness must still rank workspace/memory first (depth sort).
+        std::fs::write(
+            ws.join("AGENTS.md"),
+            "# rules\n\nSubsystem notes in upstream/sub/memory/MEMORY.md.\nDurable notes live in ./memory/*.md\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.join("memory")).unwrap();
+        std::fs::create_dir_all(ws.join("upstream/sub/memory")).unwrap();
+        std::fs::write(ws.join("memory/MEMORY.md"), "# idx\n\n- [[orchard]]\n").unwrap();
+        std::fs::write(ws.join("memory/orchard.md"), "workspace harvest is plum\n").unwrap();
+        std::fs::write(ws.join("upstream/sub/memory/MEMORY.md"), "# idx\n\n- [[grove]]\n").unwrap();
+        std::fs::write(ws.join("upstream/sub/memory/grove.md"), "fallback harvest is prune\n").unwrap();
+        let out = query(ws, "orchard harvest", 4000).unwrap();
+        let wp = out.find("plum").unwrap_or(usize::MAX);
+        let fp = out.find("prune").unwrap_or(usize::MAX);
+        assert!(out.contains("plum"), "{out}");
+        assert!(wp < fp, "workspace note must precede fallback, got:\n{out}");
     }
 }
