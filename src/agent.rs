@@ -163,10 +163,12 @@ impl Runner {
         Self::tool_specs_filtered(false, false, Agent::Build, "")
     }
 
-    /// OpenCode parity: `patch` is only advertised to GPT-family models
-    /// (others get edit/write). Case-insensitive `gpt` match.
+    /// OpenCode `tool/plugin/patch.ts` parity: GPT models (non-oss, non-4)
+    /// get `patch` ONLY (no edit/write); every other model gets
+    /// `edit`+`write` (no patch). Case-insensitive `gpt-` match.
     fn supports_patch(model: &str) -> bool {
-        model.to_lowercase().contains("gpt")
+        let m = model.to_lowercase();
+        m.contains("gpt-") && !m.contains("oss") && !m.contains("gpt-4")
     }
 
     /// Per-agent tool specs (opencode parity): plan-shaped agents never see
@@ -213,8 +215,41 @@ impl Runner {
                 true
             }
         })
-        .filter(|t| t.name != "patch" || Self::supports_patch(model))
+        .filter(|t| {
+            // Patch-model routing: patch replaces edit/write entirely.
+            let patch_model = Self::supports_patch(model);
+            match t.name.as_str() {
+                "patch" => patch_model,
+                "edit" | "write" => !patch_model,
+                _ => true,
+            }
+        })
         .collect()
+    }
+
+    /// OpenCode `tool/plugin/subagent.ts` parity: callable subagent catalog
+    /// appended to the subagent tool description (mode `primary` excluded).
+    fn subagent_catalog(bundle: &Bundle) -> String {
+        let mut ids: Vec<(&str, &str)> = bundle
+            .agents
+            .iter()
+            .filter(|a| a.mode != "primary")
+            .map(|a| {
+                let d = if a.description.trim().is_empty() {
+                    "This subagent should only be called when explicitly requested."
+                } else {
+                    a.description.trim()
+                };
+                (a.name.as_str(), d)
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        let mut out = String::from("\nAvailable subagents:");
+        for (id, d) in ids {
+            out.push_str(&format!("\n- {id}: {d}"));
+        }
+        out
     }
 
     /// OpenCode `instructions/builtins.ts` parity: date + working context so
@@ -224,24 +259,50 @@ impl Runner {
         let git = if workspace.join(".git").exists() { "yes" } else { "no" };
         let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
         format!(
-            "Today's date: {date}\n<env>\nworkspace: {}\ngit: {git}\nplatform: {}-{}\ntmp: {tmp} (prefer session TMPDIR tools, never hardcode /tmp)\n</env>\n",
+            "Today's date: {date}\nHere is some useful information about the environment you are running in:\n<env>\n  Working directory: {}\n  Workspace root folder: {}\n  Is directory a git repo: {git}\n  Platform: {}-{}\n  Prefer {tmp} over generic system temporary directories such as /tmp; file tools default to the session TMPDIR.\n</env>\n",
+            workspace.display(),
             workspace.display(),
             std::env::consts::OS,
             std::env::consts::ARCH,
         )
     }
 
-    fn system_prompt(bundle: &Bundle, agent: Agent, workspace: &Path) -> String {
+    fn system_prompt(
+        bundle: &Bundle,
+        agent: Agent,
+        workspace: &Path,
+        tools: &[ToolSpec],
+        model: &str,
+    ) -> String {
         let mut s = bundle.system_prompt.clone();
         s.push_str(&Self::env_block(workspace));
+        // OpenCode `plugin/identity.ts` parity: name the serving model.
+        let (provider, mid) = crate::llm::split_model(model);
+        let name = if model.is_empty() { "(session default)".to_string() } else { model.to_string() };
+        s.push_str(&format!(
+            "# Your Model\n- Name: {name}\n- Provider ID: {provider}\n- Model ID: {mid}\n"
+        ));
         s.push_str("You are Lumina, a local-first coding agent. Answer with tool calls when action helps; otherwise reply directly.\n");
         s.push_str("Persistence: continue the ORIGINAL user request until fully complete (all edits applied, tests/build pass). Do NOT stop with a status summary, do NOT ask the user to say 'continue', and do NOT end with 'what I found' when fixes were requested — finish the work, then reply with the completed result.\n");
         s.push_str("Fix/build/change requests are not done with zero edits: make the change (then verify it) or state exactly what is missing or blocked — ending with a status summary and no edits is not done.\n");
         s.push_str("Verify every code change in the same turn: a turn that ran edit/write/patch must also run a passing test/build/typecheck command (cargo test, pnpm build, tsc, …) or directly run the created artifact, before replying done — an edit without a green verification run is not done.\n");
         if agent == Agent::Plan {
-            s.push_str("PLAN MODE: research and blueprint only. Never edit source files; scoped writes to plan.md or .lumina/plans/*.md only.\n");
+            s.push_str("PLAN MODE: research and blueprint only. Never edit source files; scoped writes to plan.md or .lumina/plans/*.md only. If the user asks to implement, tell them to switch to build mode (Tab).\n");
         }
-        s.push_str("Tool guidance: files → native tools, never bash equivalents — read (not bash cat/head/tail), grep (not bash grep/rg), glob (not bash find/ls); live/runtime → bash + webfetch are required (log tails, status HTTP, read-only DB/journal/store queries discovered in code), never discouraged; KB protocol is lazy: read the user request FIRST, use `question` when intent is ambiguous, then at most one `kb_query` with request keywords (budget 4000) against the workspace KB first (fallback corpora share remainder) and only when a KB is configured (the tool reports when none exists — then skip KB and proceed with code/tools); never preload memory bodies into the prompt, carry IDs/stubs; `memory_write` runs post-completion only after a verified fix, never mid-turn speculation; batch independent reads; quote file:line references. Runtime/behavior questions: find primary sources from workspace code/routes first (status APIs, logs, journals/DBs/stores), query them before concluding; cite record IDs + timestamps; never present docs/memory/static inference as fact; never ask the user for data a tool can retrieve. After tool results arrive, keep going until done; call more tools if anything remains.\n");
+        // OpenCode `session/system-prompt.ts` parity: guidance lines render
+        // only for tools in the model-visible spec list.
+        let visible: std::collections::HashSet<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        s.push_str("Tool guidance: ");
+        if visible.contains("bash") || visible.contains("shell") {
+            s.push_str("prefer dedicated file tools over shell equivalents — read (not bash cat/head/tail), grep (not bash grep/rg), glob (not bash find/ls); do not chain shell commands with separators like echo \"====\"; ");
+        }
+        if visible.contains("write") {
+            s.push_str("use write to create files, prefer edit for targeted changes; ");
+        }
+        if visible.contains("edit") {
+            s.push_str("use edit for targeted changes: old_string must match exactly once (add surrounding context to disambiguate) unless replaceAll:true; ");
+        }
+        s.push_str("files → native tools, never bash equivalents; live/runtime → bash + webfetch are required (log tails, status HTTP, read-only DB/journal/store queries discovered in code), never discouraged; KB protocol is lazy: read the user request FIRST, use `question` when intent is ambiguous, then at most one `kb_query` with request keywords (budget 4000) against the workspace KB first (fallback corpora share remainder) and only when a KB is configured (the tool reports when none exists — then skip KB and proceed with code/tools); never preload memory bodies into the prompt, carry IDs/stubs; `memory_write` runs post-completion only after a verified fix, never mid-turn speculation; batch independent reads; quote file:line references. Runtime/behavior questions: find primary sources from workspace code/routes first (status APIs, logs, journals/DBs/stores), query them before concluding; cite record IDs + timestamps; never present docs/memory/static inference as fact; never ask the user for data a tool can retrieve. After tool results arrive, keep going until done; call more tools if anything remains.\n");
         s.push_str(crate::vault::VAULT_GUIDANCE);
         s.push('\n');
         s.push_str(&bundle.skills_block());
@@ -314,9 +375,25 @@ impl Runner {
         }
         let user_text = user_turn.text.clone();
 
+        // Per-agent model default (falls back to the router executor tier).
+        let model = if sess.model.is_empty() {
+            custom.as_ref().and_then(|d| (!d.model.is_empty()).then(|| d.model.clone())).unwrap_or_default()
+        } else {
+            sess.model.clone()
+        };
+        let hide_websearch = cfg.websearch.disabled;
+        let hide_lsp = cfg.lsp.disabled;
+        // Effective serving model for spec filtering + prompt identity:
+        // an empty session override resolves through the router tiers.
+        let eff_model = if model.is_empty() {
+            router.model_for("executor", &sess.agent)
+        } else {
+            model.clone()
+        };
+        let prompt_specs = Self::tool_specs_filtered(hide_websearch, hide_lsp, agent, &eff_model);
         let mut messages = vec![llm::Message {
             role: "system".into(),
-            content: Self::system_prompt(&bundle, agent, &workspace),
+            content: Self::system_prompt(&bundle, agent, &workspace, &prompt_specs, &eff_model),
             thinking: String::new(),
         }];
         if let Some(def) = &custom {
@@ -435,14 +512,6 @@ impl Runner {
             sandbox: crate::sandbox::Profile::from_config(&cfg.sandbox),
         };
         let agent_name = sess.agent.clone();
-        // Per-agent model default (falls back to the router executor tier).
-        let model = if sess.model.is_empty() {
-            custom.as_ref().and_then(|d| (!d.model.is_empty()).then(|| d.model.clone())).unwrap_or_default()
-        } else {
-            sess.model.clone()
-        };
-        let hide_websearch = cfg.websearch.disabled;
-        let hide_lsp = cfg.lsp.disabled;
         // Per-agent step cap (opencode `steps:` parity): custom agents may
         // bound the turn; otherwise the runner-wide 120-round ceiling holds.
         let max_steps = custom.as_ref().and_then(|d| d.steps).unwrap_or(self.max_steps);
@@ -609,7 +678,21 @@ impl Runner {
             // while the model kept tooling. Strip tools for exactly one
             // round so the model states its answer instead of re-running
             // what produces nothing new (max 2 per turn, then release).
-            let mut req_tools = Self::tool_specs_filtered(hide_websearch, hide_lsp, sc.agent, model);
+            let eff_role = if agent_name == "plan" { "planner" } else { "executor" };
+            let eff_model = if model.is_empty() {
+                router.model_for(eff_role, agent_name)
+            } else {
+                model.to_string()
+            };
+            let mut req_tools = Self::tool_specs_filtered(hide_websearch, hide_lsp, sc.agent, &eff_model);
+            // OpenCode `tool/plugin/subagent.ts` parity: advertise the
+            // callable subagents (permission-eligible, non-primary) with
+            // their descriptions so the model can choose.
+            if let Some(b) = &reg.bundle {
+                if let Some(spec) = req_tools.iter_mut().find(|t| t.name == "subagent") {
+                    spec.description.push_str(&Self::subagent_catalog(b));
+                }
+            }
             let mut forced_this_round = false;
             // OpenCode `steps:` parity: on the final step the tools are
             // removed and the model is asked to summarize in text.
@@ -1984,7 +2067,13 @@ async fn run_subtask(
         let u = handle.await.map_err(|e| AgentError::Msg(format!("subagent task: {e}")))??;
         sub_usage.add(&u);
         if calls.is_empty() {
-            return vault.resolve(&parent.session, &last).map(|t| (t, sub_usage)).map_err(AgentError::Msg);
+            let text = vault.resolve(&parent.session, &last).map_err(AgentError::Msg)?;
+            // OpenCode `subagent-completion` NO_TEXT parity: never hand the
+            // parent an empty result; say so explicitly instead.
+            if text.trim().is_empty() {
+                return Ok(("Subagent completed without a text response.".into(), sub_usage));
+            }
+            return Ok((text, sub_usage));
         }
         for tc in &calls {
             let args_val = serde_json::Value::Object(
@@ -2186,7 +2275,7 @@ mod specs_tests {
     }
 
     #[test]
-    fn tool_specs_plan_hides_edits_and_patch_is_gpt_only() {
+    fn tool_specs_plan_hides_edits_and_patch_routing_is_exact() {
         // Plan agents are research-only: no edit-class or delegation tools.
         let plan = Runner::tool_specs_filtered(false, false, Agent::Plan, "openai/gpt-5");
         let names: Vec<&str> = plan.iter().map(|s| s.name.as_str()).collect();
@@ -2194,21 +2283,68 @@ mod specs_tests {
             assert!(!names.contains(&t), "{names:?}");
         }
         assert!(names.contains(&"question"), "{names:?}");
-        // Non-GPT models get edit/write instead of patch (opencode parity).
-        let claude = Runner::tool_specs_filtered(false, false, Agent::Build, "anthropic/claude-sonnet-4");
-        let names: Vec<&str> = claude.iter().map(|s| s.name.as_str()).collect();
-        assert!(!names.contains(&"patch"), "{names:?}");
-        assert!(names.contains(&"edit") && names.contains(&"write"), "{names:?}");
+        // opencode patch.ts parity: gpt- (non-oss, non-4) gets patch ONLY.
         let gpt = Runner::tool_specs_filtered(false, false, Agent::Build, "openai/gpt-5-mini");
-        assert!(gpt.iter().any(|s| s.name == "patch"));
+        let names: Vec<&str> = gpt.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"patch"), "{names:?}");
+        assert!(!names.contains(&"edit") && !names.contains(&"write"), "{names:?}");
+        // gpt-4, gpt-oss, claude, and unset models get edit/write, no patch.
+        for m in ["openai/gpt-4o", "openai/gpt-4.1-mini", "openai/gpt-oss-120b", "anthropic/claude-sonnet-4", ""] {
+            let specs = Runner::tool_specs_filtered(false, false, Agent::Build, m);
+            let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+            assert!(!names.contains(&"patch"), "{m}: {names:?}");
+            assert!(names.contains(&"edit") && names.contains(&"write"), "{m}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn tool_guidance_renders_conditionally_and_names_model() {
+        let ws = PathBuf::from("/repo");
+        let full = Runner::tool_specs_filtered(false, false, Agent::Build, "anthropic/claude-sonnet-4");
+        let s = Runner::system_prompt(&Bundle::default(), Agent::Build, &ws, &full, "anthropic/claude-sonnet-4");
+        assert!(s.contains("prefer dedicated file tools over shell"), "{s}");
+        assert!(s.contains("use write to create files"), "{s}");
+        assert!(s.contains("use edit for targeted changes"), "{s}");
+        assert!(s.contains("# Your Model"), "{s}");
+        assert!(s.contains("anthropic/claude-sonnet-4"), "{s}");
+        // Plan specs carry no edit/write: their guidance lines stay out.
+        let plan = Runner::tool_specs_filtered(false, false, Agent::Plan, "openai/gpt-5");
+        let s = Runner::system_prompt(&Bundle::default(), Agent::Plan, &ws, &plan, "openai/gpt-5");
+        assert!(!s.contains("use edit for targeted changes"), "{s}");
+        assert!(!s.contains("use write to create files"), "{s}");
+        assert!(s.contains("PLAN MODE"), "{s}");
+    }
+
+    #[test]
+    fn subagent_catalog_lists_non_primary() {
+        let b = Bundle {
+            agents: vec![
+                crate::rules::AgentDef {
+                    name: "reviewer".into(), description: "Reviews code.".into(), mode: "subagent".into(),
+                    model: String::new(), path: String::new(), body: String::new(),
+                    steps: None, tools: Default::default(),
+                },
+                crate::rules::AgentDef {
+                    name: "writer".into(), description: String::new(), mode: "primary".into(),
+                    model: String::new(), path: String::new(), body: String::new(),
+                    steps: None, tools: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let c = Runner::subagent_catalog(&b);
+        assert!(c.contains("- reviewer: Reviews code."), "{c}");
+        assert!(!c.contains("writer"), "{c}");
     }
 
     #[test]
     fn system_prompt_carries_env_block() {
         let ws = PathBuf::from("/repo");
-        let s = Runner::system_prompt(&Bundle::default(), Agent::Build, &ws);
+        let full = Runner::tool_specs_filtered(false, false, Agent::Build, "x/y");
+        let s = Runner::system_prompt(&Bundle::default(), Agent::Build, &ws, &full, "x/y");
         assert!(s.contains("Today's date"), "{s}");
-        assert!(s.contains("workspace: /repo"), "{s}");
+        assert!(s.contains("Working directory: /repo"), "{s}");
+        assert!(s.contains("Is directory a git repo:"), "{s}");
     }
 
     #[test]
@@ -2474,7 +2610,8 @@ mod loop_key_tests {
     #[test]
     fn system_prompt_states_primary_source_fence() {
         let bundle = Bundle::default();
-        let s = Runner::system_prompt(&bundle, Agent::Build, Path::new("/repo"));
+        let specs = Runner::tool_specs_filtered(false, false, Agent::Build, "x/y");
+        let s = Runner::system_prompt(&bundle, Agent::Build, Path::new("/repo"), &specs, "x/y");
         assert!(s.contains("primary sources"), "{s}");
         assert!(s.contains("record IDs"), "{s}");
         assert!(s.contains("native"), "{s}");
@@ -3194,9 +3331,12 @@ mod tests {
     #[test]
     fn plan_system_prompt_fences() {
         let bundle = Bundle::default();
-        let s = Runner::system_prompt(&bundle, Agent::Plan, Path::new("/repo"));
+        let plan_specs = Runner::tool_specs_filtered(false, false, Agent::Plan, "openai/gpt-5");
+        let s = Runner::system_prompt(&bundle, Agent::Plan, Path::new("/repo"), &plan_specs, "openai/gpt-5");
         assert!(s.contains("PLAN MODE"), "{s}");
-        let s = Runner::system_prompt(&bundle, Agent::Build, Path::new("/repo"));
+        assert!(s.contains("switch to build mode"), "{s}");
+        let build_specs = Runner::tool_specs_filtered(false, false, Agent::Build, "openai/gpt-5");
+        let s = Runner::system_prompt(&bundle, Agent::Build, Path::new("/repo"), &build_specs, "openai/gpt-5");
         assert!(!s.contains("PLAN MODE"));
     }
 }

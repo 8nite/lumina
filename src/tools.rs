@@ -155,7 +155,14 @@ impl Registry {
             allow_tooling_write: sc.allow_tooling_write,
         };
         match security::decide(&eval) {
-            Decision::Deny => return Err(ToolError::Denied(format!("{name} {target}"))),
+            Decision::Deny => {
+                if sc.agent == Agent::Plan && matches!(name, "edit" | "write" | "patch") {
+                    return Err(ToolError::Denied(format!(
+                        "Cannot use {name} to modify files outside the Plan directory (plan.md, .lumina/plans/); switch to build mode (Tab) to implement."
+                    )));
+                }
+                return Err(ToolError::Denied(format!("{name} {target}")));
+            }
             Decision::Ask => {
                 let mut plugin_allow = false;
                 if let Some(h) = &self.plugins {
@@ -479,6 +486,9 @@ fn do_edit(sc: &SecCtx, args: &HashMap<String, serde_json::Value>) -> Result<Out
     let new = str_arg(args, &["new_string", "newString", "new"]);
     if p.is_empty() || old.is_empty() {
         return Err(ToolError::Msg("edit: missing path/old_string".into()));
+    }
+    if old == new {
+        return Err(ToolError::Msg("edit: old_string and new_string are identical (no-op change)".into()));
     }
     let abs = resolve(sc, &p)?;
     let text = std::fs::read_to_string(&abs).map_err(|_| ToolError::Msg(format!("edit: no such file {p}")))?;
@@ -1861,6 +1871,21 @@ mod extended_tests {
         ]));
         assert!(out.contains("Todos updated: 3/3 completed"), "{out}");
         assert!(!out.contains("In progress"), "{out}");
+    }
+
+    fn reg_call_edit(dir: &std::path::Path) -> String {
+        let reg = Registry::new();
+        let args: HashMap<String, serde_json::Value> = [("path", "f.txt"), ("old_string", "same\n"), ("new_string", "same\n")]
+            .iter().map(|(k, v)| ((*k).into(), serde_json::Value::String((*v).into()))).collect();
+        reg.call(&ctx2(dir), "edit", &args).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn edit_rejects_noop_change() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("f.txt"), "same\n").unwrap();
+        let err = reg_call_edit(d.path());
+        assert!(err.contains("identical"), "{err}");
     }
 
     #[test]

@@ -325,6 +325,97 @@ pub struct Eval {
     pub allow_tooling_write: bool,
 }
 
+/// OpenCode `shell/parse.ts` parity (portable subset): split a command
+/// into top-level segments on `&&`, `||`, `;`, `|` and newlines outside
+/// quotes, so each subcommand is permission-checked on its own
+/// (`a && b | c` = 3 checks, denied individually).
+pub fn split_shell_segments(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = cmd.chars().peekable();
+    let push = |out: &mut Vec<String>, cur: &mut String| {
+        let t = cur.trim().to_string();
+        if !t.is_empty() {
+            out.push(t);
+        }
+        cur.clear();
+    };
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            ';' | '\n' => push(&mut out, &mut cur),
+            '|' | '&' => {
+                // `||` and `&&` are one separator, like single `|` / `&`.
+                if chars.peek() == Some(&c) {
+                    chars.next();
+                }
+                push(&mut out, &mut cur);
+            }
+            _ => cur.push(c),
+        }
+    }
+    push(&mut out, &mut cur);
+    out
+}
+
+/// A pure directory-change prefix (`cd /x`, `pushd ..`) only selects the
+/// working directory; like opencode it is not a permission resource alone.
+fn is_cd_only(seg: &str) -> bool {
+    let t = seg.trim_start();
+    t == "cd" || t.starts_with("cd ") || t == "pushd" || t.starts_with("pushd ") || t == "popd"
+}
+
+/// Combine per-segment verdicts the opencode way: any deny denies,
+/// otherwise any ask asks, otherwise allow. Segments matching no rule
+/// count as ask (fail-safe: opencode defaults unmatched to ask).
+/// Returns None only when nothing checkable ran (empty / cd-only).
+pub fn decide_bash_segments(
+    rules: &std::collections::HashMap<String, String>,
+    cmd: &str,
+) -> Option<Decision> {
+    // No rules: fall through to the mode default (preserves --bypass/-y).
+    if rules.is_empty() {
+        return None;
+    }
+    let mut saw_allow = false;
+    let mut saw_ask = false;
+    let mut checked = 0;
+    for seg in split_shell_segments(cmd) {
+        let t = seg.trim();
+        if t.is_empty() || is_cd_only(t) {
+            continue;
+        }
+        checked += 1;
+        match match_bash_rules(rules, t) {
+            Some(Decision::Deny) => return Some(Decision::Deny),
+            Some(Decision::Ask) => saw_ask = true,
+            Some(Decision::Allow) => saw_allow = true,
+            None => saw_ask = true,
+        }
+    }
+    if checked == 0 {
+        return None;
+    }
+    if saw_ask {
+        Some(Decision::Ask)
+    } else if saw_allow {
+        Some(Decision::Allow)
+    } else {
+        None
+    }
+}
+
 /// Glob-prefix bash rules: `"cargo test *" = "allow"`, `"*" = "ask"`.
 pub fn match_bash_rules(rules: &std::collections::HashMap<String, String>, cmd: &str) -> Option<Decision> {
     for (pattern, verdict) in rules {
@@ -460,7 +551,7 @@ pub fn decide(e: &Eval) -> Decision {
         };
     }
     if is_bash {
-        if let Some(d) = match_bash_rules(&e.bash_rules, &e.target) {
+        if let Some(d) = decide_bash_segments(&e.bash_rules, &e.target) {
             return d;
         }
         if e.destructive {
@@ -489,6 +580,26 @@ mod tests {
 
     fn ws() -> PathBuf {
         PathBuf::from("/repo")
+    }
+
+    #[test]
+    fn shell_segments_split_and_combine() {
+        assert_eq!(split_shell_segments("cargo test * && cargo clippy"), vec!["cargo test *", "cargo clippy"]);
+        assert_eq!(split_shell_segments("a; b | c"), vec!["a", "b", "c"]);
+        assert_eq!(split_shell_segments("echo \"a && b\""), vec!["echo \"a && b\""]);
+        assert_eq!(split_shell_segments("cd /tmp && ls"), vec!["cd /tmp", "ls"]);
+        let mut rules = std::collections::HashMap::new();
+        rules.insert("cargo test *".to_string(), "allow".to_string());
+        rules.insert("rm *".to_string(), "deny".to_string());
+        rules.insert("*".to_string(), "ask".to_string());
+        // All-allow batch allows; any deny denies the whole command.
+        assert!(matches!(decide_bash_segments(&rules, "cargo test * && ls"), Some(Decision::Ask)));
+        assert!(matches!(decide_bash_segments(&rules, "cargo test *"), Some(Decision::Allow)));
+        assert!(matches!(decide_bash_segments(&rules, "cargo test * && rm -rf /"), Some(Decision::Deny)));
+        // cd-only prefix is not a resource; empty rules fall through.
+        assert!(matches!(decide_bash_segments(&rules, "cd /tmp && cargo test *"), Some(Decision::Allow)));
+        assert!(decide_bash_segments(&std::collections::HashMap::new(), "cargo test *").is_none());
+        assert!(decide_bash_segments(&rules, "   ").is_none());
     }
 
     #[test]

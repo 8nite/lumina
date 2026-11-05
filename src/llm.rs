@@ -815,6 +815,47 @@ fn parse_args(raw: &str) -> HashMap<String, serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// OpenCode `model-retry` parity: retryable provider failures (429, 529,
+/// 5xx, transport timeouts/connects) retry with capped exponential backoff
+/// instead of failing the turn. Everything else surfaces immediately.
+fn is_retryable_status(st: u16) -> bool {
+    st == 429 || st == 529 || (500..=599).contains(&st)
+}
+
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis((2000u64 << attempt.min(3)).min(10_000))
+}
+
+fn is_retryable_transport(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
+}
+
+/// POST with retry: `make` builds a fresh request per attempt (builders are
+/// single-use). Returns the first non-retryable response, or the last
+/// retryable response / transport error once the budget (5 retries) is spent.
+async fn post_with_retry<F>(mut make: F, label: &str) -> Result<reqwest::Response, LlmError>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 0u32;
+    loop {
+        match make().send().await {
+            Ok(res) if !is_retryable_status(res.status().as_u16()) => return Ok(res),
+            Ok(res) if attempt >= 5 => {
+                let st = res.status();
+                let t = res.text().await.unwrap_or_default();
+                return Err(LlmError::Msg(format!("{label}: {st}: {t}")));
+            }
+            Ok(_) => {}
+            Err(e) if is_retryable_transport(&e) && attempt < 5 => {}
+            Err(e) => return Err(LlmError::Http(e)),
+        }
+        tracing::warn!("{label}: retryable provider failure, attempt {}/5", attempt + 1);
+        tokio::time::sleep(retry_delay(attempt)).await;
+        attempt += 1;
+    }
+}
+
 async fn chat_openai(
     def: &ProviderDef,
     req: Request,
@@ -868,6 +909,7 @@ async fn chat_openai(
     // effort-rejection 400 instead of failing the turn.
     let sid = uuid::Uuid::new_v4().to_string();
     let mut effort = normalize_effort(&req.reasoning_effort).to_string();
+    let mut retries = 0u32;
     let res = loop {
         if effort.is_empty() {
             if let Some(o) = body.as_object_mut() {
@@ -881,7 +923,23 @@ async fn chat_openai(
             http = http.header(*k, v.clone());
         }
         http = http.header("x-lumina-session", &sid).header("x-opencode-session", &sid);
-        let res = http.json(&body).send().await?;
+        let res = match http.json(&body).send().await {
+            Ok(r) if !is_retryable_status(r.status().as_u16()) => r,
+            Ok(r) if retries >= 5 => r,
+            Ok(_) => {
+                tracing::warn!("openai: retryable provider failure, attempt {}/5", retries + 1);
+                tokio::time::sleep(retry_delay(retries)).await;
+                retries += 1;
+                continue;
+            }
+            Err(e) if is_retryable_transport(&e) && retries < 5 => {
+                tracing::warn!("openai: retryable transport failure, attempt {}/5", retries + 1);
+                tokio::time::sleep(retry_delay(retries)).await;
+                retries += 1;
+                continue;
+            }
+            Err(e) => return Err(LlmError::Http(e)),
+        };
         if res.status().is_success() {
             break res;
         }
@@ -890,6 +948,7 @@ async fn chat_openai(
         if st.as_u16() == 400 && !effort.is_empty() && is_effort_error(&t) {
             if let Some(down) = effort_step_down(&effort) {
                 effort = down.to_string();
+                retries = 0;
                 continue;
             }
         }
@@ -1110,12 +1169,11 @@ async fn chat_anthropic(
     if let Ok(v) = "2023-06-01".parse() {
         headers.insert("anthropic-version", v);
     }
-    let res = client()
-        .post(&url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await?;
+    let res = post_with_retry(
+        || client().post(&url).headers(headers.clone()).json(&body),
+        "anthropic",
+    )
+    .await?;
     if !res.status().is_success() {
         let st = res.status();
         let t = res.text().await.unwrap_or_default();
@@ -1281,7 +1339,7 @@ async fn chat_ollama(
     if !normalize_effort(&req.reasoning_effort).is_empty() {
         body["think"] = serde_json::json!(true);
     }
-    let res = client().post(&url).json(&body).send().await?;
+    let res = post_with_retry(|| client().post(&url).json(&body), "ollama").await?;
     if !res.status().is_success() {
         let st = res.status();
         let t = res.text().await.unwrap_or_default();
@@ -1619,6 +1677,7 @@ async fn chat_responses(
     // unsupported rungs (e.g. iceman rejects max) — walk down to the
     // provider default instead of failing the turn.
     let mut effort = normalize_effort(&req.reasoning_effort).to_string();
+    let mut retries = 0u32;
     let res = loop {
         if effort.is_empty() {
             if let Some(o) = body.as_object_mut() {
@@ -1627,14 +1686,31 @@ async fn chat_responses(
         } else {
             body["reasoning"] = serde_json::json!({"effort": effort});
         }
-        let res = client()
+        let res = match client()
             .post(&url)
             .headers(auth_headers(def))
             .header("x-lumina-session", &sid)
             .header("x-opencode-session", &sid)
             .json(&body)
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) if !is_retryable_status(r.status().as_u16()) => r,
+            Ok(r) if retries >= 5 => r,
+            Ok(_) => {
+                tracing::warn!("responses: retryable provider failure, attempt {}/5", retries + 1);
+                tokio::time::sleep(retry_delay(retries)).await;
+                retries += 1;
+                continue;
+            }
+            Err(e) if is_retryable_transport(&e) && retries < 5 => {
+                tracing::warn!("responses: retryable transport failure, attempt {}/5", retries + 1);
+                tokio::time::sleep(retry_delay(retries)).await;
+                retries += 1;
+                continue;
+            }
+            Err(e) => return Err(LlmError::Http(e)),
+        };
         if res.status().is_success() {
             break res;
         }
@@ -1643,6 +1719,7 @@ async fn chat_responses(
         if st.as_u16() == 400 && !effort.is_empty() && is_effort_error(&t) {
             if let Some(down) = effort_step_down(&effort) {
                 effort = down.to_string();
+                retries = 0;
                 continue;
             }
         }
@@ -1766,6 +1843,19 @@ async fn chat_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_budget_covers_transient_failures() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(529));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(404));
+        assert_eq!(retry_delay(0), std::time::Duration::from_millis(2000));
+        assert_eq!(retry_delay(1), std::time::Duration::from_millis(4000));
+        assert_eq!(retry_delay(9), std::time::Duration::from_millis(10_000));
+    }
 
     #[test]
     fn split_model_shapes() {
