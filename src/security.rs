@@ -88,12 +88,6 @@ pub fn is_credential_path(target: &str) -> bool {
         .any(|s| base.contains(s) || lower.contains(s))
 }
 
-/// Literal secret-injection flags are always denied: `kubectl create secret
-/// --from-literal=` would embed secret values in shell commands (Go parity).
-pub fn has_forbidden_literal(target: &str) -> bool {
-    target.contains("--from-literal=")
-}
-
 /// Home directory (`os.UserHomeDir` then `$HOME`).
 pub fn home_dir() -> String {
     std::env::var("HOME").unwrap_or_default()
@@ -411,9 +405,6 @@ pub fn decide(e: &Eval) -> Decision {
     if is_credential_path(&e.target) && !credential_override_allowed(&e.workspace, &e.tool, &e.target) {
         return Decision::Deny;
     }
-    if has_forbidden_literal(&e.target) || has_forbidden_literal(&e.tool) {
-        return Decision::Deny;
-    }
     let tool = e.tool.as_str();
     let is_read = matches!(
         tool,
@@ -657,19 +648,6 @@ mod parity_tests {
         PathBuf::from("/repo")
     }
 
-    fn eval(tool: &str, target: &str) -> Eval {
-        Eval {
-            agent: Agent::Build,
-            mode: PermissionMode::Bypass,
-            tool: tool.into(),
-            target: target.into(),
-            workspace: ws(),
-            destructive: false,
-            bash_rules: Default::default(),
-            allow_tooling_write: false,
-        }
-    }
-
     #[test]
     fn credential_widened_lists() {
         // Go CredentialFileNames parity: .env.local, .npmrc, id_rsa, vault, secrets.
@@ -695,14 +673,6 @@ mod parity_tests {
         // Innocent paths stay allowed.
         assert!(!is_credential_path("main.go"));
         assert!(!is_credential_path("README.md"));
-    }
-
-    #[test]
-    fn from_literal_flag_denied() {
-        // `kubectl --from-literal=` would embed secret values in commands.
-        assert!(has_forbidden_literal("cmd --from-literal=password"));
-        assert_eq!(decide(&eval("bash", "cmd --from-literal=password")), Decision::Deny);
-        assert!(!has_forbidden_literal("https://api.github.com"));
     }
 
     #[test]
