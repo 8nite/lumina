@@ -42,3 +42,4 @@ tags: [index, memory, lumina]
 - [[webui-tables]] — WebUI pipe tables rendered as literal text: `LinkifiedText.tsx` GFM table grammar (`splitRow` code-span-aware split, `delimAlign`, strict header/delimiter match, ragged-row pad/truncate); `tsc` + `vite build` green.
 - [[webui-background-visibility]] — Background-turn visibility (3bbace61 gap): daemon live-turn set overlays `running` on session views, sidebar pulsing dot, `App.tsx` completion toasts + tab title flash for unviewed sessions.
 - [[cache-hits]] — Prefix-cache hit rates per session (60-71% steady-state, compact costs one full-price turn, subagents start ice-cold, model swap resets namespace).
+- [[zero-google-removal-2026-11-05]] — Zero-Google guardrail layer removed (dead weight, operator uses no Google services): `is_google_url/target` + endpoint/env/cmd checks + server 403s + MCP/fetch blocks + 6 tests gone; credential denies kept. `plan.md`/`test-plan.md` left historical.
