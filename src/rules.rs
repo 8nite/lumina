@@ -37,6 +37,8 @@ pub struct AgentDef {
     pub description: String,
     pub mode: String,
     pub model: String,
+    /// Optional per-agent step cap (opencode `steps:` parity). None = turn cap.
+    pub steps: Option<usize>,
     #[allow(dead_code)]
     pub path: String,
     pub body: String,
@@ -147,6 +149,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             model: String::new(),
             path: String::new(),
             body: "You are a general-purpose subagent. Research the workspace, run safe diagnostics, and complete multi-step tasks. Read the request first; use `question` when intent is ambiguous, then at most one `kb_query` with request keywords (budget 4000) only when a KB is configured (skip when the tool reports none); prefer code grep otherwise. Summarize what you did with file references.".into(),
+            steps: None,
             tools: HashMap::new(),
         },
         AgentDef {
@@ -156,6 +159,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
             model: String::new(),
             path: String::new(),
             body: "You are an explore subagent. Read the request first; use `question` when intent is ambiguous, then search code (read, glob, grep), memory (`kb_query` once with request keywords, budget 4000, only when a KB is configured — skip when the tool reports none; `skill`), and the web (webfetch, websearch). Do not edit files. Report findings with file and line references.".into(),
+            steps: None,
             tools: HashMap::new(),
         },
     ]
@@ -182,6 +186,7 @@ fn discover_agents(workspace: &Path) -> Vec<AgentDef> {
                 model: meta.get("model").cloned().unwrap_or_default(),
                 path: f.display().to_string(),
                 body,
+                steps: meta.get("steps").and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0),
                 tools: meta
                     .iter()
                     .filter_map(|(k, v)| {
@@ -322,6 +327,19 @@ impl Bundle {
 #[cfg(test)]
 mod frontmatter_tests {
     use super::*;
+
+    #[test]
+    fn steps_value_parses() {
+        let content = "---\nname: reviewer\nmode: primary\nsteps: 8\n---\nBody.\n";
+        let (meta, _) = parse_frontmatter(content);
+        assert_eq!(meta.get("steps").map(|s| s.as_str()), Some("8"));
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".lumina/agents")).unwrap();
+        std::fs::write(d.path().join(".lumina/agents/r.md"), content).unwrap();
+        let b = Bundle::load(d.path(), false, false);
+        let def = b.agents.iter().find(|a| a.name == "reviewer").expect("agent found");
+        assert_eq!(def.steps, Some(8));
+    }
 
     #[test]
     fn tools_block_parses() {

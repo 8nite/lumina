@@ -1396,6 +1396,16 @@ async fn answer_permission(
     if !["allow_once", "allow_session", "allow_always", "deny"].contains(&d) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "decision must be allow_once|allow_session|allow_always|deny"}))).into_response();
     }
+    // OpenCode saved-approval parity: `allow_always` persists as a durable
+    // project-scoped rule; deny paths still win (decide() runs pre-gate).
+    if d == "allow_always" {
+        if let Some(meta) = st.gate.lookup_perm(&req_id) {
+            let ws = st.store.get_session(&meta.session).ok().flatten().map(|x| x.workspace_dir).unwrap_or_default();
+            if !ws.is_empty() {
+                crate::approve::record_allow_always(std::path::Path::new(&ws), &meta.tool, &meta.target);
+            }
+        }
+    }
     if st.gate.resolve(&req_id, d) {
         Json(serde_json::json!({"ok": true})).into_response()
     } else {

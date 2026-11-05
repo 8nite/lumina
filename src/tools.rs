@@ -85,12 +85,23 @@ pub struct Registry {
 pub type SubagentFn = Arc<dyn Fn(&SecCtx, &SubagentReq) -> Result<String, String> + Send + Sync>;
 
 /// One scoped child delegation (tools.SubagentRequest parity).
+/// `session_id` continues a prior child (opencode `sessionID` parity):
+/// the previous result is prepended as context instead of failing.
 #[derive(Debug, Clone, Default)]
 pub struct SubagentReq {
     pub task: String,
     pub agent: String,
     pub description: String,
     pub model: String,
+    pub session_id: String,
+}
+
+/// Prior child results by subagent session id (in-memory, daemon lifetime).
+/// Lets a follow-up `sessionID` resume the same child conversation.
+fn child_sessions() -> &'static Mutex<HashMap<String, (String, String)>> {
+    use std::sync::OnceLock;
+    static CHILD: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+    CHILD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Delegation cap (default 1; `LUMINA_SUBAGENT_DEPTH` overrides).
@@ -1238,22 +1249,29 @@ fn do_subagent(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::V
     if sc.depth >= max {
         return Err(ToolError::Msg(format!("subagent: nesting depth {max} exceeded (subagents cannot launch subagents)")));
     }
-    // Follow-ups target live child sessions, which do not persist:
-    // fail loudly instead of silently starting an unrelated child.
-    if !str_arg(args, &["sessionID", "sessionId", "session_id"]).is_empty() {
-        return Err(ToolError::Msg("subagent: follow-up via sessionID is not supported; start a new subagent with full context instead".into()));
-    }
     let task = str_arg(args, &["task", "prompt"]);
     if task.is_empty() {
         return Err(ToolError::Msg("subagent: missing task".into()));
     }
     let name = str_arg(args, &["agent", "name"]);
     let name = if name.is_empty() { "general" } else { name.as_str() };
+    // OpenCode parity: a prior child session id resumes that child — its
+    // last result is folded into the follow-up prompt.
+    let sid = str_arg(args, &["sessionID", "sessionId", "session_id", "session"]);
+    let mut full_task = task.clone();
+    if !sid.is_empty() {
+        if let Some((prev_agent, prev_result)) = child_sessions().lock().unwrap().get(&sid) {
+            full_task = format!(
+                "Continuing subagent session {sid} (agent {prev_agent}). Prior result:\n{prev_result}\n\nFollow-up task:\n{task}"
+            );
+        }
+    }
     let req = SubagentReq {
-        task: task.clone(),
+        task: full_task,
         agent: name.into(),
         description: str_arg(args, &["description"]),
         model: str_arg(args, &["model"]),
+        session_id: sid.clone(),
     };
     let Some(f) = &reg.subagent else {
         return Err(ToolError::Msg("subagent: executor not attached".into()));
@@ -1278,8 +1296,15 @@ fn do_subagent(reg: &Registry, sc: &SecCtx, args: &HashMap<String, serde_json::V
     }
     f(sc, &req)
         .map(|s| {
+            // Record the child result so a follow-up `sessionID` resumes it
+            // (opencode child-session parity). Stored text capped at 4k.
+            let id = if sid.is_empty() { uuid::Uuid::new_v4().to_string() } else { sid.clone() };
+            let mut kept = s.clone();
+            truncate_to(&mut kept, 4000);
+            child_sessions().lock().unwrap().insert(id.clone(), (name.to_string(), kept));
             let truncated = s.len() > 8000;
-            Outcome { output: s, truncated }
+            let output = format!("{s}\n(subagent session: {id} — pass as sessionID to continue this child)");
+            Outcome { output, truncated }
         })
         .map_err(ToolError::Msg)
 }
@@ -1836,6 +1861,25 @@ mod extended_tests {
         ]));
         assert!(out.contains("Todos updated: 3/3 completed"), "{out}");
         assert!(!out.contains("In progress"), "{out}");
+    }
+
+    #[test]
+    fn subagent_session_continues_child() {
+        use std::sync::Arc;
+        let d = tempfile::tempdir().unwrap();
+        let mut reg = Registry::new();
+        // Stub executor echoes the task it received.
+        reg.subagent = Some(Arc::new(|_sc: &SecCtx, req: &SubagentReq| Ok(format!("ECHO: {}", req.task))));
+        let sc = ctx2(d.path());
+        let out = reg.call(&sc, "subagent", &args(&[("task", "first job")])).unwrap();
+        assert!(out.output.contains("ECHO: first job"), "{}", out.output);
+        // The output advertises a resumable session id.
+        let tail = out.output.rsplit("(subagent session: ").next().unwrap();
+        let id = tail.split(' ').next().unwrap_or_default();
+        assert!(!id.is_empty(), "{}", out.output);
+        let out2 = reg.call(&sc, "subagent", &args(&[("task", "follow up"), ("sessionID", id)])).unwrap();
+        assert!(out2.output.contains("Continuing subagent session"), "{}", out2.output);
+        assert!(out2.output.contains("first job"), "prior result folded in: {}", out2.output);
     }
 
     #[test]

@@ -200,6 +200,21 @@ fn wait_timeout<T>(mut rx: oneshot::Receiver<T>, max: Duration) -> Result<T, Wai
         }
     }
 
+    /// Peek at a pending permission without resolving it (used to persist
+    /// `allow_always` against the session workspace).
+    pub fn lookup_perm(&self, req_id: &str) -> Option<PendingPerm> {
+        let inner = self.inner()?;
+        inner.perms.lock().unwrap().get(req_id).map(|(m, _)| m.clone())
+    }
+
+    /// Seed one in-memory session grant (used to replay durable
+    /// project-scoped `allow_always` rules at turn start).
+    pub fn seed_grant(&self, session: &str, tool: &str, prefix: &str) {
+        if let Some(inner) = self.inner() {
+            inner.grants.lock().unwrap().insert((session.into(), tool.into(), prefix.into()));
+        }
+    }
+
     pub fn answer(&self, req_id: &str, answers: Vec<Vec<String>>) -> bool {
         let Some(inner) = self.inner() else { return false };
         match inner.questions.lock().unwrap().remove(req_id) {
@@ -233,6 +248,50 @@ fn wait_timeout<T>(mut rx: oneshot::Receiver<T>, max: Duration) -> Result<T, Wai
             .map(|(m, _)| m.clone());
         (perm, ques)
     }
+}
+
+/// Durable project-scoped `allow_always` rules (opencode saved-approval
+/// parity): `<workspace>/.lumina/permissions.json` holding
+/// `{"allow": [{"tool": ..., "prefix": ...}]}`. Deny paths in
+/// `security::decide` run before the gate, so these never override a deny.
+fn allow_always_path(workspace: &std::path::Path) -> std::path::PathBuf {
+    workspace.join(".lumina/permissions.json")
+}
+
+/// Record one durable allow rule (deduped, best-effort).
+pub fn record_allow_always(workspace: &std::path::Path, tool: &str, prefix: &str) {
+    let path = allow_always_path(workspace);
+    let mut rules: Vec<(String, String)> = load_allow_always(workspace);
+    if rules.iter().any(|(t, p)| t == tool && p == prefix) {
+        return;
+    }
+    rules.push((tool.into(), prefix.into()));
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let items: Vec<serde_json::Value> = rules
+        .iter()
+        .map(|(t, p)| serde_json::json!({"tool": t, "prefix": p}))
+        .collect();
+    let _ = std::fs::write(&path, serde_json::json!({"allow": items}).to_string());
+}
+
+/// Load durable allow rules for a workspace (empty when none).
+pub fn load_allow_always(workspace: &std::path::Path) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(allow_always_path(workspace)).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    v.get("allow")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let t = e.get("tool")?.as_str()?;
+                    let p = e.get("prefix")?.as_str()?;
+                    Some((t.to_string(), p.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 
@@ -279,6 +338,21 @@ mod tests {
         h2.join().unwrap();
         // Second ask on the same prefix passes without a new request.
         assert!(gate2.ask("s2", "edit", "a.rs").unwrap());
+    }
+
+    #[test]
+    fn allow_always_round_trips_through_file() {
+        let ws = tempfile::tempdir().unwrap();
+        assert!(load_allow_always(ws.path()).is_empty());
+        record_allow_always(ws.path(), "bash", "git status");
+        record_allow_always(ws.path(), "bash", "git status"); // deduped
+        let rules = load_allow_always(ws.path());
+        assert_eq!(rules, vec![("bash".to_string(), "git status".to_string())]);
+        // A seeded grant lets ask() pass without prompting.
+        let (tx, _rx) = broadcast::channel(16);
+        let gate = ApprovalGate::new(tx);
+        gate.seed_grant("s", "bash", "git status");
+        assert!(gate.ask("s", "bash", "git status --short").unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]

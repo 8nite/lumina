@@ -10,7 +10,7 @@ use crate::{
     tools::{Registry, SecCtx},
 };
 use std::sync::Arc;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -160,10 +160,18 @@ impl Runner {
     }
 
     fn tool_specs() -> Vec<ToolSpec> {
-        Self::tool_specs_filtered(false, false)
+        Self::tool_specs_filtered(false, false, Agent::Build, "")
     }
 
-    fn tool_specs_filtered(hide_websearch: bool, hide_lsp: bool) -> Vec<ToolSpec> {
+    /// OpenCode parity: `patch` is only advertised to GPT-family models
+    /// (others get edit/write). Case-insensitive `gpt` match.
+    fn supports_patch(model: &str) -> bool {
+        model.to_lowercase().contains("gpt")
+    }
+
+    /// Per-agent tool specs (opencode parity): plan-shaped agents never see
+    /// edit-class or delegation tools, and `patch` is GPT-only.
+    fn tool_specs_filtered(hide_websearch: bool, hide_lsp: bool, agent: Agent, model: &str) -> Vec<ToolSpec> {
         let obj = |props: &[&str]| {
             serde_json::json!({
                 "type": "object",
@@ -193,15 +201,43 @@ impl Runner {
         .into_iter()
         .filter(|t| !(hide_websearch && t.name == "websearch"))
         .filter(|t| !(hide_lsp && t.name == "lsp"))
+        .filter(|t| {
+            // Plan agents are research-only: never advertise edit-class or
+            // delegation tools (the security fence denies them regardless).
+            if agent == Agent::Plan {
+                !matches!(
+                    t.name.as_str(),
+                    "edit" | "write" | "patch" | "todowrite" | "subagent" | "mcp"
+                )
+            } else {
+                true
+            }
+        })
+        .filter(|t| t.name != "patch" || Self::supports_patch(model))
         .collect()
     }
 
-    fn system_prompt(bundle: &Bundle, agent: Agent) -> String {
+    /// OpenCode `instructions/builtins.ts` parity: date + working context so
+    /// the model never has to guess recency, location, or platform.
+    fn env_block(workspace: &Path) -> String {
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let git = if workspace.join(".git").exists() { "yes" } else { "no" };
+        let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+        format!(
+            "Today's date: {date}\n<env>\nworkspace: {}\ngit: {git}\nplatform: {}-{}\ntmp: {tmp} (prefer session TMPDIR tools, never hardcode /tmp)\n</env>\n",
+            workspace.display(),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    }
+
+    fn system_prompt(bundle: &Bundle, agent: Agent, workspace: &Path) -> String {
         let mut s = bundle.system_prompt.clone();
-        s.push_str("\nYou are Lumina, a local-first coding agent. Answer with tool calls when action helps; otherwise reply directly.\n");
+        s.push_str(&Self::env_block(workspace));
+        s.push_str("You are Lumina, a local-first coding agent. Answer with tool calls when action helps; otherwise reply directly.\n");
         s.push_str("Persistence: continue the ORIGINAL user request until fully complete (all edits applied, tests/build pass). Do NOT stop with a status summary, do NOT ask the user to say 'continue', and do NOT end with 'what I found' when fixes were requested — finish the work, then reply with the completed result.\n");
         s.push_str("Fix/build/change requests are not done with zero edits: make the change (then verify it) or state exactly what is missing or blocked — ending with a status summary and no edits is not done.\n");
-        s.push_str("Verify every code change in the same turn: a turn that ran edit/write/patch must also run a passing test/build/typecheck command (cargo test, pnpm build, tsc, …) before replying done — an edit without a green verification run is not done.\n");
+        s.push_str("Verify every code change in the same turn: a turn that ran edit/write/patch must also run a passing test/build/typecheck command (cargo test, pnpm build, tsc, …) or directly run the created artifact, before replying done — an edit without a green verification run is not done.\n");
         if agent == Agent::Plan {
             s.push_str("PLAN MODE: research and blueprint only. Never edit source files; scoped writes to plan.md or .lumina/plans/*.md only.\n");
         }
@@ -280,7 +316,7 @@ impl Runner {
 
         let mut messages = vec![llm::Message {
             role: "system".into(),
-            content: Self::system_prompt(&bundle, agent),
+            content: Self::system_prompt(&bundle, agent, &workspace),
             thinking: String::new(),
         }];
         if let Some(def) = &custom {
@@ -407,6 +443,15 @@ impl Runner {
         };
         let hide_websearch = cfg.websearch.disabled;
         let hide_lsp = cfg.lsp.disabled;
+        // Per-agent step cap (opencode `steps:` parity): custom agents may
+        // bound the turn; otherwise the runner-wide 120-round ceiling holds.
+        let max_steps = custom.as_ref().and_then(|d| d.steps).unwrap_or(self.max_steps);
+        // Seed durable project-scoped `allow_always` grants (opencode saved
+        // approvals parity): deny paths return before the gate, so these
+        // never override a configured deny.
+        for (tool, prefix) in crate::approve::load_allow_always(&workspace) {
+            sc.gate.seed_grant(session_id, &tool, &prefix);
+        }
         // No-progress gate input (stuck session 81bdb764: a fix request
         // ended after 11 explore calls with zero edits and duplicated
         // filler). Plan mode is research-only by design, so it is exempt.
@@ -430,6 +475,7 @@ impl Runner {
                 &user_turn.id,
                 hide_websearch,
                 hide_lsp,
+                max_steps,
                 work_requested,
                 diagnostic_requested,
             )
@@ -449,7 +495,7 @@ impl Runner {
         Ok(outcome)
     }
 
-    // ponytail: allow 18-arg turn loop (single call site; struct would churn diff).
+    // ponytail: allow 19-arg turn loop (single call site; struct would churn diff).
     #[allow(clippy::too_many_arguments)]
     async fn loop_until_done(
         &self,
@@ -469,6 +515,7 @@ impl Runner {
         user_turn_id: &str,
         hide_websearch: bool,
         hide_lsp: bool,
+        max_steps: usize,
         work_requested: bool,
         diagnostic_requested: bool,
     ) -> Result<TurnOutcome, AgentError> {
@@ -493,6 +540,9 @@ impl Runner {
         // rounds, then the tail carries an explicit resume pointer).
         let mut mutated = false;
         let mut verified = false;
+        // Files this turn created/rewrote (edit/write/patch targets): a
+        // later successful direct run of one counts as verification.
+        let mut written: HashSet<String> = HashSet::new();
         let mut verify_rounds = 0usize;
         // No-progress gate (stuck session 81bdb764: a fix request ended
         // after 11 explore calls with zero edits and duplicated filler —
@@ -546,7 +596,7 @@ impl Runner {
         let mut static_streak = 0usize;
         let mut live_seen = false;
         let mut diagnostic_rounds = 0usize;
-        for round in 0..self.max_steps {
+        for round in 0..max_steps {
             // Cooperative stop (web Stop button / POST /stop): end the
             // turn at the next round boundary instead of running to the
             // step ceiling.
@@ -559,9 +609,17 @@ impl Runner {
             // while the model kept tooling. Strip tools for exactly one
             // round so the model states its answer instead of re-running
             // what produces nothing new (max 2 per turn, then release).
-            let mut req_tools = Self::tool_specs_filtered(hide_websearch, hide_lsp);
+            let mut req_tools = Self::tool_specs_filtered(hide_websearch, hide_lsp, sc.agent, model);
             let mut forced_this_round = false;
-            if force_answer {
+            // OpenCode `steps:` parity: on the final step the tools are
+            // removed and the model is asked to summarize in text.
+            if round + 1 == max_steps && max_steps > 0 {
+                req_tools = Vec::new();
+                messages.push(llm::Message { role: "user".into(),
+                    content: "Final step: tool use is disabled for this round. State your current answer, what was accomplished, and what remains undone.".into(),
+                    thinking: String::new() });
+                on_stage("summarizing…");
+            } else if force_answer {
                 force_answer = false;
                 if forced_answers < 2 {
                     forced_answers += 1;
@@ -1062,6 +1120,7 @@ impl Runner {
                     text_streak = 0;
                     let target = crate::tools::tool_target(&tc.name, &args);
                     if !target.is_empty() {
+                        written.insert(target.clone());
                         read_counts.remove(&target);
                     }
                 }
@@ -1085,7 +1144,7 @@ impl Runner {
                 }
                 if tc.name.eq_ignore_ascii_case("bash") && result_ok && !rendered.contains("[exit ") {
                     let cmd = crate::tools::tool_target(&tc.name, &args);
-                    if is_verify_command(&cmd) {
+                    if is_verify_command(&cmd) || runs_written_artifact(&cmd, &written) {
                         verified = true;
                     }
                 }
@@ -1227,7 +1286,7 @@ impl Runner {
         // explicit budget notice (session 7920b8fc ended with a bare echo
         // of the last filler text, which read as done with work remaining).
         // The last model text follows for context, then resume pointers.
-        let tail = ceiling_tail(&last_nonempty, self.max_steps, mutated, verified, work_requested);
+        let tail = ceiling_tail(&last_nonempty, max_steps, mutated, verified, work_requested);
         // User transparency: resolve any refs the model echoed before storing.
         let tail = store.vault.resolve(session_id, &tail).map_err(AgentError::Msg)?;
         store.add_turn(session_id, "assistant", &tail)?;
@@ -1308,13 +1367,14 @@ fn is_mutating(name: &str) -> bool {
 
 /// Side-effect-free tools safe for concurrent execution inside one model
 /// batch: pure reads plus skill-body loads (bundle lookup, no I/O beyond).
-/// Everything else (bash/edit/write/patch/mcp/subagent/question/web*,
-/// kb_query which may call the LLM, task_output polling) stays sequential
-/// so ordering, approval, and ledger semantics never change.
+/// OpenCode parity: independent web fetches/searches and background-task
+/// polls run concurrently too. Everything else (bash/edit/write/patch/mcp/
+/// subagent/question, kb_query which may call the LLM) stays sequential so
+/// ordering, approval, and ledger semantics never change.
 fn is_parallel_tool(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
-        "read" | "glob" | "grep" | "lsp" | "skill"
+        "read" | "glob" | "grep" | "lsp" | "skill" | "webfetch" | "websearch" | "task_output"
     )
 }
 
@@ -1602,6 +1662,38 @@ fn is_verify_command(cmd: &str) -> bool {
     lower.contains("pnpm") && (lower.contains("build") || lower.contains("test"))
 }
 
+/// Verify-after-fix gate, artifact-run edition: a successful bash that
+/// directly executes a file this turn wrote (e.g. `python3 hello.py` right
+/// after writing `hello.py`) counts as verification for that change.
+/// Reads (`cat`/`grep`/…), removals, and runs of other files never count.
+/// A miss only costs the verify nudge, never correctness.
+fn runs_written_artifact(cmd: &str, written: &HashSet<String>) -> bool {
+    if written.is_empty() {
+        return false;
+    }
+    let lower = cmd.to_lowercase();
+    // Reads, removals, and copies observe but never verify.
+    const NON_VERIFY: &[&str] = &[
+        "cat ", "grep ", "head ", "tail ", "less ", "more ", "wc ", "diff ", "rm ", "mv ", "cp ",
+        "sed ", "awk ",
+    ];
+    if NON_VERIFY.iter().any(|r| lower.contains(r)) {
+        return false;
+    }
+    // Execution signals only: interpreter runs, `./` runs, shell runs.
+    const RUNNERS: &[&str] = &[
+        "python", "node", "deno", "bun", "ruby", "php", "perl", "bash ", "sh ", "./",
+    ];
+    if !RUNNERS.iter().any(|r| lower.contains(r)) {
+        return false;
+    }
+    written.iter().any(|w| {
+        let wl = w.to_lowercase();
+        lower.contains(&wl)
+            || wl.rsplit('/').next().is_some_and(|b| !b.is_empty() && lower.contains(b))
+    })
+}
+
 /// Verify-after-fix tracking: does this bash command plausibly mutate the
 /// workspace (so a green verify run from before it no longer proves the
 /// tree)? Substring match on the lowered command. Interpreters only count
@@ -1724,7 +1816,8 @@ const NO_PROGRESS_POINTER: &str = "Note: no edit/write/patch ran this turn, so t
 
 
 /// Scoped subagent run: fresh context with a builtin (general|explore) system
-/// prompt, restricted tool specs, max 6 steps, no further delegation.
+/// prompt, restricted tool specs, per-agent step cap (builtins: 32),
+/// no further delegation.
 async fn run_subtask(
     router: &Router,
     cfg: &crate::config::Config,
@@ -1785,14 +1878,21 @@ async fn run_subtask(
         description.push_str("…[truncated]");
     }
     let mut prompt_text = format!("You are the {} subagent. {}\n\nScope: use only the provided tools; you cannot launch subagents. When done, summarize findings with file references.", def.name, def.body);
+    if !req.session_id.is_empty() {
+        prompt_text.push_str(&format!("\n\nResumed child session: {}.", req.session_id));
+    }
     if !description.is_empty() {
         prompt_text.push_str("\n\nTask context: ");
         prompt_text.push_str(&description);
     }
     prompt_text.push_str(crate::vault::VAULT_GUIDANCE);
     prompt_text.push('\n');
-    // Explore is read-only; general gets everything but subagent.
-    let specs: Vec<ToolSpec> = Runner::tool_specs_filtered(cfg.websearch.disabled, cfg.lsp.disabled)
+    // OpenCode parity: explore denies everything except reads/globs/grep/
+    // webfetch/websearch/external (question excluded); general denies
+    // questions and subagents. Patch stays GPT-only.
+    let is_explore = req.agent.eq_ignore_ascii_case("explore");
+    let child_agent = if is_explore { Agent::Plan } else { Agent::Build };
+    let specs: Vec<ToolSpec> = Runner::tool_specs_filtered(cfg.websearch.disabled, cfg.lsp.disabled, child_agent, &model)
         .into_iter()
         .filter(|t| {
             if req.agent.eq_ignore_ascii_case("explore") {
@@ -1802,7 +1902,7 @@ async fn run_subtask(
                         | "kb_query" | "webfetch" | "websearch" | "task_output"
                 )
             } else {
-                t.name != "subagent"
+                !matches!(t.name.as_str(), "subagent" | "question")
             }
         })
         .collect();
@@ -1851,7 +1951,8 @@ async fn run_subtask(
     // subagent cannot spin where the parent would be stopped.
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut read_counts: HashMap<String, usize> = HashMap::new();
-    for _ in 0..32 {
+    // Per-agent `steps:` cap (opencode parity); builtins keep 32.
+    for _ in 0..def.steps.unwrap_or(32) {
         let (txs, mut rxs) = mpsc::unbounded_channel::<Chunk>();
         let req_msg = Request {
             model: model.clone(),
@@ -2075,18 +2176,44 @@ mod specs_tests {
 
     #[test]
     fn tool_specs_filtered_hides_websearch() {
-        let specs = Runner::tool_specs_filtered(true, false);
+        let specs = Runner::tool_specs_filtered(true, false, Agent::Build, "openai/gpt-5");
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(!names.contains(&"websearch"), "{names:?}");
         assert!(names.contains(&"webfetch"), "{names:?}");
-        let all_specs = Runner::tool_specs_filtered(false, false);
+        let all_specs = Runner::tool_specs_filtered(false, false, Agent::Build, "openai/gpt-5");
         let all: Vec<&str> = all_specs.iter().map(|s| s.name.as_str()).collect();
         assert!(all.contains(&"websearch"), "{all:?}");
     }
 
     #[test]
+    fn tool_specs_plan_hides_edits_and_patch_is_gpt_only() {
+        // Plan agents are research-only: no edit-class or delegation tools.
+        let plan = Runner::tool_specs_filtered(false, false, Agent::Plan, "openai/gpt-5");
+        let names: Vec<&str> = plan.iter().map(|s| s.name.as_str()).collect();
+        for t in ["edit", "write", "patch", "todowrite", "subagent", "mcp"] {
+            assert!(!names.contains(&t), "{names:?}");
+        }
+        assert!(names.contains(&"question"), "{names:?}");
+        // Non-GPT models get edit/write instead of patch (opencode parity).
+        let claude = Runner::tool_specs_filtered(false, false, Agent::Build, "anthropic/claude-sonnet-4");
+        let names: Vec<&str> = claude.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"patch"), "{names:?}");
+        assert!(names.contains(&"edit") && names.contains(&"write"), "{names:?}");
+        let gpt = Runner::tool_specs_filtered(false, false, Agent::Build, "openai/gpt-5-mini");
+        assert!(gpt.iter().any(|s| s.name == "patch"));
+    }
+
+    #[test]
+    fn system_prompt_carries_env_block() {
+        let ws = PathBuf::from("/repo");
+        let s = Runner::system_prompt(&Bundle::default(), Agent::Build, &ws);
+        assert!(s.contains("Today's date"), "{s}");
+        assert!(s.contains("workspace: /repo"), "{s}");
+    }
+
+    #[test]
     fn tool_specs_filtered_hides_lsp() {
-        let specs = Runner::tool_specs_filtered(false, true);
+        let specs = Runner::tool_specs_filtered(false, true, Agent::Build, "openai/gpt-5");
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert!(!names.contains(&"lsp"), "{names:?}");
         assert!(names.contains(&"grep"), "{names:?}");
@@ -2094,10 +2221,10 @@ mod specs_tests {
 
     #[test]
     fn parallel_set_is_read_only() {
-        for t in ["read", "glob", "grep", "lsp", "skill", "READ"] {
+        for t in ["read", "glob", "grep", "lsp", "skill", "READ", "webfetch", "websearch", "task_output"] {
             assert!(is_parallel_tool(t), "{t}");
         }
-        for t in ["bash", "edit", "write", "patch", "subagent", "task_output", "kb_query", "question", "webfetch", "mcp"] {
+        for t in ["bash", "edit", "write", "patch", "subagent", "kb_query", "question", "mcp"] {
             assert!(!is_parallel_tool(t), "{t}");
         }
     }
@@ -2259,6 +2386,26 @@ mod loop_key_tests {
     }
 
     #[test]
+    fn written_artifact_run_verifies() {
+        let w: HashSet<String> = ["hello.py".to_string()].into_iter().collect();
+        assert!(runs_written_artifact("python3 hello.py", &w));
+        assert!(runs_written_artifact("python hello.py && echo done", &w));
+        assert!(runs_written_artifact("node hello.py", &w));
+        // Absolute write vs relative run (and vice versa) match by basename.
+        let abs: HashSet<String> = ["/tmp/t/hello.py".to_string()].into_iter().collect();
+        assert!(runs_written_artifact("python3 hello.py", &abs));
+        assert!(runs_written_artifact("python3 /tmp/t/hello.py", &w));
+        assert!(runs_written_artifact("./hello.py", &w));
+        // Reads, removals, other files, and empty sets never verify.
+        assert!(!runs_written_artifact("cat hello.py", &w));
+        assert!(!runs_written_artifact("grep -r x hello.py", &w));
+        assert!(!runs_written_artifact("rm hello.py", &w));
+        assert!(!runs_written_artifact("python3 other.py", &w));
+        assert!(!runs_written_artifact("ls -la", &w));
+        assert!(!runs_written_artifact("python3 hello.py", &HashSet::new()));
+    }
+
+    #[test]
     fn bash_mutation_detection() {
         // Session 7920b8fc: sed/python patches via bash must arm the gate.
         assert!(bash_looks_mutating("sed -i 's/a/b/' src/main.rs"));
@@ -2327,7 +2474,7 @@ mod loop_key_tests {
     #[test]
     fn system_prompt_states_primary_source_fence() {
         let bundle = Bundle::default();
-        let s = Runner::system_prompt(&bundle, Agent::Build);
+        let s = Runner::system_prompt(&bundle, Agent::Build, Path::new("/repo"));
         assert!(s.contains("primary sources"), "{s}");
         assert!(s.contains("record IDs"), "{s}");
         assert!(s.contains("native"), "{s}");
@@ -3047,9 +3194,9 @@ mod tests {
     #[test]
     fn plan_system_prompt_fences() {
         let bundle = Bundle::default();
-        let s = Runner::system_prompt(&bundle, Agent::Plan);
+        let s = Runner::system_prompt(&bundle, Agent::Plan, Path::new("/repo"));
         assert!(s.contains("PLAN MODE"), "{s}");
-        let s = Runner::system_prompt(&bundle, Agent::Build);
+        let s = Runner::system_prompt(&bundle, Agent::Build, Path::new("/repo"));
         assert!(!s.contains("PLAN MODE"));
     }
 }
