@@ -1,2 +1,9 @@
 # guardrails.yaml
 # Managed by `lumina evolve` (Harness² Level 1). Additive edits only.
+- id: deepcopy-close-evidence
+  when: prompt matches "why.*clos|still.*hold|mirror.*master"
+  require: [relay_copies.closeReason, relay_copies.closedAt, sibling-basket-check]
+  forbid: answering EQUITY-STOP vs mirror from DetailedStatement.htm alone when incident > statement max date
+- id: deepcopy-secret-hygiene
+  when: querying Mongo/K8s secrets
+  require: secrets via env/subprocess in bash, never print URI/key, never commit transcript values
