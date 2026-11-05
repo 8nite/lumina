@@ -49,6 +49,15 @@ Keep changes boring, minimal, and reversible.
 - `src/tui.rs` / `src/sdk.rs` / `src/pty.rs` / `src/approve.rs` — ratatui client, typed client, web terminal, permission broker.
 - `web/` — React + Vite + Tailwind SPA, embedded at build time.
 
+## Diagnosing runtime incidents
+
+- "Why did X close/change at T" is a live-state question: query the live journal/store first (event journal, status API, service logs) before theorizing from files.
+- Static exports older than the incident timestamp are history only, never the proof — compare incident time vs data max time.
+- Require close/exit proof before answering: ticket/record pair + reason + timestamp (+ sibling-basket check for mass closes).
+- Infra CLIs (`kubectl`, DB clients, `curl` to live services) via `bash` are not native-tool equivalents; the read/grep/glob nudge never applies to them.
+- Glob hygiene: exclude `venv/`, `.venv/`, `node_modules/`, `__pycache__/` on broad searches.
+- Finish the job: fetch queryable evidence yourself; don't end by asking the user for what you can query.
+
 ## Standing ops
 
 - Durable notes live in `./memory/*.md` (YAML frontmatter + `[[wikilinks]]`).
